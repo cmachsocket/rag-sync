@@ -7,7 +7,7 @@ use crate::schema::files;
 pub struct File {
     pub id: i32,
     pub path: String,
-    pub md5: String,
+    pub sha256: String,
 }
 
 #[derive(Queryable, Debug)]

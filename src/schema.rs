@@ -4,7 +4,7 @@ diesel::table! {
     files (id) {
         id -> Integer,
         path -> Text,
-        md5 -> Text,
+        sha256 -> Text,
         run_id -> Integer,
     }
 }
