@@ -12,3 +12,4 @@ diesel = { version = "2", features = ["sqlite"] }
 diesel-async = { version = "0.9", features = ["sqlite", "deadpool"] }
 reqwest = { version = "0.13", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
+serde_json = "1"

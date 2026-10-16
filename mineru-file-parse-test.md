@@ -295,7 +295,248 @@ Assignment 2
 DOCX 快约 100 倍。PDF 逐页处理，且扫描件需 OCR，`ocr_mode` 建议保持 `auto`。
 两者 `content.markdown` 都是内联返回，无需二次请求。
 
-## 9. 遗留对象
+## 9. 最小请求体
+
+必填项只有两个：顶层 `files`，项内 `source`。而 `source` 每个分支都只需 2 个字段。
+
+以 `file_id` 为例的最小可用请求体：
+
+```json
+{"files":[{"source":{"type":"file_id","file_id":"<FILE_ID>"}}]}
+```
+
+四种 source 各自的最小形态：
+
+```json
+{"files":[{"source":{"type":"file_id","file_id":"..."}}]}
+{"files":[{"source":{"type":"url","url":"..."}}]}
+{"files":[{"source":{"type":"inline","name":"a.pdf","data":"<base64>"}}]}
+{"files":[{"source":{"type":"local","path":"/abs/path.pdf"}}]}
+```
+
+### 两个不能省的细节
+
+**`type` 必须显式写。** OpenAPI schema 里标着 `"default": "file_id"`，但那是 Pydantic 生成 schema 时的产物，运行时判别器不做填充。省略后实测：
+
+```
+HTTP 400
+{"error":{"code":"invalid_request",
+  "message":"Unable to extract tag using discriminator 'type'\nfiles.0.source"}}
+```
+
+**`files` 必须是数组**，传单个对象不行：
+
+```
+HTTP 400
+{"error":{"message":"1 validation error for CreateJobRequest\nfiles\n  Input should be a valid list"}}
+```
+
+三种缺法的报错：
+
+| 缺什么 | 错误信息 |
+| --- | --- |
+| `source` | `files.0.source Field required` |
+| `files` | `files Field required` |
+| `type` | `Unable to extract tag using discriminator 'type'` |
+
+### query 参数全有默认值
+
+可以一个都不传，只有 `response_format=zip` 和 `page_range` 需要显式指定：
+
+| 参数 | 默认 | 不给的后果 |
+| --- | --- | --- |
+| `response_format` | `json` | 想拿 zip 必须显式传 |
+| `wait_timeout` | `300` | 同步等 300 秒，超时转 `202` |
+| `tier` | 服务端配置（当前 `standard`） | |
+| `ocr_mode` | `auto` | |
+| `page_range` | 空（全文档） | |
+| `output_formats` | `["markdown"]` | |
+
+## 10. `202 Accepted` 与轮询
+
+`wait_timeout` 是同步等待的秒数，超时后任务**继续在后台跑**，接口返回 `202`。客户端必须自己轮询，客户端库（如 reqwest）不会自动续等。
+
+用 `wait_timeout=1` 配合 30 页 PDF 触发：
+
+```
+POST /v1/file_parse?wait_timeout=1
+{"files":[{"source":{"type":"file_id","file_id":"file-9a1806385362e774660f373d"},"page_range":"1-30"}]}
+```
+
+`202`，耗时 1.0 s（即 `wait_timeout` 本身）：
+
+```json
+{
+  "status": "running",
+  "created_at": "2026-10-16T21:34:50Z",
+  "started_at": "2026-10-16T21:34:50Z",
+  "finished_at": null,
+  "tier": "standard",
+  "output_formats": ["markdown"],
+  "access_level": "anonymous",
+  "progress": {"completed": 0, "failed": 0, "total": 1},
+  "files": [{
+    "file_id": "file-9a1806385362e774660f373d",
+    "name": "slow.pdf",
+    "page_range": "1-30",
+    "status": "queued",
+    "parse": null,
+    "output_files": null,
+    "error": null
+  }],
+  "links": {
+    "self": "/v1/tasks/job_70062f93f45ac536eeb0e878",
+    "cancel": "/v1/tasks/job_70062f93f45ac536eeb0e878"
+  },
+  "task_id": "job_70062f93f45ac536eeb0e878",
+  "status_url": "/v1/tasks/job_70062f93f45ac536eeb0e878",
+  "result_url": "/v1/tasks/job_70062f93f45ac536eeb0e878/result"
+}
+```
+
+`progress` 在 `202` 时为 `{0,0,total}`，`files[].status` 是 `queued`，`output_files` 为 `null`。
+
+### 轮询收敛
+
+`GET /v1/tasks/{task_id}` 与 `GET /v1/tasks/{task_id}/result` 返回相同内容：
+
+```
+[t=6s]  running   | progress: {"completed": 0, "failed": 0, "total": 1}
+[t=12s] running   | progress: {"completed": 0, "failed": 0, "total": 1}
+[t=18s] completed | progress: {"completed": 1, "failed": 0, "total": 1}
+```
+
+### 坑：轮询结果里 `content` 是空的
+
+终态响应中 `content.markdown` 长度为 **0**，而 `output_files.markdown.bytes` 是 `1288276`。内容需再取一次：
+
+```
+GET /v1/files/{output_files.markdown.file_id}/content   → 直接返回 markdown 原文
+```
+
+源文件则取不到：
+
+```
+GET /v1/files/{源 file_id}/content
+HTTP 403
+{"error":{"code":"feature_requires_api_key","message":"Source files cannot be downloaded"}}
+```
+
+因此 `202` 的正确流程是三段：**轮询 task → 从 `output_files.markdown.file_id` 取内容**。
+同步路径（`200`）能直接内联拿到 markdown，属同步完成时的特例。
+
+### 终态判定
+
+`status` 终态有三种，不要只判 `completed`，否则失败任务会死循环：
+
+| 终态 | 含义 |
+| --- | --- |
+| `completed` | 成功，但仍需检查 `files[].error` |
+| `failed` | 失败，看 `files[].error` |
+| `cancelled` | 被取消（`DELETE /v1/tasks/{task_id}` 或 `links.cancel`） |
+
+`finished_at` 为 `null` 表示仍在运行。
+
+### 同步响应里的额外字段
+
+`200` 响应还带有轮询态没有的字段，便于诊断：
+
+```json
+"progress": {"completed": 1, "failed": 0, "total": 1},
+"files": [{
+  "parse": {"model_used": null, "duration_ms": 13802, "parser_version": "4.0.12"}
+}]
+```
+
+`files[].file_id` 也只在同步响应里出现。
+
+## 11. 上传按 sha256 幂等去重
+
+`POST /v1/uploads` 以 `sha256sum` 判重。内容相同则**直接返回已完成状态**：
+
+```json
+{
+  "id": "upload_a6ebfd4062d1798b90d98beb",
+  "status": "completed",
+  "upload_url": null,
+  "upload_method": null,
+  "file": {"id": "file-97739a13160d0a95822fc420", "bytes": 14790}
+}
+```
+
+此时 `upload_url` 为 `null`，再发 `PUT` 会失败：
+
+```
+HTTP 409
+{"error":{"code":"upload_already_terminal","message":"Upload is completed"}}
+```
+
+**客户端必须先判 `status`**：已是 `completed` 就直接取 `file.id` 走 `file_parse`；
+只有 `pending` 才继续 `PUT` + `complete`。
+
+## 12. `mime_type` 不参与解析
+
+传入完全错误的 MIME 不影响解析结果：
+
+```
+声明 mime_type = application/x-totally-wrong
+→ 文件上传成功，file_parse 返回 completed
+→ markdown 正常输出 749 字符，耗时 0.05 s
+```
+
+服务端不校验 `mime_type`，也不依赖它选择解析器（解析器按文件内容判定）。该字段只是
+被原样存储并回显，供调用方事后查阅：
+
+```json
+"mime_type": "application/x-totally-wrong"
+```
+
+因此 MIME 取错不会导致失败，但会让记录失真。建议仍按服务端实际使用的映射表填写。
+
+### MIME 映射表来源
+
+权威来源是 MinerU 自身的 `MIME_TYPE_BY_EXTENSION`
+（`venv/lib/python3.14/site-packages/mineru/filetypes.py`）：
+
+| 后缀 | MIME |
+| --- | --- |
+| `pdf` | `application/pdf` |
+| `ofd` | `application/ofd` |
+| `epub` | `application/epub+zip` |
+| `doc` | `application/msword` |
+| `docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` |
+| `ppt` | `application/vnd.ms-powerpoint` |
+| `pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` |
+| `xls` | `application/vnd.ms-excel` |
+| `xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` |
+| `rtf` | `application/rtf` |
+| `odt` | `application/vnd.oasis.opendocument.text` |
+| `ods` | `application/vnd.oasis.opendocument.spreadsheet` |
+| `odp` | `application/vnd.oasis.opendocument.presentation` |
+| `html` / `htm` / `shtml` | `text/html` |
+| `mhtml` / `mht` | `multipart/related` |
+| `csv` | `text/csv` |
+| `tsv` | `text/tab-separated-values` |
+| `md` / `markdown` | `text/markdown` |
+| `rst` | `text/x-rst` |
+| `tex` | `text/x-tex` |
+| `txt` | `text/plain` |
+
+**不要用各语言标准库的对照表**，6 处不一致：
+
+| 后缀 | 标准库 | MinerU |
+| --- | --- | --- |
+| `ofd` | 无 | `application/ofd` |
+| `shtml` | 无 | `text/html` |
+| `mhtml` | `message/rfc822` | `multipart/related` |
+| `mht` | `message/rfc822` | `multipart/related` |
+| `rst` | `text/prs.fallenstein.rst` | `text/x-rst` |
+| `tex` | `application/x-tex` | `text/x-tex` |
+
+`mhtml` 标准库给的是邮件 MIME，而 MHTML 是 MIME 实体打包，正确值是 `multipart/related`。
+Rust 的 `mime_guess` 等 crate 同样源自 IANA，对这几个后缀给的值与服务端不一致。
+
+## 13. 遗留对象
 
 本次测试在服务端留下以下对象，未清理：
 
@@ -309,6 +550,14 @@ DOCX 快约 100 倍。PDF 逐页处理，且扫描件需 OCR，`ocr_mode` 建议
 | DOCX | 文件 | `file-ebba75dec4d1b9470a51d095` |
 | DOCX | 任务 | `job_cc4be89aa73efb66a97dd47d` |
 | DOCX | 产物 | `file-6000e05a117052df098b3d11` |
+| 错误 MIME 探测 | 文件 | `file-97739a13160d0a95822fc420` |
+| 大 DOCX | 文件 | `file-c099519d2a7adf007954c713` |
+| 大 DOCX | 产物 | `file-4038149dc90e5edd6a6c95a3` |
+| PDF（202 触发） | 文件 | `file-9a1806385362e774660f373d` |
+| PDF（202 触发） | 任务 | `job_70062f93f45ac536eeb0e878` |
+| PDF（202 触发） | 产物 | `file-b314040e74baa564fb9ee24a` |
+
+另有探测过程中的失败上传对象 `upload_b39feed1e21a8ff07ab7b08f`、`upload_eee636f71f2b30fd0dc4f42b`。
 
 清理：
 
