@@ -2,14 +2,18 @@
 
 diesel::table! {
     files (id) {
-        id -> Nullable<Integer>,
+        id -> Integer,
         path -> Text,
-        md5 -> Nullable<Text>,
-        size -> Integer,
-        mtime -> Nullable<Integer>,
-        status -> Text,
-        error_msg -> Nullable<Text>,
-        created_at -> Integer,
-        updated_at -> Integer,
+        md5 -> Text,
+        run_id -> Integer,
     }
 }
+
+diesel::table! {
+    run_counter (id) {
+        id -> Nullable<Integer>,
+        current_run_id -> Integer,
+    }
+}
+
+diesel::allow_tables_to_appear_in_same_query!(files, run_counter,);
