@@ -1,145 +1,81 @@
-use serde::Serialize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
+// POST /v1/uploads 请求体。契约为 additionalProperties: false，
+// 字段名必须严格一致：filename / bytes / mime_type。
+// sha256sum 可选，但传了服务端才能做幂等去重，本地已算好的 sha256 直接复用。
 #[derive(Serialize)]
-pub struct FileUploadRequest {
-    pub file_path: String,
-    pub file_size: u64,
-    pub mime_type: String,
+pub struct FileUploadRequest<'a> {
+    /// 只取文件名，不含目录。服务端据此决定解析器与产物命名。
+    pub filename: &'a str,
+    pub bytes: u64,
+    pub mime_type: &'a str,
+    pub sha256sum: &'a str,
 }
 
+// POST /v1/uploads 与 GET /v1/uploads/{id} 共用的响应。
+// 按 sha256 幂等命中时 upload_url / upload_method / file 均为 null，故全部为 Option。
 #[derive(Deserialize)]
-pub struct FileUploadResponse {
+pub struct UploadObject {
     pub id: String,
-    pub object: String,
-    pub bytes: u64,
-    pub created_at: u64,
-    pub expires_at: u64,
-    pub filename: String,
-    pub purpose: String,
-    pub mime_type: String,
-    pub sha256sum: String,
     pub status: String,
-    pub upload_url: String,
-    pub upload_method: String,
-    pub upload_headers: std::collections::HashMap<String, String>,
-    pub file: Option<String>,
+    pub file: Option<FileObject>,
 }
 
-/*{
-  "id": "upload_36838fa63fbb3f71accff2f5",
-  "object": "upload",
-  "bytes": 758482,
-  "created_at": 1792180373,
-  "expires_at": 1792183973,
-  "filename": "test.pdf",
-  "purpose": "parse",
-  "mime_type": "application/pdf",
-  "sha256sum": "aea7aae52dc22592e5d7fab2bcb3bd87dd64513a13b5a4354b54b0951fa95b3c",
-  "status": "pending",
-  "upload_url": "http://127.0.0.1:9777/v1/uploads/upload_36838fa63fbb3f71accff2f5/content",
-  "upload_method": "PUT",
-  "upload_headers": {"Content-Type": "application/pdf"},
-  "file": null
-} */
-
 #[derive(Deserialize)]
-pub struct FilePutInnerStruct {
+pub struct FileObject {
     pub id: String,
-    pub object: String,
-    pub bytes: u64,
-    pub created_at: u64,
-    pub expires_at: u64,
-    pub filename: String,
-    pub purpose: String,
-    pub sha256sum: String,
 }
 
+// GET /v1/files/{产物 file_id}/content 直接返回 markdown 原文，不是 JSON。
 #[derive(Deserialize)]
-pub struct FilePutResponse {
-    pub id: String,
-    pub object: String,
-    pub bytes: u64,
-    pub status: String,
-    pub upload_url: Option<String>,
-    pub upload_method: Option<String>,
-    pub file: Option<FilePutInnerStruct>,
-}
-
-/*{
-  "id": "upload_36838fa63fbb3f71accff2f5",
-  "object": "upload",
-  "bytes": 758482,
-  "status": "completed",
-  "upload_url": null,
-  "upload_method": null,
-  "file": {
-    "id": "file-0daba4e68fe97e9ab87218f9",
-    "object": "file",
-    "bytes": 758482,
-    "created_at": 1792180375,
-    "expires_at": 1792183973,
-    "filename": "test.pdf",
-    "purpose": "parse",
-    "sha256sum": "aea7aae52dc22592e5d7fab2bcb3bd87dd64513a13b5a4354b54b0951fa95b3c"
-  }
-} */
-#[derive(Serialize)]
-pub struct FileSource {
-    pub source: FileSourceType,
-}
-
-#[derive(Serialize)]
-pub struct FileSourceType {
-    pub r#type: String,
-    pub file_id: Option<String>,
-    pub url: Option<String>,
-    pub name: Option<String>,
-    pub data: Option<String>,
-    pub path: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct FileParseRequest {
-    pub files: Vec<crate::json_model::FileSource>,
-}
-
-/*
-四种 source 各自的最小形态：
-
-```json
-{"files":[{"source":{"type":"file_id","file_id":"..."}}]}
-{"files":[{"source":{"type":"url","url":"..."}}]}
-{"files":[{"source":{"type":"inline","name":"a.pdf","data":"<base64>"}}]}
-{"files":[{"source":{"type":"local","path":"/abs/path.pdf"}}]}
-```
-
-*/
-
-
-#[derive(Deserialize)]
-pub struct FileParseResponseFileOutput {
+pub struct OutputFileRef {
     pub file_id: String,
     pub bytes: u64,
 }
 
-#[derive(Deserialize)]
-pub struct FileParseResponseFile {
-    pub name: String,
-    pub status: String,
-    pub page_range: String,
-    pub error: Option<String>,
-    pub output_files: Option<std::collections::HashMap<String, FileParseResponseFileOutput>>,
-    pub content: Option<std::collections::HashMap<String, String>>,
+/// source 的四种变体。序列化时只填 type 对应的那个字段，
+/// 其余为 None 会被 serde 跳过（配合 skip_serializing_if）。
+#[derive(Serialize)]
+pub struct FileSource {
+    pub r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct Links {
-  #[serde(rename = "self")]
-  pub self_link: String,
-    pub cancel: String,
+impl FileSource {
+    pub fn from_file_id(file_id: String) -> Self {
+        Self {
+            r#type: "file_id",
+            file_id: Some(file_id),
+            url: None,
+            name: None,
+            data: None,
+            path: None,
+        }
+    }
 }
 
+#[derive(Serialize)]
+pub struct FileParseRequest {
+    pub files: Vec<FileParseItem>,
+}
+
+#[derive(Serialize)]
+pub struct FileParseItem {
+    pub source: FileSource,
+}
+
+/// /v1/file_parse 与 GET /v1/tasks/{id} 返回同构的响应，
+/// 故复用同一结构体。progress 是嵌套对象，不是平铺字段。
 #[derive(Deserialize)]
 pub struct Progress {
     pub completed: u64,
@@ -148,94 +84,24 @@ pub struct Progress {
 }
 
 #[derive(Deserialize)]
-pub struct FileParseResponse {
+pub struct ParsedFile {
+    pub name: String,
     pub status: String,
-    pub created_at: u64,
-    pub started_at: Option<u64>,
-    pub finished_at: Option<u64>,
-    pub tier: String,
-    pub output_formats: Vec<String>,
-    pub access_level: String,
-    pub progress: Option<Progress>,
-    pub task_id: String,
-    pub status_url: String,
-    pub result_url: String,
-    pub files: Vec<FileParseResponseFile>,
-    pub links: Links,
+    pub error: Option<serde_json::Value>,
+    #[serde(default)]
+    pub output_files: Option<HashMap<String, Option<OutputFileRef>>>,
+    #[serde(default)]
+    pub content: Option<HashMap<String, Option<String>>>,
 }
-
-/*
-
-```json
-{
-  "status": "completed",
-  "created_at": 1792180440,
-  "started_at": "...",
-  "finished_at": "...",
-  "tier": "standard",
-  "output_formats": ["markdown"],
-  "access_level": "...",
-  "progress": null,
-  "task_id": "job_5f2275d16741485741624f6e",
-  "status_url": "...",
-  "result_url": "...",
-  "links": {"self": "...", "cancel": "..."},
-  "files": [
-    {
-      "name": "test.pdf",
-      "status": "completed",
-      "page_range": "1-3",
-      "error": null,
-      "output_files": {
-        "markdown": {"file_id": "file-5c1489ebba6abcdad762d6f2", "bytes": 18440},
-        "middle_json": null,
-        "structured_content": null,
-        "html": null,
-        "latex": null,
-        "docx": null,
-        "zip": null
-      },
-      "content": {"markdown": "<内联的 markdown 字符串，长度 18406>"}
-    }
-  ]
-}
-```
-{
-  "status": "running",
-  "created_at": "2026-10-16T21:34:50Z",
-  "started_at": "2026-10-16T21:34:50Z",
-  "finished_at": null,
-  "tier": "standard",
-  "output_formats": ["markdown"],
-  "access_level": "anonymous",
-  "progress": {"completed": 0, "failed": 0, "total": 1},
-  "task_id": "job_70062f93f45ac536eeb0e878",
-  "status_url": "/v1/tasks/job_70062f93f45ac536eeb0e878",
-  "result_url": "/v1/tasks/job_70062f93f45ac536eeb0e878/result"
-  "files": [{
-    "file_id": "file-9a1806385362e774660f373d",
-    "name": "slow.pdf",
-    "page_range": "1-30",
-    "status": "queued",
-    "parse": null,
-    "output_files": null,
-    "error": null
-  }],
-  "links": {
-    "self": "/v1/tasks/job_70062f93f45ac536eeb0e878",
-    "cancel": "/v1/tasks/job_70062f93f45ac536eeb0e878"
-  },
-}
-```
-`content.markdown` 直接内联返回完整内容，不必再调 `GET /v1/files/{file_id}/content`；`output_files.markdown.file_id` 另给了一个可寻址的 id。
-
-*/
 
 #[derive(Deserialize)]
-pub struct TaskStatusResponse {
-    pub completed: i64,
-    pub failed: i64,
-    pub total: i64,
+pub struct TaskResponse {
+    /// completed / running / failed / cancelled，注意没有 "success"
+    pub status: String,
+    pub task_id: String,
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub progress: Option<Progress>,
+    #[serde(default)]
+    pub files: Vec<ParsedFile>,
 }
-
-//{"completed": 0, "failed": 0, "total": 1}

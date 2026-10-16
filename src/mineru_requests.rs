@@ -1,146 +1,294 @@
 use crate::db_model;
-use crate::sync_config;
-use crate::sync_folder;
-use reqwest;
-
-use core::task;
+use crate::json_model::{
+    FileParseItem, FileParseRequest, FileSource, OutputFileRef, TaskResponse, UploadObject,
+};
+use crate::sync_config::SyncConfig;
+use crate::sync_folder::mime_for;
+use reqwest::Body;
 use std::path::Path;
+use std::time::Duration;
+use tokio_util::io::ReaderStream;
 
-async fn minerU_tackle(
-    client: reqwest::Client,
-    file: db_model::File,
-    config: sync_config::SyncConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let uploads_api = "/v1/uploads";
-    let file_api = "/content";
-    let complete_api = "/complete";
-    let parse_api = "/v1/file_parse";
-    let status_api = "/v1/tasks/";
-    let file_size = tokio::fs::metadata(&file.path).await?.len();
-    let mime_type = sync_folder::mime_for(Path::new(&file.path));
-    let upload_request = crate::json_model::FileUploadRequest {
-        file_path: file.path.clone(),
-        file_size,
-        mime_type: mime_type.to_string(),
-    };
-    let resp = client
-        .post(format!("{}{}", config.mineru_url, uploads_api))
-        .json(&upload_request)
-        .send()
-        .await?;
-    let upload_response: crate::json_model::FileUploadResponse =
-        resp.error_for_status()?.json().await?;
-    let file_id = upload_response.id.clone();
-    let _ = client
-        .put(format!(
-            "{}{}/{}{}",
-            config.mineru_url, uploads_api, file_id, file_api
-        ))
-        .header("Content-Type", upload_response.mime_type.clone())
-        .body(tokio::fs::read(&file.path).await?)
-        .send()
-        .await?;
-    loop {
-        let resp = client
-            .get(format!(
-                "{}{}/{}{}",
-                config.mineru_url, uploads_api, file_id, complete_api
-            ))
-            .send()
-            .await?;
-        let complete_response: crate::json_model::FilePutResponse =
-            resp.error_for_status()?.json().await?;
-        if complete_response.status == "completed" {
-            println!("文件 {} 上传完成", file.path);
-            break;
-        } else {
-            println!(
-                "文件 {} 上传中，状态: {}",
-                file.path, complete_response.status
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 轮询上限。仅防服务端任务卡死导致无限等待，与 HTTP 层的 wait_timeout 无关。
+const MAX_POLL_ROUNDS: u32 = 720;
+
+/// 错误信息统一带上文件路径，便于定位是哪个文件出的问题。
+fn err(file: &db_model::File, msg: impl std::fmt::Display) -> Box<dyn std::error::Error> {
+    format!("{}: {msg}", file.path).into()
+}
+
+/// 取得 file_id：优先复用已有映射，否则走完整上传流程。
+async fn ensure_file_id(
+    client: &reqwest::Client,
+    file: &db_model::File,
+    config: &SyncConfig,
+) -> Result<String> {
+    if file.id != 0 {
+        return Ok(file.id.to_string());
     }
-    let parse_request = crate::json_model::FileParseRequest {
-        files: vec![crate::json_model::FileSource {
-            source: crate::json_model::FileSourceType {
-                file_id: Some(file_id.clone()),
-                url: None,
-                name: None,
-                data: None,
-                path: None,
-                r#type: "file_id".to_string(),
-            },
+    upload(client, file, config).await
+}
+
+async fn upload(
+    client: &reqwest::Client,
+    file: &db_model::File,
+    config: &SyncConfig,
+) -> Result<String> {
+    let path = Path::new(&file.path);
+    // filename 只取文件名部分，含目录会被服务端拒绝或产生意外的产物名
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| err(file, "文件名不是合法 UTF-8"))?;
+
+    let bytes = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| err(file, format!("读取文件元数据失败: {e}")))?
+        .len();
+
+    if file.sha256.is_empty() {
+        return Err(err(file, "缺少 sha256，无法声明上传"));
+    }
+
+    let mime_type = mime_for(path);
+    let req = crate::json_model::FileUploadRequest {
+        filename,
+        bytes,
+        mime_type,
+        sha256sum: &file.sha256,
+    };
+
+    let resp = client
+        .post(format!("{}/v1/uploads", config.mineru_url))
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| err(file, format!("创建上传失败: {e}")))?;
+    let resp = resp
+        .error_for_status()
+        .map_err(|e| err(file, format!("创建上传被拒绝: {e}")))?;
+    let upload: UploadObject = resp
+        .json()
+        .await
+        .map_err(|e| err(file, format!("解析上传响应失败: {e}")))?;
+
+    // 按 sha256 幂等：内容已存在时服务端直接返回 completed，
+    // 此时 upload_url 为 null，再 PUT 会得到 409 upload_already_terminal。
+    if upload.status == "completed" {
+        if let Some(f) = upload.file {
+            return Ok(f.id);
+        }
+        return Err(err(file, "上传已完成但响应中缺少 file.id"));
+    }
+
+    put_content(client, file, config, &upload.id, mime_type).await?;
+    complete(client, file, config, &upload.id).await
+}
+
+/// 流式上传文件内容，避免把整个文件读进内存。
+async fn put_content(
+    client: &reqwest::Client,
+    file: &db_model::File,
+    config: &SyncConfig,
+    upload_id: &str,
+    mime_type: &str,
+) -> Result<()> {
+    let f = tokio::fs::File::open(&file.path)
+        .await
+        .map_err(|e| err(file, format!("打开文件失败: {e}")))?;
+
+    // ReaderStream 要求 AsyncRead + Unpin，tokio::fs::File 两者都满足
+    let stream = ReaderStream::with_capacity(f, 64 * 1024);
+    let body_len = tokio::fs::metadata(&file.path)
+        .await
+        .map_err(|e| err(file, format!("读取文件元数据失败: {e}")))?
+        .len();
+
+    let resp = client
+        .put(format!("{}/v1/uploads/{upload_id}/content", config.mineru_url))
+        .header("Content-Type", mime_type)
+        // 声明长度，避免服务端使用 chunked 编码
+        .header("Content-Length", body_len)
+        .body(Body::wrap_stream(stream))
+        .send()
+        .await
+        .map_err(|e| err(file, format!("上传内容失败: {e}")))?;
+
+    resp.error_for_status()
+        .map_err(|e| err(file, format!("上传内容被拒绝: {e}")))?;
+    Ok(())
+}
+
+/// 触发完成，一次 POST 即完成，不需要轮询。
+async fn complete(
+    client: &reqwest::Client,
+    file: &db_model::File,
+    config: &SyncConfig,
+    upload_id: &str,
+) -> Result<String> {
+    let resp = client
+        .post(format!("{}/v1/uploads/{upload_id}/complete", config.mineru_url))
+        .send()
+        .await
+        .map_err(|e| err(file, format!("完成上传请求失败: {e}")))?;
+    let resp = resp
+        .error_for_status()
+        .map_err(|e| err(file, format!("完成上传被拒绝: {e}")))?;
+    let upload: UploadObject = resp
+        .json()
+        .await
+        .map_err(|e| err(file, format!("解析完成响应失败: {e}")))?;
+
+    if upload.status != "completed" {
+        return Err(err(file, format!("上传未完成，状态: {}", upload.status)));
+    }
+    upload
+        .file
+        .map(|f| f.id)
+        .ok_or_else(|| err(file, "完成响应中缺少 file.id"))
+}
+
+/// 触发解析。202 时轮询到终态并取回产物内容。
+async fn parse(
+    client: &reqwest::Client,
+    file: &db_model::File,
+    config: &SyncConfig,
+    file_id: &str,
+) -> Result<String> {
+    let req = FileParseRequest {
+        files: vec![FileParseItem {
+            source: FileSource::from_file_id(file_id.to_string()),
         }],
     };
-    let resp: crate::json_model::FileParseResponse = client
-        .post(format!("{}{}", config.mineru_url, parse_api))
-        .json(&parse_request)
+
+    let resp = client
+        .post(format!("{}/v1/file_parse", config.mineru_url))
+        .json(&req)
         .send()
-        .await?
+        .await
+        .map_err(|e| err(file, format!("解析请求失败: {e}")))?;
+
+    let resp = resp
+        .error_for_status()
+        .map_err(|e| err(file, format!("解析被拒绝: {e}")))?;
+
+    // 202 与 200 同构，都反序列化成 TaskResponse
+    let mut task: TaskResponse = resp
         .json()
-        .await?;
-    if resp.status == "success" {
-        println!("文件 {} 解析成功", file.path);
-        let content = resp.files
-            .iter()
-            .map(|f| {
-                f.content
-                    .as_ref()
-                    .unwrap()
-                    .get("markdown")
-                    .unwrap()
-                    .clone()
-            })
-            .next()
-            .unwrap();
-        return Ok(content);
-    } else if resp.status == "running" {
-        loop {
-            let task_id = resp.task_id.clone();
-            let resp = client
-                .get(format!("{}{}/{}", config.mineru_url, status_api, task_id))
-                .send()
-                .await?;
-            let status_response: crate::json_model::TaskStatusResponse =
-                resp.error_for_status()?.json().await?;
-            if status_response.completed == status_response.total {
-                println!("文件 {} 解析完成", file.path);
-                break;
-            } else {
-                println!(
-                    "文件 {} 解析中，状态: {}/{}",
-                    file.path, status_response.completed, status_response.total
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }
-        //GET /v1/files/{output_files.markdown.file_id}/content   → 直接返回 markdown 原文
-        //从逻辑上保证单一
-        let markdown_file_id = resp.files
-            .iter()
-            .map(|f| {
-                f.output_files
-                    .as_ref()
-                    .unwrap()
-                    .get("markdown")
-                    .unwrap()
-                    .file_id
-                    .clone()
-            })
-            .next()
-            .unwrap();
-        let resp = client
-            .get(format!(
-                "{}{}/{}{}",
-                config.mineru_url, uploads_api, markdown_file_id, file_api
-            ))
-            .send()
-            .await?;
-        let content: String = resp.text().await?;
-        return Ok(content);
-    } else {
-        println!("文件 {} 解析失败，状态: {}", file.path, resp.status);
+        .await
+        .map_err(|e| err(file, format!("解析响应失败: {e}")))?;
+
+    if task.status == "running" {
+        task = poll(client, file, config, &task.task_id).await?;
     }
-    Err(format!("文件 {} 解析失败，状态: {}", file.path, resp.status).into())
+
+    // 终态校验。注意 status 取值为 completed/failed/cancelled，没有 "success"
+    if task.status != "completed" {
+        let detail = task
+            .files
+            .first()
+            .and_then(|f| f.error.as_ref())
+            .map(|e| format!("，错误: {e}"))
+            .unwrap_or_default();
+        return Err(err(file, format!("解析未成功，状态: {}{detail}", task.status)));
+    }
+
+    extract_markdown(client, file, config, &task).await
+}
+
+async fn poll(
+    client: &reqwest::Client,
+    file: &db_model::File,
+    config: &SyncConfig,
+    task_id: &str,
+) -> Result<TaskResponse> {
+    for round in 1..=MAX_POLL_ROUNDS {
+        let resp = client
+            .get(format!("{}/v1/tasks/{task_id}", config.mineru_url))
+            .send()
+            .await
+            .map_err(|e| err(file, format!("轮询失败: {e}")))?;
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| err(file, format!("轮询被拒绝: {e}")))?;
+        let task: TaskResponse = resp
+            .json()
+            .await
+            .map_err(|e| err(file, format!("解析轮询响应失败: {e}")))?;
+
+        // 终态有四种，不能只判 completed，否则失败任务会一直轮询
+        if matches!(
+            task.status.as_str(),
+            "completed" | "failed" | "cancelled"
+        ) {
+            return Ok(task);
+        }
+
+        if let Some(p) = &task.progress {
+            println!(
+                "[轮询 {round}/{MAX_POLL_ROUNDS}] {} 状态: {} ({}/{})",
+                file.path, task.status, p.completed, p.total
+            );
+        } else {
+            println!("[轮询 {round}/{MAX_POLL_ROUNDS}] {} 状态: {}", file.path, task.status);
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    Err(err(file, "轮询超时，任务可能仍在服务端运行"))
+}
+
+/// 取 markdown 内容。同步完成时内联在 content 里，轮询完成后需二次请求。
+async fn extract_markdown(
+    client: &reqwest::Client,
+    file: &db_model::File,
+    config: &SyncConfig,
+    task: &TaskResponse,
+) -> Result<String> {
+    let parsed = task
+        .files
+        .first()
+        .ok_or_else(|| err(file, "响应中缺少 files 条目"))?;
+
+    // 优先用内联内容
+    if let Some(md) = parsed.content.as_ref().and_then(|c| c.get("markdown")) {
+        if let Some(text) = md {
+            return Ok(text.clone());
+        }
+    }
+
+    // 回退到产物 id。注意轮询终态的 content 恒为空，必须走这条路
+    let product_id = parsed
+        .output_files
+        .as_ref()
+        .and_then(|m| m.get("markdown"))
+        .and_then(|o| o.as_ref())
+        .map(|o: &OutputFileRef| o.file_id.as_str())
+        .ok_or_else(|| err(file, "既无内联内容也无 markdown 产物 id"))?;
+
+    let resp = client
+        .get(format!("{}/v1/files/{product_id}/content", config.mineru_url))
+        .send()
+        .await
+        .map_err(|e| err(file, format!("获取解析内容失败: {e}")))?;
+    let resp = resp
+        .error_for_status()
+        .map_err(|e| err(file, format!("获取解析内容被拒绝: {e}")))?;
+    resp.text()
+        .await
+        .map_err(|e| err(file, format!("读取解析内容失败: {e}")))
+}
+
+/// 单个文件的完整流程：上传 → 解析 → 返回 markdown。
+pub async fn minerU_tackle(
+    client: reqwest::Client,
+    file: db_model::File,
+    config: SyncConfig,
+) -> Result<String> {
+    let file_id = ensure_file_id(&client, &file, &config).await?;
+    parse(&client, &file, &config, &file_id).await
 }
