@@ -2,10 +2,10 @@ use diesel::prelude::{ExpressionMethods, OptionalExtension, QueryDsl};
 use diesel::{self, SqliteConnection};
 use diesel_async::{AsyncConnection, RunQueryDsl, sync_connection_wrapper::SyncConnectionWrapper};
 
+pub type Conn = SyncConnectionWrapper<SqliteConnection>;
 
-type Conn = SyncConnectionWrapper<SqliteConnection>;
-
-trait db_func {
+pub trait db_func {
+    async fn file_exists(&mut self, file_path: &str) -> Result<bool, Box<dyn std::error::Error>>;
     async fn get_sha256(
         &mut self,
         file_path: &str,
@@ -36,8 +36,19 @@ pub async fn establish_db_connection() -> Result<Conn, Box<dyn std::error::Error
     Ok(connection)
 }
 
-
 impl db_func for Conn {
+    async fn file_exists(
+        &mut self,
+        file_path: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        use crate::schema::files::dsl::*;
+        let count = files
+            .filter(path.eq(file_path))
+            .count()
+            .get_result::<i64>(self)
+            .await?;
+        Ok(count > 0)
+    }
     async fn get_sha256(
         &mut self,
         file_path: &str,
@@ -50,13 +61,12 @@ impl db_func for Conn {
             .await
             .optional()?;
         Ok(result)
-    } 
+    }
     async fn update_sha256(
         &mut self,
         file_path: &str,
         new_sha256: &str,
-    ) -> Result<(), Box<dyn std::error::Error>>
-    {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::schema::files::dsl::*;
         diesel::update(files.filter(path.eq(file_path)))
             .set(sha256.eq(new_sha256))
@@ -66,8 +76,7 @@ impl db_func for Conn {
     }
     async fn get_run_counter(
         &mut self,
-    ) -> Result<Option<crate::db_model::RunCounter>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<Option<crate::db_model::RunCounter>, Box<dyn std::error::Error>> {
         use crate::schema::run_counter::dsl::run_counter;
         let result = run_counter
             .first::<crate::db_model::RunCounter>(self)
@@ -78,8 +87,7 @@ impl db_func for Conn {
     async fn update_run_counter(
         &mut self,
         new_run_id: i32,
-    ) -> Result<(), Box<dyn std::error::Error>>
-    {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::schema::run_counter::dsl::*;
         diesel::update(run_counter)
             .set(current_run_id.eq(new_run_id))
@@ -95,14 +103,9 @@ impl db_func for Conn {
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::schema::files::dsl::{files, id as file_id, path, sha256};
         diesel::insert_into(files)
-            .values((
-                file_id.eq(id),
-                path.eq(file_path),
-                sha256.eq(sha256_value),
-            ))
+            .values((file_id.eq(id), path.eq(file_path), sha256.eq(sha256_value)))
             .execute(self)
             .await?;
         Ok(())
     }
-
 }

@@ -93,12 +93,19 @@ pub async fn get_files(config: &sync_config::SyncConfig) -> Result<Vec<db_model:
     Ok(files)
 }
 
-pub async fn create_output_files(config: &sync_config::SyncConfig, files: &Vec<db_model::File>) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+pub async fn create_output_files(config: &sync_config::SyncConfig, files: &[db_model::File],conn: &mut database::Conn) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let mut output_files: Vec<PathBuf> = Vec::new();
     for file in files {
+        let file_in_db = database::db_func::file_exists(conn, &file.path).await?;
         let file_path = Path::new(&file.path);
-        
+        if file_in_db {
+            let old_sha = database::db_func::get_sha256(conn, &file.path).await?;
+            if old_sha.as_deref() == Some(&file.sha256) {
+                println!("文件 {} 的 sha256 未变化，跳过处理", file.path);
+                continue;
+            }
+        }
         create_output_dir(config, file_path).await?;
         let markdown = mineru_tackle(&client, file, config).await?;
 
