@@ -3,6 +3,7 @@ use crate::{database, db_model};
 use crate::mineru_requests::mineru_tackle;
 use crate::sync_config;
 use crate::file_mime::SUFFIX_MIME;
+use crate::database::DBfunc;
 use sha2::{Digest, Sha256};
 use std::io::{self};
 use std::{eprintln, path::{Path, PathBuf}};
@@ -98,10 +99,10 @@ pub async fn create_output_files(config: &sync_config::SyncConfig, files: &[db_m
     let client = reqwest::Client::new();
     let mut output_files: Vec<PathBuf> = Vec::new();
     for file in files {
-        let file_in_db = database::db_func::file_exists(conn, &file.path).await?;
+        let file_in_db = DBfunc::file_exists(conn, &file.path).await?;
         let file_path = Path::new(&file.path);
         if file_in_db {
-            let old_sha = database::db_func::get_sha256(conn, &file.path).await?;
+            let old_sha = DBfunc::get_sha256(conn, &file.path).await?;
             if old_sha.as_deref() == Some(&file.sha256) {
                 println!("文件 {} 的 sha256 未变化，跳过处理", file.path);
                 continue;

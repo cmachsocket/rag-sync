@@ -4,7 +4,7 @@ use diesel_async::{AsyncConnection, RunQueryDsl, sync_connection_wrapper::SyncCo
 
 pub type Conn = SyncConnectionWrapper<SqliteConnection>;
 
-pub trait db_func {
+pub trait DBfunc {
     async fn file_exists(&mut self, file_path: &str) -> Result<bool, Box<dyn std::error::Error>>;
     async fn get_sha256(
         &mut self,
@@ -28,6 +28,16 @@ pub trait db_func {
         &mut self,
         new_run_id: i32,
     ) -> Result<(), Box<dyn std::error::Error>>;
+    async fn get_file_run_id(
+        &mut self,
+        file_path: &str,
+    ) -> Result<Option<i32>, Box<dyn std::error::Error>>;
+    async fn update_file_run_id(
+        &mut self,
+        file_path: &str,
+        new_run_id: i32,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    
 }
 
 pub async fn establish_db_connection() -> Result<Conn, Box<dyn std::error::Error>> {
@@ -36,7 +46,7 @@ pub async fn establish_db_connection() -> Result<Conn, Box<dyn std::error::Error
     Ok(connection)
 }
 
-impl db_func for Conn {
+impl DBfunc for Conn {
     async fn file_exists(&mut self, file_path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         use crate::schema::files::dsl::*;
         let count = files
@@ -103,6 +113,32 @@ impl db_func for Conn {
         use crate::schema::files::dsl::{files, id as file_id, path, sha256};
         diesel::insert_into(files)
             .values((file_id.eq(id), path.eq(file_path), sha256.eq(sha256_value)))
+            .execute(self)
+            .await?;
+        Ok(())
+    }
+    async fn get_file_run_id(
+        &mut self,
+        file_path: &str,
+    ) -> Result<Option<i32>, Box<dyn std::error::Error>>
+    {
+        use crate::schema::files::dsl::*;
+        let result = files
+            .filter(path.eq(file_path))
+            .select(run_id)
+            .first::<i32>(self)
+            .await
+            .optional()?;
+        Ok(result)
+    }
+    async fn update_file_run_id(
+        &mut self,
+        file_path: &str,
+        new_run_id: i32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::schema::files::dsl::*;
+        diesel::update(files.filter(path.eq(file_path)))
+            .set(run_id.eq(new_run_id))
             .execute(self)
             .await?;
         Ok(())

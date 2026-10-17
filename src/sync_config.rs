@@ -34,7 +34,7 @@ impl SyncConfig {
         if config.output_dir.is_empty() {
             return Err("配置文件中缺少 output_dir 配置".into());
         }
-        let old_counter: crate::db_model::RunCounter =match database::db_func::get_run_counter(conn).await? {
+        let old_counter: crate::db_model::RunCounter =match database::DBfunc::get_run_counter(conn).await? {
             Some(r) => r,
             None => return Err("无法获取运行计数器".into()),
         };

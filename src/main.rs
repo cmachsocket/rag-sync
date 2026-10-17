@@ -4,9 +4,10 @@ mod sync_config;
 mod sync_folder;
 mod file_mime;
 mod mineru_requests;
-mod json_model;
+mod mineru_model;
 mod database;
-
+mod lightrag_requests;
+mod lightrag_model;
 
 
 use tokio;

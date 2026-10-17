@@ -1,5 +1,5 @@
 use crate::db_model;
-use crate::json_model::{
+use crate::mineru_model::{
     FileParseItem, FileParseRequest, FileSource, OutputFileRef, TaskResponse, UploadObject,
 };
 use crate::sync_config::SyncConfig;
@@ -54,7 +54,7 @@ async fn upload(
     }
 
     let mime_type = crate::file_mime::mime_for(path);
-    let req = crate::json_model::FileUploadRequest {
+    let req = crate::mineru_model::FileUploadRequest {
         filename,
         bytes,
         mime_type,
