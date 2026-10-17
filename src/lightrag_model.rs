@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 
 /*
@@ -13,13 +13,20 @@ use serde::{Deserialize, Serialize};
   "api_version": "0344"
 }
 ```
+只有 access_token 是必需的。其余字段带 serde(default)，
+服务端增删字段不会让登录整体失效。
 */
 #[derive(Deserialize)]
 pub struct LoginResponse {
     pub access_token: String,
+    #[serde(default)]
     pub token_type: String,
+    #[serde(default)]
     pub auth_configured: bool,
+    #[serde(default)]
     pub auth_mode: String,
-    pub core_version: String, 
+    #[serde(default)]
+    pub core_version: String,
+    #[serde(default)]
     pub api_version: String,
 }
