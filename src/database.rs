@@ -1,4 +1,4 @@
-use diesel::prelude::{ExpressionMethods, OptionalExtension, QueryDsl};
+use diesel::prelude::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel::{self, SqliteConnection};
 use diesel_async::{AsyncConnection, RunQueryDsl, sync_connection_wrapper::SyncConnectionWrapper};
 
@@ -37,10 +37,7 @@ pub async fn establish_db_connection() -> Result<Conn, Box<dyn std::error::Error
 }
 
 impl db_func for Conn {
-    async fn file_exists(
-        &mut self,
-        file_path: &str,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    async fn file_exists(&mut self, file_path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         use crate::schema::files::dsl::*;
         let count = files
             .filter(path.eq(file_path))
@@ -77,9 +74,11 @@ impl db_func for Conn {
     async fn get_run_counter(
         &mut self,
     ) -> Result<Option<crate::db_model::RunCounter>, Box<dyn std::error::Error>> {
+        use crate::db_model::RunCounter;
         use crate::schema::run_counter::dsl::run_counter;
         let result = run_counter
-            .first::<crate::db_model::RunCounter>(self)
+            .select(RunCounter::as_select())
+            .first::<RunCounter>(self)
             .await
             .optional()?;
         Ok(result)

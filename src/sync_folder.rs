@@ -84,6 +84,7 @@ pub async fn get_files(config: &sync_config::SyncConfig) -> Result<Vec<db_model:
                         sha256: sha256_file(file_path.to_str().unwrap())
                             .await
                             .unwrap_or_else(|_| String::new()),
+                        run_id: config.run_id,
                     });
                 }
             }

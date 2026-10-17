@@ -1,0 +1,6 @@
+sync_dir: "~/Documents"
+output_dir: "~/MinerU"
+mineru_url: "http://127.0.0.1:9777"
+lightrag_url: "http://127.0.0.1:9778"
+lightrag_username: "admin"
+lightrag_password: "admin"

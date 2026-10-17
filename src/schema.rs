@@ -11,7 +11,7 @@ diesel::table! {
 
 diesel::table! {
     run_counter (id) {
-        id -> Nullable<Integer>,
+        id -> Integer,
         current_run_id -> Integer,
     }
 }

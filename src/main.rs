@@ -14,7 +14,6 @@ use tokio;
 
 #[tokio::main]
 async fn main() {
-    let sync_config = sync_config::SyncConfig::new().await.unwrap();
     let mut conn = match database::establish_db_connection().await {
         Ok(conn) => conn,
         Err(e) => {
@@ -22,6 +21,8 @@ async fn main() {
             return;
         }
     };
+    let sync_config = sync_config::SyncConfig::new(&mut conn).await.unwrap();
+    
     let files = sync_folder::get_files(&sync_config).await.unwrap();
     sync_folder::create_output_files(&sync_config, &files,&mut conn).await.unwrap();
     println!("Sync directory: {}", &sync_config.sync_dir);
