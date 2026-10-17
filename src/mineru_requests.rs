@@ -3,7 +3,6 @@ use crate::json_model::{
     FileParseItem, FileParseRequest, FileSource, OutputFileRef, TaskResponse, UploadObject,
 };
 use crate::sync_config::SyncConfig;
-use crate::sync_folder::mime_for;
 use reqwest::Body;
 use std::path::Path;
 use std::time::Duration;
@@ -54,7 +53,7 @@ async fn upload(
         return Err(err(file, "缺少 sha256，无法声明上传"));
     }
 
-    let mime_type = mime_for(path);
+    let mime_type = crate::file_mime::mime_for(path);
     let req = crate::json_model::FileUploadRequest {
         filename,
         bytes,
@@ -284,10 +283,10 @@ async fn extract_markdown(
 }
 
 /// 单个文件的完整流程：上传 → 解析 → 返回 markdown。
-pub async fn minerU_tackle(
-    client: reqwest::Client,
-    file: db_model::File,
-    config: SyncConfig,
+pub async fn mineru_tackle(
+    client: &reqwest::Client,
+    file: &db_model::File,
+    config: &SyncConfig,
 ) -> Result<String> {
     let file_id = ensure_file_id(&client, &file, &config).await?;
     parse(&client, &file, &config, &file_id).await

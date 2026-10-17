@@ -1,30 +1,16 @@
 
-use crate::db_model;
+use crate::{database, db_model};
+use crate::mineru_requests::mineru_tackle;
 use crate::sync_config;
 use crate::file_mime::SUFFIX_MIME;
 use sha2::{Digest, Sha256};
 use std::io::{self};
-use std::{eprintln, path::Path};
+use std::{eprintln, path::{Path, PathBuf}};
 use tokio;
 use tokio::{fs::File as FsFile, io::AsyncReadExt};
 use tokio::fs;
 use walkdir::WalkDir;
 
-/// 由扩展名查 MIME。查不到返回 `application/octet-stream`。
-/// 比较前统一转小写，避免 `REPORT.PDF` 被漏掉。
-pub fn mime_for(file_path: &Path) -> &'static str {
-    file_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .and_then(|ext| {
-            let lower = ext.to_ascii_lowercase();
-            SUFFIX_MIME
-                .iter()
-                .find(|(suffix, _)| *suffix == lower)
-                .map(|(_, mime)| *mime)
-        })
-        .unwrap_or("application/octet-stream")
-}
 
 
 async fn sha256_file(path: &str) -> io::Result<String> {
@@ -52,25 +38,24 @@ async fn is_supported_file(file_path: &Path) -> bool {
         })
 }
 
-async fn create_output_dir(config: &sync_config::SyncConfig, file_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let parent_path = match file_path.parent() {
-        Some(p) => p,
-        None => {
-            eprintln!("错误: 无法获取文件 {} 的父目录", file_path.display());
-            return Err("无法获取文件的父目录".into());
-        }
-    };
-    let root_dir = &config.sync_dir;
-    let output_dir = &config.output_dir;
-    let rel = match parent_path.strip_prefix(&root_dir) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("错误: {}", e);
-            return Err("无法获取相对路径".into());
-        }
-    };
+async fn get_relative_path(root_dir: &str, file_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    
+    let root_path = Path::new(root_dir);
+    let relative_path = file_path.strip_prefix(root_path).map_err(|_| {
+        format!(
+            "计算相对路径失败: {} 相对于 {}",
+            file_path.display(),
+            root_path.display()
+        )
+    })?;
+    Ok(relative_path.to_string_lossy().into_owned())
+}
 
-    let _output_path = Path::new(output_dir).join(rel);
+async fn create_output_dir(config: &sync_config::SyncConfig, file_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let output_dir = &config.output_dir;
+    let rel = get_relative_path(&config.sync_dir, file_path).await?;
+    let output_path = Path::new(output_dir).join(rel);
+    let _output_path = output_path.parent().ok_or("无法获取输出文件的父目录")?;
     fs::create_dir_all(&_output_path).await.map_err(|e| {
         eprintln!("错误: 创建输出目录 {} 失败: {}", _output_path.display(), e);
         "创建输出目录失败"
@@ -80,7 +65,6 @@ async fn create_output_dir(config: &sync_config::SyncConfig, file_path: &Path) -
 
 pub async fn get_files(config: &sync_config::SyncConfig) -> Result<Vec<db_model::File>, Box<dyn std::error::Error>> {
     let root_dir = &config.sync_dir;
-    let output_dir = &config.output_dir;
     let mut files: Vec<db_model::File> = Vec::new();
 
     for entry in WalkDir::new(root_dir) {
@@ -106,6 +90,26 @@ pub async fn get_files(config: &sync_config::SyncConfig) -> Result<Vec<db_model:
             Err(e) => eprintln!("错误: {}", e),
         }
     }
-
     Ok(files)
+}
+
+pub async fn create_output_files(config: &sync_config::SyncConfig, files: &Vec<db_model::File>) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let mut output_files: Vec<PathBuf> = Vec::new();
+    for file in files {
+        let file_path = Path::new(&file.path);
+        
+        create_output_dir(config, file_path).await?;
+        let markdown = mineru_tackle(&client, file, config).await?;
+
+        let rel = get_relative_path(&config.sync_dir, file_path).await?;
+        let output_file_path = Path::new(&config.output_dir).join(rel);
+        fs::write(&output_file_path, &markdown).await.map_err(|e| {
+            eprintln!("错误: 写入输出文件 {} 失败: {}", output_file_path.display(), e);
+            "写入输出文件失败"
+        })?;
+        println!("已生成输出文件: {}", output_file_path.display());
+        output_files.push(output_file_path);
+    }
+    Ok(output_files)
 }
