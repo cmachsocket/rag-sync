@@ -49,10 +49,21 @@ pub trait DBfunc {
         file_path: &str,
         new_rag_id: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> ;
+    async fn found_file_less_than_run_id(
+        &mut self,
+        file_run_id: i32,
+    ) -> Result<Vec<crate::db_model::File>, Box<dyn std::error::Error>>;
 }
 
 pub async fn establish_db_connection() -> Result<Conn, Box<dyn std::error::Error>> {
     let database_url = "rag-sync.db";
+    let connection = Conn::establish(database_url).await?;
+    Ok(connection)
+}
+
+/// 与 `establish_db_connection` 相同，但库路径可指定。测试要用临时库，
+/// 否则每个用例都会打到仓库里那个真的 rag-sync.db 上。
+pub async fn establish_db_connection_at(database_url: &str) -> Result<Conn, Box<dyn std::error::Error>> {
     let connection = Conn::establish(database_url).await?;
     Ok(connection)
 }
@@ -184,5 +195,19 @@ impl DBfunc for Conn {
             .execute(self)
             .await?;
         Ok(())
+    }
+    async fn found_file_less_than_run_id(
+        &mut self,
+        file_run_id: i32,
+    ) -> Result<Vec<crate::db_model::File>, Box<dyn std::error::Error>>
+    {
+        use crate::db_model::File;
+        use crate::schema::files::dsl::*;
+        let results = files
+            .filter(run_id.lt(file_run_id))
+            .select(File::as_select())
+            .load::<File>(self)
+            .await?;
+        Ok(results)
     }
 }

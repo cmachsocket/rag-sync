@@ -14,9 +14,10 @@ use tokio::fs;
 use tokio::{fs::File as FsFile, io::AsyncReadExt};
 use walkdir::WalkDir;
 
-const NOT_IN_DB: i32 = 0;
+pub const NOT_IN_DB: i32 = 0;
 
-async fn sha256_file(path: &str) -> io::Result<String> {
+/// 供 `tests/` 直接调用：sha256 是「文件变了没有」的唯一判据，不能只测调用方。
+pub async fn sha256_file(path: &str) -> io::Result<String> {
     let mut file = FsFile::open(path).await?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
@@ -31,7 +32,7 @@ async fn sha256_file(path: &str) -> io::Result<String> {
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-async fn is_supported_file(file_path: &Path) -> bool {
+pub async fn is_supported_file(file_path: &Path) -> bool {
     file_path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -41,7 +42,7 @@ async fn is_supported_file(file_path: &Path) -> bool {
         })
 }
 
-async fn get_relative_path(
+pub async fn get_relative_path(
     root_dir: &str,
     file_path: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -179,4 +180,21 @@ pub async fn create_output_files(
         }
     }
     Ok(output_files)
+}
+pub async fn delete_old_files(
+    config: &sync_config::SyncConfig,
+    conn: &mut database::Conn,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let old_files = DBfunc::found_file_less_than_run_id(conn, config.run_id).await?;
+    for file in old_files {
+        let file_path = Path::new(&file.path);
+        if file_path.exists() {
+            fs::remove_file(file_path).await.map_err(|e| {
+                eprintln!("错误: 删除旧文件 {} 失败: {}", file_path.display(), e);
+                "删除旧文件失败"
+            })?;
+            println!("已删除旧文件: {}", file_path.display());
+        }
+    }
+    Ok(())
 }

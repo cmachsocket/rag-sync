@@ -25,13 +25,22 @@ fn zero() -> i32{
 
 impl SyncConfig {
     pub async fn new(conn: &mut crate::database::Conn) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut file = FsFile::open("config.yml")
+        Self::from_file(conn, "config.yml").await
+    }
+
+    /// 与 `new` 相同，只是配置文件路径可指定。生产代码用 `new`；
+    /// 测试需要指向临时目录里的配置，故拆开。
+    pub async fn from_file(
+        conn: &mut crate::database::Conn,
+        path: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut file = FsFile::open(path)
             .await
-            .map_err(|e| format!("打开配置文件 config.yml 失败: {e}"))?;
+            .map_err(|e| format!("打开配置文件 {path} 失败: {e}"))?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)
             .await
-            .map_err(|e| format!("读取配置文件 config.yml 失败: {e}"))?;
+            .map_err(|e| format!("读取配置文件 {path} 失败: {e}"))?;
         let mut config: Self =
             serde_saphyr::from_str(&contents).map_err(|e| format!("解析 config.yml 失败: {e}"))?;
         if config.sync_dir.is_empty() {

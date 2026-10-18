@@ -48,7 +48,7 @@ impl UploadError {
 
 /// 取 basename。上传给服务端的 filename 就是它，服务端存的 file_path 也是它
 /// （不是原始绝对路径），两边靠这个对上。
-fn basename(path: &str) -> String {
+pub fn basename(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -60,7 +60,7 @@ fn basename(path: &str) -> String {
 ///
 /// 这里只剥实测见过的两种（§3.2 的 legacy / §3.3 的 native）。没见过的 hint 不猜 ——
 /// 宁可匹配不上、报出来让人看一眼，也不要按错误的名字删掉别人的文档。
-fn canonical_basename(name: &str) -> String {
+pub fn canonical_basename(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     let stem = match lower.rfind('.') {
         Some(dot) => &lower[..dot],
@@ -74,8 +74,6 @@ fn canonical_basename(name: &str) -> String {
     stem.to_string()
 }
 
-// 上传接口尚未实现，main 也还没接入，因此暂时没有构造点。
-#[allow(dead_code)]
 pub struct RAGRequest<'a> {
     client: &'a reqwest::Client,
     url: &'a str,
@@ -297,7 +295,7 @@ impl<'a> RAGRequest<'a> {
 
     /// 文档是否还在库里。查 paginated 列表，是判定删除是否生效的唯一权威依据。
     /// 必须翻完所有页：服务端 page_size 上限 200，只看第一页会漏判。
-    async fn document_exists(&self, doc_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    pub async fn document_exists(&self, doc_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
         let url = format!("{}/documents/paginated", self.url);
         let mut req = lightrag_model::DocumentsRequest::first_page();
         loop {
@@ -330,7 +328,7 @@ impl<'a> RAGRequest<'a> {
 
     /// 按文件名反查占用它的 doc_id。服务端把文件名当唯一文档键，409 只在
     /// detail 里给文件名，doc_id 得自己从列表里找出来。
-    async fn find_doc_ids_by_filename(
+    pub async fn find_doc_ids_by_filename(
         &self,
         name: &str,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -422,64 +420,5 @@ impl<'a> RAGRequest<'a> {
             .first_doc_id()
             .map(str::to_string)
             .ok_or_else(|| format!("{track_id} 没有返回任何 doc_id").into())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 端到端验证「同名冲突自愈」。
-    ///
-    /// 默认跳过 —— 它打真实服务、会写入知识库。每个文件约 30 s 后台处理，
-    /// 一次跑两轮上传。显式开启：
-    ///
-    /// ```sh
-    /// RAG_LIVE=1 \
-    /// RAG_URL=http://192.168.2.7:9621 \
-    /// RAG_USER=xxx RAG_PASS=xxx \
-    /// cargo test live_upload_conflict -- --nocapture --ignored
-    /// ```
-    #[tokio::test]
-    #[ignore = "打真实服务并写入知识库"]
-    async fn live_upload_conflict() -> Result<(), Box<dyn std::error::Error>> {
-        let url = std::env::var("RAG_URL").expect("RAG_URL");
-        let user = std::env::var("RAG_USER").expect("RAG_USER");
-        let pass = std::env::var("RAG_PASS").expect("RAG_PASS");
-
-        let path = std::env::temp_dir().join("rag_sync_live_conflict_probe.txt");
-        std::fs::write(&path, format!("live conflict probe {}\nbody\n", std::process::id()))?;
-        let path = path.to_string_lossy().into_owned();
-
-        let client = reqwest::Client::new();
-        let rag = RAGRequest::new(&client, &url, &user, &pass).await?;
-
-        // 1. 首次上传
-        std::fs::write(&path, format!("probe round 1 {}\nbody\n", std::process::id()))?;
-        let first = rag.upload_file(&path).await?;
-        println!("第一次上传 -> {first}");
-        assert!(rag.document_exists(&first).await?);
-
-        // 2. 相同文件重传：必然 409，走 remove_conflicting 分支。
-        //    doc_id 由文件名派生（= "doc-" + md5(文件名)，已对 4 个样本核对），
-        //    所以重传拿到的 doc_id 与之前完全一样。
-        let same = rag.upload_file(&path).await?;
-        println!("重传同名 -> {same}");
-        assert_eq!(first, same, "doc_id 由文件名派生，同名重传应完全相同");
-
-        // 3. 改内容重传：仍走冲突分支。doc_id 照样不变（它只看文件名），
-        //    变的只有底下的文档内容 —— 这一点是 doc_id 派生自文件名的直接后果。
-        std::fs::write(&path, format!("probe round 2 DIFFERENT {}\nbody\n", std::process::id()))?;
-        let changed = rag.upload_file(&path).await?;
-        println!("改内容重传 -> {changed}");
-        assert_eq!(first, changed, "doc_id 只看文件名，内容变了也不该变");
-        assert!(rag.document_exists(&changed).await?);
-
-        // 4. 删干净。
-        rag.delete_document(&changed).await?;
-        assert!(!rag.document_exists(&changed).await?);
-        std::fs::remove_file(&path).ok();
-        println!("全部通过");
-        Ok(())
     }
 }
