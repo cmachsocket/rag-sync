@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! 回归防护：每一条都对应一个曾经真实存在、且会**丢用户数据**的缺陷。
 //!
 //! 这些用例原先钉的是错误行为（见 REVIEW 结论）。修复后已翻转为断言正确行为，
@@ -14,7 +13,7 @@ use rag_sync::database::DBfunc;
 use rag_sync::lightrag_requests::canonical_basename;
 use rag_sync::sync_folder::{create_output_files, delete_old_files, get_files};
 
-fn rag_路由(doc_id: &str) -> Vec<Route> {
+fn rag_routes(doc_id: &str) -> Vec<Route> {
     vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload")
@@ -29,7 +28,7 @@ fn rag_路由(doc_id: &str) -> Vec<Route> {
     ]
 }
 
-fn mineru_路由(md: &str) -> Vec<Route> {
+fn mineru_routes(md: &str) -> Vec<Route> {
     vec![
         Route::post("/v1/uploads")
             .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
@@ -47,10 +46,10 @@ fn mineru_路由(md: &str) -> Vec<Route> {
     ]
 }
 
-async fn 环境(md: &str) -> (Env, MockServer) {
+async fn env_with_services(md: &str) -> (Env, MockServer) {
     let mut env = Env::new();
-    let mut routes = mineru_路由(md);
-    routes.extend(rag_路由("doc-1"));
+    let mut routes = mineru_routes(md);
+    routes.extend(rag_routes("doc-1"));
     let server = MockServer::start(routes).await;
     env.mineru_url = server.base_url.clone();
     env.lightrag_url = server.base_url.clone();
@@ -58,7 +57,7 @@ async fn 环境(md: &str) -> (Env, MockServer) {
 }
 
 /// 跑完一轮「扫描 + 转换」，不碰删除步骤
-async fn 同步一轮(
+async fn sync_once(
     env: &Env,
     db: &mut common::TestDb,
     run_id: i32,
@@ -74,7 +73,7 @@ async fn 同步一轮(
 // insert_file 曾把 run_id 写进 id 主键列
 
 #[tokio::test]
-async fn 插入时轮次号写进_run_id_主键交给自增() {
+async fn insert_writes_run_id_and_autoincrements_id() {
     let mut db = common::test_db().await;
 
     DBfunc::insert_file(&mut db.conn, "/sync/a.pdf", "sha-a", 7, Some("doc-1"))
@@ -87,7 +86,7 @@ async fn 插入时轮次号写进_run_id_主键交给自增() {
 }
 
 #[tokio::test]
-async fn 同一轮可以插入多个文件() {
+async fn multiple_files_insert_in_same_run() {
     let mut db = common::test_db().await;
     // 曾经两个文件都用 run_id 当 id，第二个直接 UNIQUE 主键冲突
     for (path, sha) in [("/sync/a.pdf", "s1"), ("/sync/b.pdf", "s2"), ("/sync/c.pdf", "s3")] {
@@ -99,7 +98,7 @@ async fn 同一轮可以插入多个文件() {
 }
 
 #[tokio::test]
-async fn delete_file_只删指定行() {
+async fn delete_file_touches_only_target_row() {
     let mut db = common::test_db().await;
     db.insert_file_row(1, "/sync/a.pdf", "s1", 1, None).await;
     db.insert_file_row(2, "/sync/b.pdf", "s2", 1, None).await;
@@ -116,12 +115,12 @@ async fn delete_file_只删指定行() {
 // run_id 停在 0 -> 同一轮就把刚处理完的原件当成旧文件删掉
 
 #[tokio::test]
-async fn 单轮同步后_用户的原始文档还在() {
+async fn source_documents_survive_a_run() {
     let mut db = common::test_db().await;
-    let (env, _s) = 环境("# 标题").await;
+    let (env, _s) = env_with_services("# 标题").await;
     let src = env.write_source("report.pdf", "用户的原始文档");
 
-    同步一轮(&env, &mut db, 1).await;
+    sync_once(&env, &mut db, 1).await;
     assert_eq!(db.run_id_of(&src).await, 1, "本轮处理过的必须标成当前轮次");
 
     delete_old_files(&env.config(1), &mut db.conn).await.unwrap();
@@ -136,17 +135,17 @@ async fn 单轮同步后_用户的原始文档还在() {
 // 跳过判断拿 DB 的 sha 比 DB 的 sha -> 内容改了也看不见
 
 #[tokio::test]
-async fn 文件内容变了会重新转换并刷新产物() {
+async fn changed_content_is_reprocessed() {
     let mut db = common::test_db().await;
-    let (env, server) = 环境("# 第一版").await;
+    let (env, server) = env_with_services("# 第一版").await;
     let src = env.write_source("a.pdf", "第一次的内容");
 
-    同步一轮(&env, &mut db, 1).await;
+    sync_once(&env, &mut db, 1).await;
     assert_eq!(env.output_text("a.pdf"), "# 第一版");
 
     // 用户改了文件
     std::fs::write(&src, "完全不同的内容").unwrap();
-    同步一轮(&env, &mut db, 2).await;
+    sync_once(&env, &mut db, 2).await;
 
     assert_eq!(
         server.count_to("POST", "/v1/file_parse"),
@@ -163,13 +162,13 @@ async fn 文件内容变了会重新转换并刷新产物() {
 }
 
 #[tokio::test]
-async fn 内容没变就只刷新轮次_不重跑() {
+async fn unchanged_content_only_refreshes_run_id() {
     let mut db = common::test_db().await;
-    let (env, server) = 环境("# 标题").await;
+    let (env, server) = env_with_services("# 标题").await;
     let src = env.write_source("a.pdf", "内容不变");
 
-    同步一轮(&env, &mut db, 1).await;
-    同步一轮(&env, &mut db, 2).await;
+    sync_once(&env, &mut db, 1).await;
+    sync_once(&env, &mut db, 2).await;
 
     assert_eq!(server.count_to("POST", "/v1/file_parse"), 1, "没变就不该重跑");
     assert_eq!(
@@ -183,10 +182,10 @@ async fn 内容没变就只刷新轮次_不重跑() {
 // delete_old_files 曾删同步目录里的用户原件
 
 #[tokio::test]
-async fn 旧文件被清理时只清我们造出来的东西() {
+async fn cleanup_only_removes_generated_artifacts() {
     let mut db = common::test_db().await;
     let mut env = Env::new();
-    let mut routes = rag_路由("doc-old");
+    let mut routes = rag_routes("doc-old");
     // 删除确认：文档列表里已经没有它了
     routes.push(
         Route::post("/documents/paginated")
@@ -233,11 +232,11 @@ async fn 旧文件被清理时只清我们造出来的东西() {
 }
 
 #[tokio::test]
-async fn 没有旧文件时不去连知识库() {
+async fn cleanup_skips_service_when_nothing_is_old() {
     let mut db = common::test_db().await;
-    let (env, server) = 环境("# 标题").await;
+    let (env, server) = env_with_services("# 标题").await;
     env.write_source("a.pdf", "内容");
-    同步一轮(&env, &mut db, 1).await;
+    sync_once(&env, &mut db, 1).await;
 
     let before = server.count_to("POST", "/login");
     // 同一轮收尾：本轮扫到的文件 run_id 就是 1，没有「旧文件」
@@ -258,11 +257,11 @@ async fn 没有旧文件时不去连知识库() {
 }
 
 #[tokio::test]
-async fn 本轮文件不会被清理() {
+async fn current_run_files_are_never_cleaned() {
     let mut db = common::test_db().await;
-    let (env, server) = 环境("# 标题").await;
+    let (env, server) = env_with_services("# 标题").await;
     env.write_source("a.pdf", "内容");
-    同步一轮(&env, &mut db, 5).await;
+    sync_once(&env, &mut db, 5).await;
 
     delete_old_files(&env.config(5), &mut db.conn).await.unwrap();
 
@@ -271,13 +270,13 @@ async fn 本轮文件不会被清理() {
 }
 
 #[tokio::test]
-async fn 没有待处理文件时不连任何服务() {
+async fn no_pending_files_means_no_service_calls() {
     let mut db = common::test_db().await;
-    let (env, server) = 环境("# 标题").await;
-    同步一轮(&env, &mut db, 1).await;
+    let (env, server) = env_with_services("# 标题").await;
+    sync_once(&env, &mut db, 1).await;
     let before = server.count_to("POST", "/login");
 
-    同步一轮(&env, &mut db, 2).await;
+    sync_once(&env, &mut db, 2).await;
 
     assert_eq!(
         server.count_to("POST", "/login"),
@@ -289,11 +288,11 @@ async fn 没有待处理文件时不连任何服务() {
 /// 完整生命周期：两轮同步，中间用户自己删掉一个文件。
 /// 断言「用户删掉的」和「用户还在的」两种结果都对。
 #[tokio::test]
-async fn 两轮同步_用户删掉的文件被清理_剩下的文件完好() {
+async fn two_rounds_cleanup_deleted_keep_rest() {
     let mut db = common::test_db().await;
     let mut env = Env::new();
-    let mut routes = mineru_路由("# 标题");
-    routes.extend(rag_路由("doc-keep"));
+    let mut routes = mineru_routes("# 标题");
+    routes.extend(rag_routes("doc-keep"));
     routes.push(Route::post("/documents/upload").and(R::json(
         200,
         r#"{"status":"success","message":"ok","track_id":"tr-1"}"#,
@@ -319,7 +318,7 @@ async fn 两轮同步_用户删掉的文件被清理_剩下的文件完好() {
     let gone = env.write_source("gone.md", "用户后来删掉了");
 
     // 第一轮：两个文件都入库
-    同步一轮(&env, &mut db, 1).await;
+    sync_once(&env, &mut db, 1).await;
     assert!(DBfunc::file_exists(&mut db.conn, &keep).await.unwrap());
     assert!(DBfunc::file_exists(&mut db.conn, &gone).await.unwrap());
     assert_eq!(
@@ -360,9 +359,9 @@ async fn 两轮同步_用户删掉的文件被清理_剩下的文件完好() {
 // ensure_file_id 曾把 DB 行号当成 MinerU 的 file_id
 
 #[tokio::test]
-async fn 重新处理时用真实的矿U_file_id() {
+async fn reprocess_uses_real_mineru_file_id() {
     let d = tempfile::tempdir().unwrap();
-    let server = MockServer::start(mineru_路由("# 转换结果")).await;
+    let server = MockServer::start(mineru_routes("# 转换结果")).await;
     let path = d.path().join("a.pdf");
     std::fs::write(&path, "x").unwrap();
 
@@ -404,7 +403,7 @@ async fn 重新处理时用真实的矿U_file_id() {
 // canonical_basename 剥 hint 后残留点号
 
 #[test]
-fn 带hint与不带hint归一到同一个键() {
+fn parser_hint_normalises_to_same_key() {
     for hint in ["[native]", "[legacy]"] {
         assert_eq!(
             canonical_basename(&format!("a.{hint}.md")),
@@ -422,7 +421,7 @@ fn 带hint与不带hint归一到同一个键() {
 }
 
 #[tokio::test]
-async fn 冲突自愈对带hint的文档有效() {
+async fn conflict_selfheal_works_with_parser_hint() {
     let client = reqwest::Client::new();
     let server = MockServer::start(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
@@ -471,7 +470,7 @@ async fn 冲突自愈对带hint的文档有效() {
 // 配置里的 ~ 不展开
 
 #[tokio::test]
-async fn 配置里的波浪号被展开() {
+async fn tilde_in_config_is_expanded() {
     let mut db = common::test_db().await;
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("config.yml");
@@ -495,7 +494,7 @@ async fn 配置里的波浪号被展开() {
 }
 
 #[tokio::test]
-async fn 路径里不是开头的波浪号不动() {
+async fn tilde_inside_path_is_left_alone() {
     let mut db = common::test_db().await;
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("config.yml");
@@ -517,7 +516,7 @@ async fn 路径里不是开头的波浪号不动() {
 // 同步目录不存在时静默跑完一轮空同步
 
 #[tokio::test]
-async fn 同步目录不存在时报错() {
+async fn missing_sync_dir_is_an_error() {
     let mut db = common::test_db().await;
     let env = Env::new();
     let mut cfg = env.config(1);

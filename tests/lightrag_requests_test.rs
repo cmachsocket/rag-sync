@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! RAGRequest 对着 mock 服务端跑完整链路。
 //!
 //! 覆盖的是最贵的那条路径：409 同名冲突 -> 按文件名反查 doc_id -> 删除 ->
@@ -11,7 +10,7 @@ use common::{CannedResponse as R, MockServer, Route};
 
 use rag_sync::lightrag_requests::{basename, canonical_basename, RAGRequest};
 
-fn 上传成功体(track: &str) -> R {
+fn upload_ok(track: &str) -> R {
     R::json(
         200,
         format!(
@@ -20,7 +19,7 @@ fn 上传成功体(track: &str) -> R {
     )
 }
 
-fn track_已处理(doc_id: &str) -> R {
+fn track_processed(doc_id: &str) -> R {
     R::json(
         200,
         format!(
@@ -31,7 +30,7 @@ fn track_已处理(doc_id: &str) -> R {
     )
 }
 
-fn 文档页(docs: &str, has_next: bool) -> R {
+fn docs_page(docs: &str, has_next: bool) -> R {
     R::json(
         200,
         format!(
@@ -41,17 +40,17 @@ fn 文档页(docs: &str, has_next: bool) -> R {
     )
 }
 
-async fn 起服务(routes: Vec<Route>) -> (MockServer, tempfile::TempDir) {
+async fn setup(routes: Vec<Route>) -> (MockServer, tempfile::TempDir) {
     let d = tempfile::tempdir().unwrap();
     std::fs::write(d.path().join("a.md"), "# a\n内容\n").unwrap();
     (MockServer::start(routes).await, d)
 }
 
-fn 上传路径(d: &tempfile::TempDir) -> String {
+fn upload_path(d: &tempfile::TempDir) -> String {
     d.path().join("a.md").to_string_lossy().into_owned()
 }
 
-async fn 客户端<'a>(
+async fn logged_in<'a>(
     server: &'a MockServer,
     client: &'a reqwest::Client,
 ) -> RAGRequest<'a> {
@@ -63,7 +62,7 @@ async fn 客户端<'a>(
 // ---------------------------------------------------------------- 文件名归一
 
 #[test]
-fn basename_只取最后一段() {
+fn basename_takes_last_segment() {
     assert_eq!(basename("/home/u/文档/a.md"), "a.md");
     assert_eq!(basename("a.md"), "a.md");
     assert_eq!(basename(""), "");
@@ -72,14 +71,14 @@ fn basename_只取最后一段() {
 }
 
 #[test]
-fn canonical_basename_不猜没见过的hint() {
+fn canonical_basename_leaves_unknown_hints() {
     // 宁可匹配不上、报出来让人看一眼，也不要按错的名字删掉别人的文档
     assert_eq!(canonical_basename("abc.[weird].docx"), "abc.[weird]");
     assert_eq!(canonical_basename("abc.v2.docx"), "abc.v2");
 }
 
 #[test]
-fn canonical_basename_只剥结尾的hint() {
+fn canonical_basename_strips_trailing_hint() {
     assert_eq!(canonical_basename("[native].abc.docx"), "[native].abc");
     assert_eq!(canonical_basename("abc.md"), "abc");
     assert_eq!(canonical_basename("abc"), "abc");
@@ -92,20 +91,43 @@ fn canonical_basename_只剥结尾的hint() {
 // ---------------------------------------------------------------- 登录
 
 #[tokio::test]
-async fn 登录成功_后续请求带_bearer_token() {
+async fn login_with_empty_token_is_rejected() {
+    // 空 token 会让后续请求以 401 的形式失败，把「凭据没拿到」伪装成接口问题
+    let (server, _d) = setup(vec![
+        Route::post("/login").and(R::json(200, r#"{"access_token":""}"#)),
+        Route::post("/documents/upload").once(),
+    ])
+    .await;
+
     let client = reqwest::Client::new();
-    let (server, d) = 起服务(vec![
+    let err = RAGRequest::new(&client, &server.base_url, "u", "p")
+        .await
+        .err()
+        .expect("空 token 应返回 Err")
+        .to_string();
+    assert!(err.contains("access_token"), "{err}");
+    assert_eq!(
+        server.count_to("POST", "/documents/upload"),
+        0,
+        "没拿到凭据就不该发出业务请求"
+    );
+}
+
+#[tokio::test]
+async fn successful_login_sends_bearer_token() {
+    let client = reqwest::Client::new();
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(
             200,
             r#"{"access_token":"JWT-123","token_type":"bearer","auth_configured":true}"#,
         )),
-        Route::get("/documents/track_status/t1").and(track_已处理("doc-1")),
-        Route::post("/documents/upload").and(上传成功体("t1")),
+        Route::get("/documents/track_status/t1").and(track_processed("doc-1")),
+        Route::post("/documents/upload").and(upload_ok("t1")),
     ])
     .await;
 
-    let rag = 客户端(&server, &client).await;
-    let _ = rag.upload_file(&上传路径(&d)).await;
+    let rag = logged_in(&server, &client).await;
+    let _ = rag.upload_file(&upload_path(&d)).await;
 
     let login = server.requests_to("POST", "/login");
     assert_eq!(login.len(), 1);
@@ -120,9 +142,9 @@ async fn 登录成功_后续请求带_bearer_token() {
 }
 
 #[tokio::test]
-async fn 登录失败_把_body_里的真实原因带出来() {
+async fn failed_login_surfaces_response_body() {
     let client = reqwest::Client::new();
-    let (server, _d) = 起服务(vec![Route::post("/login").and(R::json(
+    let (server, _d) = setup(vec![Route::post("/login").and(R::json(
         401,
         r#"{"detail":"Incorrect username or password"}"#,
     ))])
@@ -141,9 +163,9 @@ async fn 登录失败_把_body_里的真实原因带出来() {
 }
 
 #[tokio::test]
-async fn 登录返回非_json_报错带原文() {
+async fn non_json_login_response_is_rejected() {
     let client = reqwest::Client::new();
-    let (server, _d) = 起服务(vec![
+    let (server, _d) = setup(vec![
         Route::post("/login").and(R::text(200, "not json at all")),
         Route::post("/documents/upload").once(),
     ])
@@ -161,33 +183,33 @@ async fn 登录返回非_json_报错带原文() {
 // ---------------------------------------------------------------- 上传 + 轮询
 
 #[tokio::test]
-async fn 上传成功_等轮询终态后返回_doc_id() {
+async fn upload_returns_doc_id_after_polling() {
     let client = reqwest::Client::new();
-    let (server, d) = 起服务(vec![
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
-        Route::post("/documents/upload").and(上传成功体("track-9")),
-        Route::get("/documents/track_status/track-9").and(track_已处理("doc-final")),
+        Route::post("/documents/upload").and(upload_ok("track-9")),
+        Route::get("/documents/track_status/track-9").and(track_processed("doc-final")),
     ])
     .await;
 
-    let rag = 客户端(&server, &client).await;
-    let doc_id = rag.upload_file(&上传路径(&d)).await.unwrap();
+    let rag = logged_in(&server, &client).await;
+    let doc_id = rag.upload_file(&upload_path(&d)).await.unwrap();
     assert_eq!(doc_id, "doc-final");
     assert_eq!(server.count_to("GET", "/documents/track_status/track-9"), 1);
 }
 
 #[tokio::test]
-async fn 上传的_filename_是_basename_不是全路径() {
+async fn upload_filename_is_basename() {
     let client = reqwest::Client::new();
-    let (server, d) = 起服务(vec![
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
-        Route::post("/documents/upload").and(上传成功体("t1")),
-        Route::get("/documents/track_status/t1").and(track_已处理("doc-1")),
+        Route::post("/documents/upload").and(upload_ok("t1")),
+        Route::get("/documents/track_status/t1").and(track_processed("doc-1")),
     ])
     .await;
 
-    let rag = 客户端(&server, &client).await;
-    rag.upload_file(&上传路径(&d)).await.unwrap();
+    let rag = logged_in(&server, &client).await;
+    rag.upload_file(&upload_path(&d)).await.unwrap();
 
     let body = server.requests_to("POST", "/documents/upload")[0].body_str();
     assert!(body.contains(r#"filename="a.md""#), "应传 basename: {body}");
@@ -198,9 +220,9 @@ async fn 上传的_filename_是_basename_不是全路径() {
 }
 
 #[tokio::test]
-async fn 上传返回非_success_当失败() {
+async fn upload_non_success_status_is_failure() {
     let client = reqwest::Client::new();
-    let (server, d) = 起服务(vec![
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(R::json(
             200,
@@ -210,8 +232,8 @@ async fn 上传返回非_success_当失败() {
     ])
     .await;
 
-    let err = 客户端(&server, &client).await
-        .upload_file(&上传路径(&d))
+    let err = logged_in(&server, &client).await
+        .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
         .to_string();
@@ -224,19 +246,19 @@ async fn 上传返回非_success_当失败() {
 }
 
 #[tokio::test]
-async fn 上传遇到_401_原样上抛_不重试() {
+async fn upload_401_is_not_retried() {
     let client = reqwest::Client::new();
     // 401 重试没有意义（凭据错），只会把一次失败拖成两次请求，
     // 并把真实错误掩盖成一次莫名其妙的冲突失败。
-    let (server, d) = 起服务(vec![
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(R::json(401, r#"{"detail":"token 过期"}"#)),
         Route::post("/documents/paginated").once(),
     ])
     .await;
 
-    let err = 客户端(&server, &client).await
-        .upload_file(&上传路径(&d))
+    let err = logged_in(&server, &client).await
+        .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
         .to_string();
@@ -250,11 +272,11 @@ async fn 上传遇到_401_原样上抛_不重试() {
 }
 
 #[tokio::test]
-async fn 后台处理失败_把_error_msg_带出来() {
+async fn background_failure_surfaces_error_msg() {
     let client = reqwest::Client::new();
-    let (server, d) = 起服务(vec![
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
-        Route::post("/documents/upload").and(上传成功体("t1")),
+        Route::post("/documents/upload").and(upload_ok("t1")),
         Route::get("/documents/track_status/t1").and(R::json(
             200,
             r#"{"track_id":"t1","total_count":1,"status_summary":{"failed":1},
@@ -264,8 +286,8 @@ async fn 后台处理失败_把_error_msg_带出来() {
     ])
     .await;
 
-    let err = 客户端(&server, &client).await
-        .upload_file(&上传路径(&d))
+    let err = logged_in(&server, &client).await
+        .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
         .to_string();
@@ -279,9 +301,9 @@ async fn 后台处理失败_把_error_msg_带出来() {
 // ---------------------------------------------------------------- 409 自愈
 
 #[tokio::test]
-async fn 冲突_409_删掉旧文档后重传() {
+async fn conflict_409_deletes_then_reuploads() {
     let client = reqwest::Client::new();
-    let (server, d) = 起服务(vec![
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         // 第一次上传：409；第二次：成功
         Route::post("/documents/upload")
@@ -289,22 +311,22 @@ async fn 冲突_409_删掉旧文档后重传() {
                 409,
                 r#"{"detail":"Document 'a.md' already exists in documents storage"}"#,
             ))
-            .and(上传成功体("t1")),
+            .and(upload_ok("t1")),
         // 反查时旧文档还在
         Route::post("/documents/paginated")
-            .and(文档页(r#"{"id":"doc-old","status":"processed","file_path":"a.md"}"#, false))
+            .and(docs_page(r#"{"id":"doc-old","status":"processed","file_path":"a.md"}"#, false))
             // 删完再查：没了
-            .and(文档页("", false)),
+            .and(docs_page("", false)),
         Route::delete("/documents/delete_document").and(R::json(
             200,
             r#"{"status":"deletion_started","message":"已调度","doc_id":"doc-old"}"#,
         )),
-        Route::get("/documents/track_status/t1").and(track_已处理("doc-new")),
+        Route::get("/documents/track_status/t1").and(track_processed("doc-new")),
     ])
     .await;
 
-    let rag = 客户端(&server, &client).await;
-    let doc_id = rag.upload_file(&上传路径(&d)).await.unwrap();
+    let rag = logged_in(&server, &client).await;
+    let doc_id = rag.upload_file(&upload_path(&d)).await.unwrap();
     assert_eq!(doc_id, "doc-new");
 
     // 顺序：上传(409) -> 反查 -> 删除 -> 确认消失 -> 重传 -> 轮询
@@ -335,21 +357,21 @@ async fn 冲突_409_删掉旧文档后重传() {
 }
 
 #[tokio::test]
-async fn 冲突_409_但列表查不到_报错指向_input_目录残留() {
+async fn conflict_409_without_list_entry_reports_input_dir() {
     let client = reqwest::Client::new();
-    let (server, d) = 起服务(vec![
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(R::json(
             409,
             r#"{"detail":"file exists in input dir"}"#,
         )),
-        Route::post("/documents/paginated").and(文档页("", false)),
+        Route::post("/documents/paginated").and(docs_page("", false)),
         Route::delete("/documents/delete_document").once(),
     ])
     .await;
 
-    let err = 客户端(&server, &client).await
-        .upload_file(&上传路径(&d))
+    let err = logged_in(&server, &client).await
+        .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
         .to_string();
@@ -362,12 +384,12 @@ async fn 冲突_409_但列表查不到_报错指向_input_目录残留() {
 }
 
 #[tokio::test]
-async fn 冲突_409_匹配到多个文档_拒绝自动删除() {
+async fn conflict_409_with_multiple_matches_refuses_to_delete() {
     let client = reqwest::Client::new();
-    let (server, d) = 起服务(vec![
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(R::json(409, r#"{"detail":"dup"}"#)),
-        Route::post("/documents/paginated").and(文档页(
+        Route::post("/documents/paginated").and(docs_page(
             r#"{"id":"doc-1","status":"processed","file_path":"a.md"},
                 {"id":"doc-2","status":"processed","file_path":"A.MD"}"#,
             false,
@@ -376,8 +398,8 @@ async fn 冲突_409_匹配到多个文档_拒绝自动删除() {
     ])
     .await;
 
-    let err = 客户端(&server, &client).await
-        .upload_file(&上传路径(&d))
+    let err = logged_in(&server, &client).await
+        .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
         .to_string();
@@ -390,17 +412,17 @@ async fn 冲突_409_匹配到多个文档_拒绝自动删除() {
 }
 
 #[tokio::test]
-async fn 冲突_409_清理后仍冲突_只重试一次并带服务端信息() {
+async fn conflict_409_retries_only_once() {
     let client = reqwest::Client::new();
     // 只重试一次：再循环下去只是把一次失败拖成无数次请求
-    let (server, d) = 起服务(vec![
+    let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload")
             .and(R::json(409, r#"{"detail":"still conflicting"}"#))
             .and(R::json(409, r#"{"detail":"still conflicting again"}"#)),
         Route::post("/documents/paginated")
-            .and(文档页(r#"{"id":"doc-old","status":"processed","file_path":"a.md"}"#, false))
-            .and(文档页("", false)),
+            .and(docs_page(r#"{"id":"doc-old","status":"processed","file_path":"a.md"}"#, false))
+            .and(docs_page("", false)),
         Route::delete("/documents/delete_document").and(R::json(
             200,
             r#"{"status":"deletion_started","message":"ok","doc_id":"doc-old"}"#,
@@ -408,8 +430,8 @@ async fn 冲突_409_清理后仍冲突_只重试一次并带服务端信息() {
     ])
     .await;
 
-    let err = 客户端(&server, &client).await
-        .upload_file(&上传路径(&d))
+    let err = logged_in(&server, &client).await
+        .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
         .to_string();
@@ -425,9 +447,9 @@ async fn 冲突_409_清理后仍冲突_只重试一次并带服务端信息() {
 // ---------------------------------------------------------------- 删除
 
 #[tokio::test]
-async fn 删除返回_busy_报错且不做任何后续轮询() {
+async fn delete_busy_fails_without_polling() {
     let client = reqwest::Client::new();
-    let (server, _d) = 起服务(vec![
+    let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::delete("/documents/delete_document")
             .and(R::json(200, r#"{"status":"busy","message":"pipeline 被占用"}"#)),
@@ -435,7 +457,7 @@ async fn 删除返回_busy_报错且不做任何后续轮询() {
     ])
     .await;
 
-    let err = 客户端(&server, &client)
+    let err = logged_in(&server, &client)
         .await
         .delete_document("doc-1")
         .await
@@ -450,35 +472,35 @@ async fn 删除返回_busy_报错且不做任何后续轮询() {
 }
 
 #[tokio::test]
-async fn 删除返回未知状态_报错而不是当成功() {
+async fn delete_unknown_status_is_failure() {
     let client = reqwest::Client::new();
-    let (server, _d) = 起服务(vec![
+    let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::delete("/documents/delete_document")
             .and(R::json(200, r#"{"status":"not_allowed","message":"无权限"}"#)),
     ])
     .await;
 
-    let err = 客户端(&server, &client).await.delete_document("doc-1").await.unwrap_err().to_string();
+    let err = logged_in(&server, &client).await.delete_document("doc-1").await.unwrap_err().to_string();
     assert!(err.contains("not_allowed"), "{err}");
 }
 
 #[tokio::test]
-async fn 删除已调度_要等_doc_id_从列表消失才算成功() {
+async fn delete_waits_for_doc_to_disappear() {
     let client = reqwest::Client::new();
-    let (server, _d) = 起服务(vec![
+    let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::delete("/documents/delete_document").and(R::json(
             200,
             r#"{"status":"deletion_started","message":"ok","doc_id":"doc-1"}"#,
         )),
         Route::post("/documents/paginated")
-            .and(文档页(r#"{"id":"doc-1","status":"processed","file_path":"a.md"}"#, false))
-            .and(文档页("", false)),
+            .and(docs_page(r#"{"id":"doc-1","status":"processed","file_path":"a.md"}"#, false))
+            .and(docs_page("", false)),
     ])
     .await;
 
-    客户端(&server, &client).await.delete_document("doc-1").await.unwrap();
+    logged_in(&server, &client).await.delete_document("doc-1").await.unwrap();
     assert_eq!(
         server.count_to("POST", "/documents/paginated"),
         2,
@@ -489,9 +511,9 @@ async fn 删除已调度_要等_doc_id_从列表消失才算成功() {
 // ---------------------------------------------------------------- 分页判定
 
 #[tokio::test]
-async fn document_exists_要翻完所有页() {
+async fn document_exists_reads_all_pages() {
     let client = reqwest::Client::new();
-    let (server, _d) = 起服务(vec![
+    let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/paginated")
             .and(R::json(
@@ -512,7 +534,7 @@ async fn document_exists_要翻完所有页() {
     ])
     .await;
 
-    let rag = 客户端(&server, &client).await;
+    let rag = logged_in(&server, &client).await;
     assert!(
         rag.document_exists("doc-want").await.unwrap(),
         "只看第一页会漏判 —— 目标在第 3 页"
@@ -531,9 +553,9 @@ async fn document_exists_要翻完所有页() {
 }
 
 #[tokio::test]
-async fn 反查文件名_按服务端存的_basename_匹配() {
+async fn find_by_filename_matches_stored_basename() {
     let client = reqwest::Client::new();
-    let (server, _d) = 起服务(vec![
+    let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/paginated").and(R::json(
             200,
@@ -545,7 +567,7 @@ async fn 反查文件名_按服务端存的_basename_匹配() {
     ])
     .await;
 
-    let found = 客户端(&server, &client)
+    let found = logged_in(&server, &client)
         .await
         .find_doc_ids_by_filename("a.md")
         .await
@@ -554,9 +576,9 @@ async fn 反查文件名_按服务端存的_basename_匹配() {
 }
 
 #[tokio::test]
-async fn 反查文件名_大小写不同的同名文档算多条() {
+async fn find_by_filename_returns_all_case_matches() {
     let client = reqwest::Client::new();
-    let (server, _d) = 起服务(vec![
+    let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/paginated").and(R::json(
             200,
@@ -568,7 +590,7 @@ async fn 反查文件名_大小写不同的同名文档算多条() {
     ])
     .await;
 
-    let found = 客户端(&server, &client)
+    let found = logged_in(&server, &client)
         .await
         .find_doc_ids_by_filename("a.md")
         .await
@@ -577,15 +599,15 @@ async fn 反查文件名_大小写不同的同名文档算多条() {
 }
 
 #[tokio::test]
-async fn 分页查询_非_2xx_报错并带_body() {
+async fn pagination_non_2xx_surfaces_body() {
     let client = reqwest::Client::new();
-    let (server, _d) = 起服务(vec![
+    let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/paginated").and(R::json(503, r#"{"detail":"维护中"}"#)),
     ])
     .await;
 
-    let err = 客户端(&server, &client)
+    let err = logged_in(&server, &client)
         .await
         .document_exists("doc-1")
         .await

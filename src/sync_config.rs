@@ -28,7 +28,7 @@ fn zero() -> i32 {
 /// 不展开的话，`sync_dir: "~/Documents"` 会被当成工作目录下一个叫
 /// `~/Documents` 的相对路径：目录扫不到（这轮等于什么都没干），更糟的是
 /// DB 里存下的 path 与实际位置对不上，历史记录全成孤儿。
-fn 展开家目录(path: &str) -> String {
+fn expand_home_dir(path: &str) -> String {
     let rest = if path == "~" {
         ""
     } else if let Some(rest) = path.strip_prefix("~/") {
@@ -88,8 +88,8 @@ impl SyncConfig {
         }
         // 统一在加载时展开：之后 sync_dir / output_dir 一定是绝对路径，
         // get_files 存进 DB 的 path 与 delete_old_files 拼回的路径才对得上。
-        config.sync_dir = 展开家目录(&config.sync_dir);
-        config.output_dir = 展开家目录(&config.output_dir);
+        config.sync_dir = expand_home_dir(&config.sync_dir);
+        config.output_dir = expand_home_dir(&config.output_dir);
         let old_counter: crate::db_model::RunCounter =match database::DBfunc::get_run_counter(conn).await? {
             Some(r) => r,
             None => return Err("无法获取运行计数器".into()),

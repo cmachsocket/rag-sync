@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! create_output_files 的端到端链路：扫到的文件 -> MinerU 转换 -> 写产物 ->
 //! 上传 LightRAG -> 落库。
 //!
@@ -11,16 +10,16 @@ use common::{CannedResponse as R, Env, MockServer, Route};
 use rag_sync::database::DBfunc;
 use rag_sync::sync_folder::{create_output_files, get_files};
 
-fn rag_上传成功() -> Route {
+fn rag_login_ok() -> Route {
     Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#))
 }
 
-fn 上传响应() -> Route {
+fn upload_ok() -> Route {
     Route::post("/documents/upload")
         .and(R::json(200, r#"{"status":"success","message":"ok","track_id":"tr-1"}"#))
 }
 
-fn track_终态(doc_id: &str) -> Route {
+fn track_terminal(doc_id: &str) -> Route {
     Route::get("/documents/track_status/tr-1").and(R::json(
         200,
         format!(
@@ -30,7 +29,7 @@ fn track_终态(doc_id: &str) -> Route {
     ))
 }
 
-fn mineru_路由(markdown: &str) -> Vec<Route> {
+fn mineru_routes(markdown: &str) -> Vec<Route> {
     vec![
         Route::post("/v1/uploads")
             .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
@@ -49,12 +48,12 @@ fn mineru_路由(markdown: &str) -> Vec<Route> {
 }
 
 /// 起一套完整环境：临时 sync/out 目录 + MinerU + LightRAG。
-async fn 环境(mineru_md: &str) -> (Env, MockServer) {
+async fn env_with_services(mineru_md: &str) -> (Env, MockServer) {
     let mut env = Env::new();
-    let mut routes = mineru_路由(mineru_md);
-    routes.push(rag_上传成功());
-    routes.push(上传响应());
-    routes.push(track_终态("doc-1"));
+    let mut routes = mineru_routes(mineru_md);
+    routes.push(rag_login_ok());
+    routes.push(upload_ok());
+    routes.push(track_terminal("doc-1"));
     let server = MockServer::start(routes).await;
     env.mineru_url = server.base_url.clone();
     env.lightrag_url = server.base_url.clone();
@@ -62,9 +61,9 @@ async fn 环境(mineru_md: &str) -> (Env, MockServer) {
 }
 
 #[tokio::test]
-async fn 新文件_产出_上传_入库_一条龙() {
+async fn new_file_end_to_end() {
     let mut db = common::test_db().await;
-    let (env, server) = 环境("# 标题\n\n正文").await;
+    let (env, server) = env_with_services("# 标题\n\n正文").await;
     let src = env.write_source("a.pdf", "pdf 内容");
 
     let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
@@ -96,9 +95,9 @@ async fn 新文件_产出_上传_入库_一条龙() {
 }
 
 #[tokio::test]
-async fn 子目录结构_原样保留到输出目录() {
+async fn nested_layout_preserved_in_output() {
     let mut db = common::test_db().await;
-    let (env, _s) = 环境("md").await;
+    let (env, _s) = env_with_services("md").await;
     env.write_source("2024/一季度/a.pdf", "x");
 
     let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
@@ -110,9 +109,9 @@ async fn 子目录结构_原样保留到输出目录() {
 }
 
 #[tokio::test]
-async fn 内容没变的已有文件_跳过_不重跑_mineru_也不重传() {
+async fn unchanged_file_is_skipped() {
     let mut db = common::test_db().await;
-    let (env, server) = 环境("# 新内容").await;
+    let (env, server) = env_with_services("# 新内容").await;
     let src = env.write_source("a.pdf", "pdf 内容");
     let sha = rag_sync::sync_folder::sha256_file(&src).await.unwrap();
     db.insert_file_row(1, &src, &sha, 1, Some("doc-old")).await;
@@ -128,7 +127,7 @@ async fn 内容没变的已有文件_跳过_不重跑_mineru_也不重传() {
 }
 
 #[tokio::test]
-async fn mineru_失败_不写产物_不入库() {
+async fn mineru_failure_writes_nothing() {
     let mut db = common::test_db().await;
     let mut env = Env::new();
     let server = MockServer::start(vec![
@@ -158,10 +157,10 @@ async fn mineru_失败_不写产物_不入库() {
 }
 
 #[tokio::test]
-async fn lightrag_上传失败_报错且不写_rag_id() {
+async fn rag_upload_failure_records_nothing() {
     let mut db = common::test_db().await;
     let mut env = Env::new();
-    let mut routes = mineru_路由("# 标题");
+    let mut routes = mineru_routes("# 标题");
     routes.push(Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)));
     routes.push(
         Route::post("/documents/upload")
@@ -185,10 +184,10 @@ async fn lightrag_上传失败_报错且不写_rag_id() {
 }
 
 #[tokio::test]
-async fn lightrag_登录失败_整轮快速失败() {
+async fn rag_login_failure_fails_fast() {
     let mut db = common::test_db().await;
     let mut env = Env::new();
-    let mut routes = mineru_路由("# 标题");
+    let mut routes = mineru_routes("# 标题");
     routes.push(
         Route::post("/login").and(R::json(401, r#"{"detail":"Incorrect username or password"}"#)),
     );
@@ -211,7 +210,7 @@ async fn lightrag_登录失败_整轮快速失败() {
 }
 
 #[tokio::test]
-async fn 多个文件_逐个处理_一个失败不吞掉前面的成功() {
+async fn one_failure_is_not_swallowed() {
     let mut db = common::test_db().await;
     let mut env = Env::new();
     let server = MockServer::start(vec![

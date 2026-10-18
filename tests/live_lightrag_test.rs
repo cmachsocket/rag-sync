@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! 打真实 LightRAG 服务的端到端测试，默认全部跳过。
 //!
 //! 需要真实的账号与网络，`cargo test` 默认不会跑；显式开启：
@@ -13,7 +12,7 @@
 
 use rag_sync::lightrag_requests::RAGRequest;
 
-fn 环境() -> (String, String, String) {
+fn credentials() -> (String, String, String) {
     (
         std::env::var("RAG_URL").expect("需要环境变量 RAG_URL"),
         std::env::var("RAG_USER").expect("需要环境变量 RAG_USER"),
@@ -28,7 +27,7 @@ fn 环境() -> (String, String, String) {
 #[tokio::test]
 #[ignore = "打真实服务并写入知识库"]
 async fn live_upload_conflict() -> Result<(), Box<dyn std::error::Error>> {
-    let (url, user, pass) = 环境();
+    let (url, user, pass) = credentials();
 
     let path = std::env::temp_dir().join("rag_sync_live_conflict_probe.txt");
     std::fs::write(&path, format!("live conflict probe {}\nbody\n", std::process::id()))?;

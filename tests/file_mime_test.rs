@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! 扩展名 -> MIME 映射。表是照抄 MinerU 服务端的，抄错一个字符就是解析器选错，
 //! 而且要到解析阶段才暴露，所以固定住整张表。
 
@@ -7,7 +6,7 @@ use rag_sync::sync_folder::is_supported_file;
 use std::path::Path;
 
 #[test]
-fn 表里_25_个后缀_且无重复() {
+fn suffix_table_has_25_unique_entries() {
     assert_eq!(SUFFIX_MIME.len(), 25);
     let mut seen = std::collections::HashSet::new();
     for (suffix, _) in SUFFIX_MIME.iter() {
@@ -16,7 +15,7 @@ fn 表里_25_个后缀_且无重复() {
 }
 
 #[test]
-fn 后缀全小写_且MIME形状对() {
+fn suffixes_lowercase_and_mime_well_formed() {
     for (suffix, mime) in SUFFIX_MIME.iter() {
         assert_eq!(*suffix, suffix.to_ascii_lowercase(), "后缀必须小写: {suffix}");
         assert!(!suffix.is_empty());
@@ -25,7 +24,7 @@ fn 后缀全小写_且MIME形状对() {
 }
 
 #[test]
-fn 常见后缀映射正确() {
+fn common_suffixes_map_correctly() {
     let cases = [
         ("a.pdf", "application/pdf"),
         ("a.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
@@ -49,7 +48,7 @@ fn 常见后缀映射正确() {
 }
 
 #[test]
-fn 大写后缀同样命中() {
+fn uppercase_suffix_still_matches() {
     assert_eq!(mime_for(Path::new("REPORT.PDF")), "application/pdf");
     assert_eq!(
         mime_for(Path::new("a.DoCx")),
@@ -58,13 +57,13 @@ fn 大写后缀同样命中() {
 }
 
 #[test]
-fn 只看最后一个后缀() {
+fn only_last_suffix_counts() {
     assert_eq!(mime_for(Path::new("归档.2024.final.pdf")), "application/pdf");
     assert_eq!(mime_for(Path::new("/tmp/a/b/c.tar.gz")), "application/octet-stream");
 }
 
 #[test]
-fn 查不到的一律_octet_stream() {
+fn unknown_suffix_falls_back_to_octet_stream() {
     assert_eq!(mime_for(Path::new("a.png")), "application/octet-stream");
     assert_eq!(mime_for(Path::new("a.exe")), "application/octet-stream");
     assert_eq!(mime_for(Path::new("noext")), "application/octet-stream");
@@ -74,12 +73,12 @@ fn 查不到的一律_octet_stream() {
 }
 
 #[test]
-fn 中文路径与空格不影响查表() {
+fn unicode_and_space_in_path_do_not_matter() {
     assert_eq!(mime_for(Path::new("/home/u/我的 文档/a.pdf")), "application/pdf");
 }
 
 #[tokio::test]
-async fn 同步范围与查表口径一致() {
+async fn supported_file_matches_mime_table() {
     for (suffix, _) in SUFFIX_MIME.iter() {
         let p = format!("/tmp/x.{suffix}");
         assert!(

@@ -11,6 +11,7 @@
 pub mod database;
 pub mod db_model;
 pub mod file_mime;
+pub mod http_util;
 pub mod lightrag_model;
 pub mod lightrag_requests;
 pub mod mineru_model;

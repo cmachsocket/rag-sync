@@ -1,4 +1,5 @@
 use crate::database::DBfunc;
+use crate::http_util;
 use crate::file_mime::SUFFIX_MIME;
 use crate::mineru_requests::mineru_tackle;
 use crate::sync_config;
@@ -61,14 +62,16 @@ async fn create_output_dir(
     config: &sync_config::SyncConfig,
     file_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let output_dir = &config.output_dir;
     let rel = get_relative_path(&config.sync_dir, file_path).await?;
-    let output_path = Path::new(output_dir).join(rel);
-    let _output_path = output_path.parent().ok_or("无法获取输出文件的父目录")?;
-    fs::create_dir_all(&_output_path).await.map_err(|e| {
-        eprintln!("错误: 创建输出目录 {} 失败: {}", _output_path.display(), e);
-        "创建输出目录失败"
+    let output_file_path = Path::new(&config.output_dir).join(rel);
+    let parent = output_file_path.parent().ok_or_else(|| {
+        format!("无法获取输出文件的父目录: {}", output_file_path.display())
     })?;
+    // 只在返回的错误里带一次详细信息：eprintln + 固定文案会让上层拿到
+    // 一条没有原因的错误，真正的原因只留在 stderr 里。
+    fs::create_dir_all(parent)
+        .await
+        .map_err(|e| format!("创建输出目录 {} 失败: {e}", parent.display()))?;
     Ok(())
 }
 
@@ -115,17 +118,14 @@ pub async fn get_files(
                 }
             }
             Err(e) => {
-                // 根目录本身就打不开（路径写错、没权限）必须让整轮失败 ——
-                // 与「目录里没有可同步的文件」区分开，否则计数器会白白推进一轮。
-                // 子目录读不了只丢那一支，继续扫剩下的。
-                if e.depth() == 0 {
-                    return Err(format!(
-                        "扫描同步目录 {} 失败: {e}",
-                        Path::new(root_dir).display()
-                    )
-                    .into());
-                }
-                eprintln!("警告: 跳过 {:?}: {e}", e.path());
+                // 任何一处读不出来都必须让整轮停下来，不能只警告。
+                // 「没扫到」在 delete_old_files 眼里等于「用户把它删了」：
+                // 一个权限错误就会让这一支的产物和知识库文档被清掉。
+                let at = e
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| root_dir.clone());
+                return Err(format!("扫描 {at} 失败: {e}，本轮中止（跳过会把它们当成已删除）").into());
             }
         }
     }
@@ -140,7 +140,7 @@ pub async fn get_files(
 /// 「本轮扫到过」这个信号只能靠刷新 run_id 表达：delete_old_files 靠
 /// run_id < 本轮 判定「上轮见过、这轮没了」。跳过的文件不刷新，
 /// 下一轮就会被当成用户已删除而连带清掉它的产物与知识库条目。
-async fn 待处理<'a>(
+async fn select_pending<'a>(
     config: &sync_config::SyncConfig,
     files: &'a [db_model::File],
     conn: &mut database::Conn,
@@ -167,7 +167,7 @@ pub async fn create_output_files(
     files: &[db_model::File],
     conn: &mut database::Conn,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    let todo = 待处理(config, files, conn).await?;
+    let todo = select_pending(config, files, conn).await?;
     let mut output_files: Vec<PathBuf> = Vec::new();
     // 没有要处理的文件就不去连 MinerU / LightRAG。服务不可达不该让
     // 「这轮没事可做」变成一轮失败。
@@ -175,7 +175,7 @@ pub async fn create_output_files(
         return Ok(output_files);
     }
 
-    let client = reqwest::Client::new();
+    let client = http_util::client()?;
     let rag_request = RAGRequest::new(
         &client,
         &config.lightrag_url,
@@ -220,8 +220,10 @@ pub async fn create_output_files(
 /// 清理「上轮见过、这轮没扫到」的文件。
 ///
 /// 只清理我们自己造出来的东西，**绝不碰同步目录里的原始文档** ——
-/// 那是用户的文件，本程序只读。顺序也有讲究：先从知识库里撤掉，
-/// 再删产物，最后才删 DB 行。反过来做的话，中途失败会留下无主条目。
+/// 那是用户的文件，本程序只读。
+///
+/// 单个文件失败不拖累其余：逐个尽力处理，最后把失败汇总成一个错误返回。
+/// 汇总失败会让整轮以非零码退出、计数器不推进，下一轮重试这些条目。
 pub async fn delete_old_files(
     config: &sync_config::SyncConfig,
     conn: &mut database::Conn,
@@ -231,7 +233,7 @@ pub async fn delete_old_files(
         return Ok(());
     }
 
-    let client = reqwest::Client::new();
+    let client = http_util::client()?;
     let rag_request = RAGRequest::new(
         &client,
         &config.lightrag_url,
@@ -240,33 +242,64 @@ pub async fn delete_old_files(
     )
     .await?;
 
+    let mut failures: Vec<String> = Vec::new();
     for file in old_files {
-        if let Some(rag_id) = file.rag_id.as_deref() {
-            rag_request.delete_document(rag_id).await.map_err(|e| {
-                format!("清理知识库文档 {rag_id}（{}）失败: {e}", file.path)
-            })?;
-            println!("已删除知识库文档: {rag_id}");
+        if let Err(e) = cleanup_one_old_file(&rag_request, config, conn, &file).await {
+            failures.push(format!("{}: {e}", file.path));
         }
-        let rel = match get_relative_path(&config.sync_dir, Path::new(&file.path)).await {
-            Ok(rel) => rel,
-            Err(e) => {
-                // 记录里的路径不在当前 sync_dir 之下 —— 通常是用户改过配置。
-                // 知识库和 DB 行照常清掉，否则清理这一步会被这一行永久卡死。
-                eprintln!("警告: {} 无法定位到输出目录，跳过产物清理: {e}", file.path);
-                DBfunc::delete_file(conn, &file.path).await?;
-                println!("已删除数据库记录: {}", file.path);
-                continue;
-            }
-        };
-        let output_file_path = Path::new(&config.output_dir).join(rel);
-        if tokio::fs::try_exists(&output_file_path).await.unwrap_or(false) {
-            tokio::fs::remove_file(&output_file_path).await.map_err(|e| {
-                format!("删除输出文件 {} 失败: {e}", output_file_path.display())
-            })?;
-            println!("已删除输出文件: {}", output_file_path.display());
-        }
-        DBfunc::delete_file(conn, &file.path).await?;
-        println!("已删除数据库记录: {}", file.path);
     }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "清理 {} 个旧文件失败（其余已清理干净）:\n  - {}",
+        failures.len(),
+        failures.join("\n  - ")
+    )
+    .into())
+}
+
+/// 单个旧文件的清理。顺序：撤知识库 -> 删产物 -> 删 DB 行。
+/// 任一步失败就**保留 DB 行**，下轮重试。反过来做的话，
+/// 中途失败会留下「产物没了、DB 里还留着」或「文档还在、记录没了」的无主状态。
+async fn cleanup_one_old_file(
+    rag_request: &RAGRequest<'_>,
+    config: &sync_config::SyncConfig,
+    conn: &mut database::Conn,
+    file: &db_model::File,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(rag_id) = file.rag_id.as_deref() {
+        rag_request
+            .delete_document(rag_id)
+            .await
+            .map_err(|e| format!("清理知识库文档 {rag_id} 失败: {e}"))?;
+        println!("已删除知识库文档: {rag_id}");
+    }
+
+    // 记录里的路径定位不到输出目录 —— 通常是用户改过 sync_dir 配置。
+    // 跳过产物清理，但知识库与 DB 行照清，否则这一行会把整个清理步骤永久卡死。
+    match get_relative_path(&config.sync_dir, Path::new(&file.path)).await {
+        Ok(rel) => {
+            let output_file_path = Path::new(&config.output_dir).join(rel);
+            match tokio::fs::remove_file(&output_file_path).await {
+                Ok(()) => println!("已删除输出文件: {}", output_file_path.display()),
+                // 已经不在了正是预期结果（用户自己删过产物）
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                // 权限不足之类不能当成「不存在」：那样会跳过删除、
+                // 接着把 DB 行删掉，产物从此永久失去关联、再也找不到。
+                Err(e) => {
+                    return Err(format!(
+                        "删除输出文件 {} 失败: {e}",
+                        output_file_path.display()
+                    )
+                    .into())
+                }
+            }
+        }
+        Err(e) => eprintln!("警告: {} 无法定位到输出目录，跳过产物清理: {e}", file.path),
+    }
+
+    DBfunc::delete_file(conn, &file.path).await?;
+    println!("已删除数据库记录: {}", file.path);
     Ok(())
 }

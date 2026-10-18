@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! sha256、相对路径、扫描、以及 delete_old_files。
 //!
 //! `delete_old_files` 的测试特意分成两段：一段断言它确实在删某个文件，
@@ -9,13 +8,14 @@ mod common;
 
 use common::{test_db, Env};
 use rag_sync::database::DBfunc;
+use rag_sync::http_util;
 use rag_sync::sync_folder::{delete_old_files, get_files, get_relative_path, sha256_file};
 use std::path::Path;
 
 // ---------------------------------------------------------------- sha256
 
 #[tokio::test]
-async fn sha256_对上标准向量() {
+async fn sha256_matches_known_vectors() {
     let d = tempfile::tempdir().unwrap();
     let empty = d.path().join("empty.bin");
     std::fs::write(&empty, b"").unwrap();
@@ -33,7 +33,7 @@ async fn sha256_对上标准向量() {
 }
 
 #[tokio::test]
-async fn sha256_跨_8192_缓冲边界不丢字节() {
+async fn sha256_handles_buffer_boundaries() {
     // 循环每次读 8 KiB。构造多个长度都验一遍，能抓到「补零」「少读一字节」
     // 这类只在特定长度出现的错误。
     let d = tempfile::tempdir().unwrap();
@@ -53,7 +53,7 @@ async fn sha256_跨_8192_缓冲边界不丢字节() {
 }
 
 #[tokio::test]
-async fn sha256_只差一个字节_摘要就不同() {
+async fn sha256_differs_on_single_byte() {
     let d = tempfile::tempdir().unwrap();
     let a = d.path().join("a.bin");
     let b = d.path().join("b.bin");
@@ -69,7 +69,7 @@ async fn sha256_只差一个字节_摘要就不同() {
 }
 
 #[tokio::test]
-async fn sha256_文件不存在_返回_err_而不是空串() {
+async fn sha256_missing_file_is_an_error() {
     let err = sha256_file("/no/such/file.pdf").await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
@@ -77,7 +77,7 @@ async fn sha256_文件不存在_返回_err_而不是空串() {
 // ---------------------------------------------------------------- 相对路径
 
 #[tokio::test]
-async fn 相对路径_去根前缀() {
+async fn relative_path_strips_root() {
     assert_eq!(
         get_relative_path("/data/sync", Path::new("/data/sync/a.pdf")).await.unwrap(),
         "a.pdf"
@@ -91,7 +91,7 @@ async fn 相对路径_去根前缀() {
 }
 
 #[tokio::test]
-async fn 相对路径_路径不在根下时报错() {
+async fn relative_path_outside_root_errors() {
     // get_files 之后按相对路径写输出文件，strip_prefix 失败却当成
     // 「相对路径就是原样」的话，会把输出写到 output_dir 外面去。
     let err = get_relative_path("/data/sync", Path::new("/other/a.pdf"))
@@ -102,7 +102,7 @@ async fn 相对路径_路径不在根下时报错() {
 }
 
 #[tokio::test]
-async fn 相对路径_前缀只是字符串相同不算根() {
+async fn relative_path_string_prefix_is_not_root() {
     // "/data/synced" 不是 "/data/sync" 的子路径
     assert!(get_relative_path("/data/sync", Path::new("/data/synced/a.pdf"))
         .await
@@ -112,7 +112,7 @@ async fn 相对路径_前缀只是字符串相同不算根() {
 // ---------------------------------------------------------------- 扫描
 
 #[tokio::test]
-async fn 扫描_只收支持的后缀_且递归子目录() {
+async fn scan_only_picks_supported_suffixes_recursively() {
     let mut db = test_db().await;
     let env = Env::new();
     env.write_source("a.pdf", "pdf-a");
@@ -133,7 +133,7 @@ async fn 扫描_只收支持的后缀_且递归子目录() {
 }
 
 #[tokio::test]
-async fn 扫描_库里没有的文件算新增_并现算_sha256() {
+async fn scan_hashes_new_files() {
     let mut db = test_db().await;
     let env = Env::new();
     let path = env.write_source("a.pdf", "hello");
@@ -151,7 +151,7 @@ async fn 扫描_库里没有的文件算新增_并现算_sha256() {
 }
 
 #[tokio::test]
-async fn 扫描_库里已有时沿用库里的身份信息_但_sha256_用磁盘实况() {
+async fn scan_keeps_db_identity_but_refreshes_sha() {
     let mut db = test_db().await;
     let env = Env::new();
     env.write_source("a.pdf", "hello");
@@ -178,7 +178,7 @@ async fn 扫描_库里已有时沿用库里的身份信息_但_sha256_用磁盘�
 }
 
 #[tokio::test]
-async fn 扫描_返回顺序按路径排序() {
+async fn scan_returns_sorted_paths() {
     let mut db = test_db().await;
     let env = Env::new();
     for name in ["c.pdf", "a.pdf", "b.pdf"] {
@@ -192,7 +192,185 @@ async fn 扫描_返回顺序按路径排序() {
 }
 
 #[tokio::test]
-async fn 扫描_空目录返回空vec() {
+async fn unreadable_subdirectory_aborts_the_run() {
+    let mut db = test_db().await;
+    let env = Env::new();
+    env.write_source("能读/a.pdf", "x");
+    let locked = Path::new(&env.sync_dir).join("锁住");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("b.pdf"), "x").unwrap();
+    // 去掉读权限，制造一个「子目录存在但读不了」的错误
+    let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o000);
+    }
+    std::fs::set_permissions(&locked, perms).unwrap();
+
+    let cfg = env.config(1);
+    let files = get_files(&cfg, &mut db.conn).await;
+
+    #[cfg(unix)]
+    {
+        // root 无视权限位，那样就造不出这个错误，跳过而不是假装通过
+        if std::fs::read_dir(&locked).is_ok() {
+            eprintln!("以 root 运行，权限位无效，跳过本用例");
+            let _ = std::fs::remove_dir_all(&locked);
+            return;
+        }
+        let err = files.unwrap_err().to_string();
+        assert!(
+            err.contains("锁住"),
+            "要指出是哪个目录读不了: {err}"
+        );
+        assert!(
+            err.contains("中止"),
+            "跳过的目录会被 delete_old_files 当成「用户删了」而清掉产物与知识库，必须中止: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&locked);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = files;
+    }
+}
+
+/// HTTP 客户端必须带超时。reqwest 默认既不限制连接也不限制读取，
+/// 而轮询里的「上限」只在请求**返回之后**才检查得到 ——
+/// 也就是说服务端不回包的话，上限完全失效，整个进程会永久挂住。
+///
+/// 用 tokio 的自动推进时钟：READ_TIMEOUT 是 60 s 真实时间，
+/// 这里不会真的等 60 s。
+#[tokio::test(start_paused = true)]
+async fn http_client_times_out_on_silent_server() {
+    // 只 accept 不回应：请求永远拿不到响应
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+
+    let client = http_util::client().unwrap();
+    let url = format!("http://{addr}/v1/uploads");
+
+    let started = tokio::time::Instant::now();
+    let result = client.get(&url).send().await;
+    let waited = started.elapsed();
+
+    let err = result.err().expect("服务端不应回包，请求必须失败");
+    assert!(
+        err.is_timeout() || format!("{err}").contains("timed out"),
+        "期望是超时错误，实际: {err}"
+    );
+    assert!(
+        waited >= http_util::READ_TIMEOUT,
+        "应当一直等到 READ_TIMEOUT 才放弃，实际只等了 {waited:?}"
+    );
+}
+
+#[tokio::test]
+async fn undeletable_artifact_keeps_db_row() {
+    // 「产物删不掉」和「产物不存在」必须区别对待：当成不存在就等于
+    // 跳过删除、接着把 DB 行删掉，产物从此永久失去关联再也找不到。
+    // 这里在产物路径上放一个**目录**来触发删除失败，无需依赖权限位。
+    let mut db = test_db().await;
+    let env = Env::new();
+    let src = env.write_source("a.pdf", "原件");
+    std::fs::create_dir_all(env.output_path("a.pdf")).unwrap();
+    db.insert_file_row(1, &src, "sha", 1, Some("doc-1")).await;
+
+    let server = common::MockServer::start(vec![
+        common::Route::post("/login")
+            .and(common::CannedResponse::json(200, r#"{"access_token":"t"}"#)),
+        common::Route::delete("/documents/delete_document").and(
+            common::CannedResponse::json(
+                200,
+                r#"{"status":"deletion_started","message":"ok","doc_id":"doc-1"}"#,
+            ),
+        ),
+        common::Route::post("/documents/paginated")
+            .and(common::CannedResponse::json(
+                200,
+                r#"{"documents":[{"id":"doc-1","status":"processed","file_path":"a.pdf"}],
+                     "pagination":{"page":1,"total_pages":1,"total_count":1,"has_next":false}}"#,
+            ))
+            .and(common::CannedResponse::json(
+                200,
+                r#"{"documents":[],"pagination":{"page":1,"total_pages":1,"total_count":0,"has_next":false}}"#,
+            )),
+    ])
+    .await;
+    let mut cfg = env.config(2);
+    cfg.lightrag_url = server.base_url.clone();
+
+    let err = delete_old_files(&cfg, &mut db.conn)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    // 知识库那步成功了，卡在产物删除
+    assert_eq!(
+        server.requests_to("DELETE", "/documents/delete_document")[0].json()["doc_ids"][0],
+        "doc-1"
+    );
+    assert!(err.contains("删除输出文件"), "{err}");
+    assert!(
+        DBfunc::file_exists(&mut db.conn, &src).await.unwrap(),
+        "产物没删掉就不能删 DB 行，否则下轮再也不会来清这个产物"
+    );
+    assert!(std::path::Path::new(&src).exists(), "原件始终不能动");
+}
+
+#[tokio::test]
+async fn one_cleanup_failure_does_not_block_others() {
+    let mut db = test_db().await;
+    let env = Env::new();
+    let bad = env.write_source("bad.md", "x");
+    let good = env.write_source("good.md", "x");
+    // bad 的产物是个目录，删不掉
+    std::fs::create_dir_all(env.output_path("bad.md")).unwrap();
+    std::fs::write(env.output_path("good.md"), "# 过期").unwrap();
+    db.insert_file_row(1, &bad, "s1", 1, None).await;
+    db.insert_file_row(2, &good, "s2", 1, None).await;
+
+    let server = common::MockServer::start(vec![
+        common::Route::post("/login")
+            .and(common::CannedResponse::json(200, r#"{"access_token":"t"}"#)),
+    ])
+    .await;
+    let mut cfg = env.config(2);
+    cfg.lightrag_url = server.base_url.clone();
+
+    let err = delete_old_files(&cfg, &mut db.conn)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    // 整体仍然失败（让本轮以非零码退出，计数器不推进，下轮重试）
+    assert!(err.contains("清理 1 个旧文件失败"), "{err}");
+    assert!(err.contains(&bad), "汇总里要指明是哪个文件: {err}");
+    assert!(!err.contains(&good), "成功的那个不该出现在失败列表里: {err}");
+
+    assert!(
+        DBfunc::file_exists(&mut db.conn, &bad).await.unwrap(),
+        "失败的那个要留下 DB 行等下轮重试"
+    );
+    assert!(
+        !DBfunc::file_exists(&mut db.conn, &good).await.unwrap(),
+        "成功的那个照样要清掉"
+    );
+    assert!(
+        !env.output_path("good.md").exists(),
+        "成功那条的产物也要清掉"
+    );
+}
+
+#[tokio::test]
+async fn scan_empty_dir_returns_empty() {
     let mut db = test_db().await;
     let env = Env::new();
     assert!(get_files(&env.config(1), &mut db.conn).await.unwrap().is_empty());
@@ -201,7 +379,7 @@ async fn 扫描_空目录返回空vec() {
 // ---------------------------------------------------------------- delete_old_files
 
 #[tokio::test]
-async fn 删旧文件_没有旧记录时直接返回_不碰任何服务() {
+async fn delete_old_returns_early_when_nothing_is_old() {
     // Env 的 lightrag_url 是空串，登录必然失败。这里能过，说明清理动作
     // 在「没有旧文件」时确实一步都没做 —— 服务不可达不该拖垮一轮同步。
     let mut db = test_db().await;
@@ -210,7 +388,7 @@ async fn 删旧文件_没有旧记录时直接返回_不碰任何服务() {
 }
 
 #[tokio::test]
-async fn 清理_缺产物或不在当前目录下_都不卡住() {
+async fn cleanup_tolerates_missing_artifacts() {
     let mut db = test_db().await;
     let env = Env::new();
     let cur = env.write_source("a.pdf", "x");

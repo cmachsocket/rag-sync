@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! MinerU 的上传 -> 解析 -> 取产物链路，对着 mock 服务端跑。
 //!
 //! 这条链路有两个坑：契约是 `additionalProperties: false`（字段名写错直接 422），
@@ -11,7 +10,7 @@ use common::{CannedResponse as R, MockServer, Route};
 use rag_sync::db_model::File;
 use rag_sync::mineru_requests::mineru_tackle;
 
-fn 样例文件(dir: &tempfile::TempDir, id: i32, name: &str, content: &str) -> File {
+fn sample_file(dir: &tempfile::TempDir, id: i32, name: &str, content: &str) -> File {
     let p = dir.path().join(name);
     std::fs::write(&p, content).unwrap();
     File {
@@ -23,7 +22,7 @@ fn 样例文件(dir: &tempfile::TempDir, id: i32, name: &str, content: &str) -> 
     }
 }
 
-async fn 起(
+async fn setup(
     dir: &tempfile::TempDir,
     routes: Vec<Route>,
 ) -> (MockServer, rag_sync::sync_config::SyncConfig) {
@@ -43,7 +42,7 @@ async fn 起(
 // ---------------------------------------------------------------- 请求体形状
 
 #[test]
-fn source_序列化_只留_type_对应的那一个字段() {
+fn source_serialises_only_its_own_field() {
     // 契约为 additionalProperties: false，带 null 字段会被 422
     let src = rag_sync::mineru_model::FileSource::from_file_id("f-1".into());
     assert_eq!(
@@ -53,7 +52,7 @@ fn source_序列化_只留_type_对应的那一个字段() {
 }
 
 #[test]
-fn 上传请求体_字段名与契约一致() {
+fn upload_request_body_matches_contract() {
     let req = rag_sync::mineru_model::FileUploadRequest {
         filename: "a.pdf",
         bytes: 1234,
@@ -67,7 +66,7 @@ fn 上传请求体_字段名与契约一致() {
 }
 
 #[test]
-fn 解析请求体_是_files_数组包一层() {
+fn parse_request_body_shape() {
     let req = rag_sync::mineru_model::FileParseRequest {
         files: vec![rag_sync::mineru_model::FileParseItem {
             source: rag_sync::mineru_model::FileSource::from_file_id("f-1".into()),
@@ -80,7 +79,7 @@ fn 解析请求体_是_files_数组包一层() {
 }
 
 #[test]
-fn 上传响应_幂等命中时_file_为_null() {
+fn upload_response_file_may_be_null() {
     // 按 sha256 幂等命中，upload_url / upload_method / file 全是 null
     let u: rag_sync::mineru_model::UploadObject = serde_json::from_str(
         r#"{"id":"up-1","status":"completed","file":{"id":"f-9"},
@@ -100,10 +99,10 @@ fn 上传响应_幂等命中时_file_为_null() {
 // ---------------------------------------------------------------- 完整上传流程
 
 #[tokio::test]
-async fn 新文件走完整上传_上传内容_再完成() {
+async fn new_file_uploads_content_then_completes() {
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello world");
-    let (server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello world");
+    let (server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -151,12 +150,12 @@ async fn 新文件走完整上传_上传内容_再完成() {
 }
 
 #[tokio::test]
-async fn 幂等命中_不重复上传内容() {
+async fn idempotent_hit_skips_content_upload() {
     // 服务端已按 sha256 收过这份内容，直接 completed。再 PUT 会得到
     // 409 upload_already_terminal。
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -187,10 +186,10 @@ async fn 幂等命中_不重复上传内容() {
 }
 
 #[tokio::test]
-async fn 幂等命中但响应缺_file_报错() {
+async fn idempotent_hit_without_file_is_error() {
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (server, cfg) = setup(
         &d,
         vec![Route::post("/v1/uploads").and(R::json(
             200,
@@ -208,11 +207,11 @@ async fn 幂等命中但响应缺_file_报错() {
 }
 
 #[tokio::test]
-async fn 缺少_sha256_直接拒绝_不浪费一次上传() {
+async fn missing_sha256_rejected_before_upload() {
     let d = tempfile::tempdir().unwrap();
-    let mut file = 样例文件(&d, 0, "a.pdf", "hello");
+    let mut file = sample_file(&d, 0, "a.pdf", "hello");
     file.sha256 = String::new();
-    let (server, cfg) = 起(
+    let (server, cfg) = setup(
         &d,
         vec![Route::post("/v1/uploads").once()],
     )
@@ -227,11 +226,11 @@ async fn 缺少_sha256_直接拒绝_不浪费一次上传() {
 }
 
 #[tokio::test]
-async fn 文件在磁盘上消失_报错带路径() {
+async fn vanished_file_reports_path() {
     let d = tempfile::tempdir().unwrap();
-    let mut file = 样例文件(&d, 0, "a.pdf", "hello");
+    let file = sample_file(&d, 0, "a.pdf", "hello");
     std::fs::remove_file(&file.path).unwrap();
-    let (server, cfg) = 起(
+    let (server, cfg) = setup(
         &d,
         vec![Route::post("/v1/uploads").once()],
     )
@@ -246,14 +245,15 @@ async fn 文件在磁盘上消失_报错带路径() {
 }
 
 #[tokio::test]
-async fn 创建上传被拒_报错带文件路径与状态() {
+async fn upload_rejected_surfaces_status_and_body() {
+    // 只报状态码等于让人自己猜：字段校验、限流这些原因都只写在 body 里
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (_server, cfg) = setup(
         &d,
         vec![Route::post("/v1/uploads").and(R::json(
             422,
-            r#"{"detail":"mime_type unsupported"}"#,
+            r#"{"detail":"mime_type application/pdf not supported by this backend"}"#,
         ))],
     )
     .await;
@@ -264,13 +264,36 @@ async fn 创建上传被拒_报错带文件路径与状态() {
         .to_string();
     assert!(err.contains("a.pdf"), "{err}");
     assert!(err.contains("422"), "{err}");
+    assert!(
+        err.contains("not supported by this backend"),
+        "服务端正文必须带出来: {err}"
+    );
 }
 
 #[tokio::test]
-async fn 完成返回非终态_报错() {
+async fn empty_error_body_is_labelled() {
+    // 「读不出来」和「服务端就是返回空」要能区分开，否则排查时会照着
+    // 一个并不存在的空 body 去猜原因
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (_server, cfg) = setup(
+        &d,
+        vec![Route::post("/v1/uploads").and(R::json(500, "   "))],
+    )
+    .await;
+
+    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("<空响应>"), "{err}");
+}
+
+#[tokio::test]
+async fn complete_non_terminal_is_error() {
+    let d = tempfile::tempdir().unwrap();
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (_server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -292,10 +315,10 @@ async fn 完成返回非终态_报错() {
 // ---------------------------------------------------------------- 解析
 
 #[tokio::test]
-async fn 解析_running_轮询到终态后取产物内容() {
+async fn parse_running_polls_then_fetches_artifact() {
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -326,10 +349,10 @@ async fn 解析_running_轮询到终态后取产物内容() {
 }
 
 #[tokio::test]
-async fn 解析_failed_把该文件的错误带出来() {
+async fn parse_failed_surfaces_file_error() {
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (_server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -357,11 +380,11 @@ async fn 解析_failed_把该文件的错误带出来() {
 }
 
 #[tokio::test]
-async fn 解析_cancelled_也要当失败() {
+async fn parse_cancelled_is_failure() {
     // 终态有四种，只判 completed 会让失败/取消的任务被当成成功
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (_server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -389,10 +412,10 @@ async fn 解析_cancelled_也要当失败() {
 }
 
 #[tokio::test]
-async fn 内联_content_为_null_时回退到产物_id() {
+async fn null_inline_content_falls_back_to_artifact() {
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -420,10 +443,10 @@ async fn 内联_content_为_null_时回退到产物_id() {
 }
 
 #[tokio::test]
-async fn 既无内联也无产物_id_报错_不返回空文件() {
+async fn no_content_and_no_artifact_is_error() {
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (_server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -447,10 +470,10 @@ async fn 既无内联也无产物_id_报错_不返回空文件() {
 }
 
 #[tokio::test]
-async fn 解析响应里没有_files_条目_报错() {
+async fn parse_response_without_files_is_error() {
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (_server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -472,12 +495,12 @@ async fn 解析响应里没有_files_条目_报错() {
 }
 
 #[tokio::test]
-async fn 内容是原样文本_不是_json() {
+async fn artifact_content_is_plain_text() {
     // GET /v1/files/{id}/content 直接返回 markdown 原文，
     // 按 JSON 解会得到一个空串再写进输出文件
     let d = tempfile::tempdir().unwrap();
-    let file = 样例文件(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = 起(
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let (_server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")
@@ -503,12 +526,12 @@ async fn 内容是原样文本_不是_json() {
 }
 
 #[tokio::test]
-async fn 大文件按声明长度流式上传() {
+async fn large_file_uploads_with_declared_length() {
     // 不能把整个文件读进内存；这里只验证「声明的长度 == 实际字节数」
     let d = tempfile::tempdir().unwrap();
     let body = "x".repeat(300_000);
-    let file = 样例文件(&d, 0, "big.pdf", &body);
-    let (server, cfg) = 起(
+    let file = sample_file(&d, 0, "big.pdf", &body);
+    let (server, cfg) = setup(
         &d,
         vec![
             Route::post("/v1/uploads")

@@ -18,6 +18,10 @@ const TRACK_TIMEOUT: Duration = Duration::from_secs(900);
 /// 长任务尾巴（pipeline 忙时 delete 会直接返回 busy）。
 const DELETE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 文档列表翻页上限。只防服务端一直回 `has_next: true` —— 没有它，
+/// 一个坏掉的代理就能让同步永远转下去。
+const MAX_PAGES: u32 = 1000;
+
 /// 上传失败的原因。**只有同名冲突能自愈**，其余一律原样上抛 ——
 /// 在 upload_file 里对 400 / 401 也重试，会把真实错误掩盖成一次莫名其妙的失败。
 enum UploadError {
@@ -134,13 +138,17 @@ impl<'a> RAGRequest<'a> {
         // 先读完 body 再判状态：401 的真实原因（Incorrect username or password）
         // 只在 body 里，只报状态码等于没给线索
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = crate::http_util::error_body(response).await;
         if !status.is_success() {
             return Err(format!("登录失败，状态码: {status}，响应: {body}").into());
         }
 
         let login_response: lightrag_model::LoginResponse = serde_json::from_str(&body)
             .map_err(|e| format!("解析登录响应失败: {e}，响应: {body}"))?;
+        // 空 token 会让后续请求以 401 的形式失败，把登录问题伪装成接口问题
+        if login_response.access_token.is_empty() {
+            return Err("登录响应中 access_token 为空，拒绝继续".into());
+        }
         Ok(login_response.access_token)
     }
     async fn _upload(&self, file_path: &str) -> Result<String, UploadError> {
@@ -168,7 +176,7 @@ impl<'a> RAGRequest<'a> {
         if status == reqwest::StatusCode::CONFLICT {
             // 409：同名文档已存在。服务端在写文件之前就同步拒绝，并要求先删掉
             // 已有记录。detail 区分了两种来源：文档存储里已有 / input 目录里已有。
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::http_util::error_body(resp).await;
             return Err(UploadError::conflict(&body));
         }
         if status.is_success() {
@@ -186,7 +194,7 @@ impl<'a> RAGRequest<'a> {
                 )))
             }
         } else {
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::http_util::error_body(resp).await;
             Err(UploadError::fatal(format!(
                 "上传文件失败，状态码: {status}，响应: {body}"
             )))
@@ -213,7 +221,7 @@ impl<'a> RAGRequest<'a> {
                 .map_err(|e| format!("获取文件状态请求失败: {e}"))?;
             let status = resp.status();
             if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body = crate::http_util::error_body(resp).await;
                 return Err(format!("获取文件状态失败，状态码: {status}，响应: {body}").into());
             }
             let track: lightrag_model::TrackResponse = resp
@@ -254,7 +262,7 @@ impl<'a> RAGRequest<'a> {
             .map_err(|e| format!("删除文档请求失败: {e}"))?;
         let status = resp.status();
         // 先把 body 读完：busy 的说明只在 body 里。
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::http_util::error_body(resp).await;
         if !status.is_success() {
             return Err(format!("删除文档失败，状态码: {status}，响应: {body}").into());
         }
@@ -306,11 +314,11 @@ impl<'a> RAGRequest<'a> {
     /// 翻完所有页拉回文档列表。必须翻完：服务端 page_size 上限 200，
     /// 只看第一页会漏判。两处判定（存在性 / 按文件名反查）都走这里，
     /// 免得修一处漏一处。
-    async fn 全部文档(&self) -> Result<Vec<lightrag_model::DocStatusResponse>, Box<dyn std::error::Error>> {
+    async fn fetch_all_documents(&self) -> Result<Vec<lightrag_model::DocStatusResponse>, Box<dyn std::error::Error>> {
         let url = format!("{}/documents/paginated", self.url);
         let mut req = lightrag_model::DocumentsRequest::first_page();
         let mut all = Vec::new();
-        loop {
+        for _ in 0..MAX_PAGES {
             let resp = self
                 .client
                 .post(&url)
@@ -321,7 +329,7 @@ impl<'a> RAGRequest<'a> {
                 .map_err(|e| format!("查询文档列表失败: {e}"))?;
             let status = resp.status();
             if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body = crate::http_util::error_body(resp).await;
                 return Err(format!("查询文档列表失败，状态码: {status}，响应: {body}").into());
             }
             let page: lightrag_model::PaginatedDocsResponse = resp
@@ -334,12 +342,17 @@ impl<'a> RAGRequest<'a> {
             }
             req.page += 1;
         }
+        Err(format!(
+            "文档列表翻页超过 {MAX_PAGES} 页仍未结束（共取到 {} 条），疑似服务端一直回 has_next",
+            all.len()
+        )
+        .into())
     }
 
     /// 文档是否还在库里。查 paginated 列表，是判定删除是否生效的唯一权威依据。
     pub async fn document_exists(&self, doc_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(self
-            .全部文档()
+            .fetch_all_documents()
             .await?
             .iter()
             .any(|d| d.id == doc_id))
@@ -353,7 +366,7 @@ impl<'a> RAGRequest<'a> {
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let target = canonical_basename(name);
         Ok(self
-            .全部文档()
+            .fetch_all_documents()
             .await?
             .iter()
             .filter(|doc| canonical_basename(&basename(&doc.file_path)) == target)

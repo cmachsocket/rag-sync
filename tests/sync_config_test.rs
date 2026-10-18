@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! 配置加载与 run_id 的推导。
 //!
 //! run_id 是整个同步流程的时钟：它既决定「哪些文件算这轮新增」，
@@ -8,17 +7,17 @@ mod common;
 
 use common::test_db;
 
-fn 写配置(dir: &tempfile::TempDir, body: &str) -> String {
+fn write_config(dir: &tempfile::TempDir, body: &str) -> String {
     let p = dir.path().join("config.yml");
     std::fs::write(&p, body).unwrap();
     p.to_string_lossy().into_owned()
 }
 
 #[tokio::test]
-async fn 读全字段() {
+async fn loads_all_fields() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(
+    let path = write_config(
         &d,
         r#"
 sync_dir: "/data/sync"
@@ -41,10 +40,10 @@ lightrag_password: "p"
 }
 
 #[tokio::test]
-async fn 缺省键取默认值_不影响加载() {
+async fn missing_keys_use_defaults() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(
+    let path = write_config(
         &d,
         r#"
 sync_dir: "/data/sync"
@@ -64,10 +63,10 @@ lightrag_url: "http://r:9621"
 }
 
 #[tokio::test]
-async fn 缺_sync_dir_报错并指出字段名() {
+async fn missing_sync_dir_names_the_field() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "output_dir: \"/data/out\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
+    let path = write_config(&d, "output_dir: \"/data/out\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
     let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap_err()
@@ -76,10 +75,10 @@ async fn 缺_sync_dir_报错并指出字段名() {
 }
 
 #[tokio::test]
-async fn 缺_output_dir_报错并指出字段名() {
+async fn missing_output_dir_names_the_field() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "sync_dir: \"/data/sync\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
+    let path = write_config(&d, "sync_dir: \"/data/sync\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
     let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap_err()
@@ -88,10 +87,10 @@ async fn 缺_output_dir_报错并指出字段名() {
 }
 
 #[tokio::test]
-async fn 空字符串等同于缺失() {
+async fn empty_string_counts_as_missing() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "sync_dir: \"\"\noutput_dir: \"/data/out\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
+    let path = write_config(&d, "sync_dir: \"\"\noutput_dir: \"/data/out\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
     let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap_err()
@@ -100,10 +99,10 @@ async fn 空字符串等同于缺失() {
 }
 
 #[tokio::test]
-async fn 缺_mineru_url_报错并指出字段名() {
+async fn missing_mineru_url_names_the_field() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(
+    let path = write_config(
         &d,
         "sync_dir: \"/a\"\noutput_dir: \"/b\"\nlightrag_url: \"http://r\"\n",
     );
@@ -116,10 +115,10 @@ async fn 缺_mineru_url_报错并指出字段名() {
 }
 
 #[tokio::test]
-async fn 缺_lightrag_url_报错并指出字段名() {
+async fn missing_lightrag_url_names_the_field() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nmineru_url: \"http://m\"\n");
+    let path = write_config(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nmineru_url: \"http://m\"\n");
     let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap_err()
@@ -128,7 +127,7 @@ async fn 缺_lightrag_url_报错并指出字段名() {
 }
 
 #[tokio::test]
-async fn 文件不存在_报错要带路径() {
+async fn missing_config_file_reports_path() {
     let mut db = test_db().await;
     let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, "/no/such/config.yml")
         .await
@@ -138,10 +137,10 @@ async fn 文件不存在_报错要带路径() {
 }
 
 #[tokio::test]
-async fn 语法错误_报错要指出解析失败() {
+async fn syntax_error_reports_parse_failure() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "sync_dir: [unclosed\n  - a\n");
+    let path = write_config(&d, "sync_dir: [unclosed\n  - a\n");
     let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap_err()
@@ -152,10 +151,10 @@ async fn 语法错误_报错要指出解析失败() {
 // ---------------------------------------------------------------- run_id
 
 #[tokio::test]
-async fn run_id_等于计数器加一_不会覆盖计数器() {
+async fn run_id_is_counter_plus_one() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
+    let path = write_config(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
 
     let c = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
@@ -183,14 +182,14 @@ async fn run_id_等于计数器加一_不会覆盖计数器() {
 }
 
 #[tokio::test]
-async fn 配置里的_run_id_不参与计算() {
+async fn configured_run_id_is_ignored() {
     let mut db = test_db().await;
     rag_sync::database::DBfunc::update_run_counter(&mut db.conn, 7)
         .await
         .unwrap();
     let d = tempfile::tempdir().unwrap();
     // 就算配置里写了 run_id: 999，也必须以计数器为准
-    let path = 写配置(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nrun_id: 999\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
+    let path = write_config(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nrun_id: 999\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
     let c = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap();

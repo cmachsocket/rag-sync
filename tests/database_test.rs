@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! DBfunc 的行为测试。跑的是真 SQLite + 真 migration。
 //!
 //! 这里固定的是「改了 DB 层会破坏谁」的契约：同步流程靠 sha256 判断文件是否变化，
@@ -11,7 +10,7 @@ use common::test_db;
 use rag_sync::database::DBfunc;
 use rag_sync::db_model::File;
 
-async fn 一个文件(conn: &mut rag_sync::database::Conn) -> File {
+async fn insert_one_file(conn: &mut rag_sync::database::Conn) -> File {
     DBfunc::insert_file(conn, "/sync/a.pdf", "sha-a", 1, Some("doc-1"))
         .await
         .unwrap();
@@ -21,24 +20,24 @@ async fn 一个文件(conn: &mut rag_sync::database::Conn) -> File {
 // ---------------------------------------------------------------- 增删查
 
 #[tokio::test]
-async fn insert_后可原样读回() {
+async fn inserted_row_round_trips() {
     let mut db = test_db().await;
-    let file = 一个文件(&mut db.conn).await;
+    let file = insert_one_file(&mut db.conn).await;
     assert_eq!(file.path, "/sync/a.pdf");
     assert_eq!(file.sha256, "sha-a");
     assert_eq!(file.rag_id.as_deref(), Some("doc-1"));
 }
 
 #[tokio::test]
-async fn file_exists_对不存在的路径为_false() {
+async fn file_exists_is_false_for_missing() {
     let mut db = test_db().await;
     assert!(!DBfunc::file_exists(&mut db.conn, "/sync/a.pdf").await.unwrap());
-    一个文件(&mut db.conn).await;
+    insert_one_file(&mut db.conn).await;
     assert!(DBfunc::file_exists(&mut db.conn, "/sync/a.pdf").await.unwrap());
 }
 
 #[tokio::test]
-async fn get_不存在的行返回_None_而不是报错() {
+async fn get_missing_row_returns_none() {
     let mut db = test_db().await;
     assert_eq!(DBfunc::get_sha256(&mut db.conn, "/nope").await.unwrap(), None);
     assert_eq!(DBfunc::get_file_run_id(&mut db.conn, "/nope").await.unwrap(), None);
@@ -49,10 +48,10 @@ async fn get_不存在的行返回_None_而不是报错() {
 // ---------------------------------------------------------------- 更新
 
 #[tokio::test]
-async fn 更新_sha256_只动目标行() {
+async fn update_sha256_touches_only_target_row() {
     let mut db = test_db().await;
     db.insert_file_row(2, "/sync/b.pdf", "sha-b", 7, None).await;
-    一个文件(&mut db.conn).await;
+    insert_one_file(&mut db.conn).await;
 
     DBfunc::update_sha256(&mut db.conn, "/sync/a.pdf", "sha-a2")
         .await
@@ -70,9 +69,9 @@ async fn 更新_sha256_只动目标行() {
 }
 
 #[tokio::test]
-async fn 更新_rag_id_支持写回_None() {
+async fn update_rag_id_can_write_back_none() {
     let mut db = test_db().await;
-    一个文件(&mut db.conn).await;
+    insert_one_file(&mut db.conn).await;
 
     DBfunc::update_rag_id(&mut db.conn, "/sync/a.pdf", None)
         .await
@@ -88,10 +87,10 @@ async fn 更新_rag_id_支持写回_None() {
 }
 
 #[tokio::test]
-async fn 更新_run_id_只动目标行() {
+async fn update_run_id_touches_only_target_row() {
     let mut db = test_db().await;
     db.insert_file_row(2, "/sync/b.pdf", "sha-b", 7, None).await;
-    一个文件(&mut db.conn).await;
+    insert_one_file(&mut db.conn).await;
 
     DBfunc::update_file_run_id(&mut db.conn, "/sync/a.pdf", 99)
         .await
@@ -110,14 +109,14 @@ async fn 更新_run_id_只动目标行() {
 // ---------------------------------------------------------------- run_counter
 
 #[tokio::test]
-async fn migration_已插入_单行计数器且为_0() {
+async fn migration_seeds_single_counter_row() {
     let mut db = test_db().await;
     let c = DBfunc::get_run_counter(&mut db.conn).await.unwrap();
     assert_eq!(c.map(|c| c.current_run_id), Some(0));
 }
 
 #[tokio::test]
-async fn 计数器可更新且只有一个生效行() {
+async fn run_counter_updates_single_row() {
     let mut db = test_db().await;
     DBfunc::update_run_counter(&mut db.conn, 42).await.unwrap();
     let c = DBfunc::get_run_counter(&mut db.conn).await.unwrap().unwrap();
@@ -128,7 +127,7 @@ async fn 计数器可更新且只有一个生效行() {
 // ---------------------------------------------------------------- run_id 范围查询
 
 #[tokio::test]
-async fn 查旧文件_严格小于_并按路径排序稳定() {
+async fn found_older_than_is_strict_and_ordered() {
     let mut db = test_db().await;
     db.insert_file_row(1, "/sync/old1.pdf", "s1", 3, None).await;
     db.insert_file_row(2, "/sync/cur.pdf", "s2", 5, None).await;
@@ -144,7 +143,7 @@ async fn 查旧文件_严格小于_并按路径排序稳定() {
 }
 
 #[tokio::test]
-async fn 查旧文件_返回完整行_含_rag_id_供删除用() {
+async fn found_older_than_returns_full_row() {
     let mut db = test_db().await;
     db.insert_file_row(1, "/sync/old.pdf", "s1", 1, Some("doc-9"))
         .await;
@@ -157,7 +156,7 @@ async fn 查旧文件_返回完整行_含_rag_id_供删除用() {
 }
 
 #[tokio::test]
-async fn 查旧文件_没有旧文件时返回空vec_而不是报错() {
+async fn found_older_than_returns_empty_not_error() {
     let mut db = test_db().await;
     // 用 fixture 而不是 insert_file：后者不写 run_id，测不出查询语义
     db.insert_file_row(1, "/sync/cur.pdf", "s1", 1, None).await;
@@ -168,7 +167,7 @@ async fn 查旧文件_没有旧文件时返回空vec_而不是报错() {
 }
 
 #[tokio::test]
-async fn 查旧文件_本轮见过的文件不会被判为旧() {
+async fn found_older_than_spares_current_run() {
     let mut db = test_db().await;
     db.insert_file_row(1, "/sync/a.pdf", "s1", 4, None).await;
     // 本轮 run_id == 4，严格小于的查询必须放过它

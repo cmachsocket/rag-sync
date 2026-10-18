@@ -1,4 +1,3 @@
-#![allow(non_snake_case)]
 //! LightRAG 响应体的反序列化与状态判定。
 //!
 //! 这层全是「服务端改一个字段名 / 多一个字段就静默拿到空值」的雷区，
@@ -9,7 +8,7 @@ use rag_sync::lightrag_model::*;
 // ---------------------------------------------------------------- 登录
 
 #[test]
-fn 登录响应_完整报文() {
+fn login_response_full_body() {
     let r: LoginResponse = serde_json::from_str(
         r#"{
           "access_token": "<JWT, 长度 199>",
@@ -28,7 +27,7 @@ fn 登录响应_完整报文() {
 }
 
 #[test]
-fn 登录响应_只有_token_也能过() {
+fn login_response_token_only() {
     // 服务端加字段不该让登录整体失效
     let r: LoginResponse = serde_json::from_str(r#"{"access_token":"abc"}"#).unwrap();
     assert_eq!(r.access_token, "abc");
@@ -37,7 +36,7 @@ fn 登录响应_只有_token_也能过() {
 }
 
 #[test]
-fn 登录响应_缺_token_必须报错() {
+fn login_response_without_token_is_error() {
     // 空 token 会让后续请求以 401 失败，把登录问题伪装成接口问题
     let res = serde_json::from_str::<LoginResponse>(r#"{"token_type":"bearer"}"#);
     assert!(res.is_err(), "缺 access_token 时必须报错");
@@ -47,7 +46,7 @@ fn 登录响应_缺_token_必须报错() {
 
 // ---------------------------------------------------------------- track_status
 
-fn 文档(id: &str, status: &str) -> serde_json::Value {
+fn doc(id: &str, status: &str) -> serde_json::Value {
     serde_json::json!({
         "id": id,
         "status": status,
@@ -67,8 +66,8 @@ fn track(docs: serde_json::Value) -> TrackResponse {
 }
 
 #[test]
-fn track_信封_顶层没有_status_不能按顶层解析() {
-    let t = track(serde_json::json!([文档("doc-1", "processing")]));
+fn track_envelope_has_no_top_level_status() {
+    let t = track(serde_json::json!([doc("doc-1", "processing")]));
     // 顶层只有 track_id / documents / total_count / status_summary
     assert_eq!(t.track_id, "upload_20261017_002603_f93bcf1d");
     assert_eq!(t.documents.len(), 1);
@@ -77,28 +76,28 @@ fn track_信封_顶层没有_status_不能按顶层解析() {
 }
 
 #[test]
-fn 未完成_不算处理完() {
+fn pending_is_not_finished() {
     for st in ["pending", "parsing", "analyzing", "processing", "preprocessed"] {
-        let t = track(serde_json::json!([文档("doc-1", st)]));
+        let t = track(serde_json::json!([doc("doc-1", st)]));
         assert!(!t.is_finished(), "{st} 被当成了终态");
     }
 }
 
 #[test]
-fn 完成_两种大小写都算终态() {
+fn processed_is_terminal_in_any_case() {
     // OpenAPI 示例给 "PROCESSED"，实测响应给 "processed"
-    assert!(track(serde_json::json!([文档("doc-1", "processed")])).is_finished());
-    assert!(track(serde_json::json!([文档("doc-1", "PROCESSED")])).is_finished());
+    assert!(track(serde_json::json!([doc("doc-1", "processed")])).is_finished());
+    assert!(track(serde_json::json!([doc("doc-1", "PROCESSED")])).is_finished());
 }
 
 #[test]
-fn 失败_也算终态_但要把原因交出去() {
-    let t = track(serde_json::json!([文档("doc-1", "failed")]));
+fn failed_is_terminal() {
+    let t = track(serde_json::json!([doc("doc-1", "failed")]));
     assert!(t.is_finished(), "failed 是终态，不该一直轮询下去");
 }
 
 #[test]
-fn documents_为空数组_不算完成() {
+fn empty_documents_is_not_finished() {
     // 拿到 track_id 的瞬间查列表可能返回空数组，和「文档已被删除」在响应里
     // 一模一样。去掉这个判断，`all()` 在空迭代器上恒为 true，会立刻误判完成。
     let t = track(serde_json::json!([]));
@@ -107,23 +106,23 @@ fn documents_为空数组_不算完成() {
 }
 
 #[test]
-fn 多文档_要全部终态才算完成() {
-    let done = track(serde_json::json!([文档("a", "processed"), 文档("b", "processed")]));
+fn all_documents_must_be_terminal() {
+    let done = track(serde_json::json!([doc("a", "processed"), doc("b", "processed")]));
     assert!(done.is_finished());
-    let half = track(serde_json::json!([文档("a", "processed"), 文档("b", "processing")]));
+    let half = track(serde_json::json!([doc("a", "processed"), doc("b", "processing")]));
     assert!(!half.is_finished(), "还有一个在跑就不能算完成");
 }
 
 #[test]
-fn doc_id_取第一个() {
-    let t = track(serde_json::json!([文档("doc-1", "processed"), 文档("doc-2", "processed")]));
+fn first_doc_id_takes_head() {
+    let t = track(serde_json::json!([doc("doc-1", "processed"), doc("doc-2", "processed")]));
     assert_eq!(t.first_doc_id(), Some("doc-1"));
     let empty = track(serde_json::json!([]));
     assert_eq!(empty.first_doc_id(), None);
 }
 
 #[test]
-fn 失败原因_能从_dedup_报错里读出来() {
+fn first_error_reads_dedup_message() {
     let t: TrackResponse = serde_json::from_str(
         r#"{
           "track_id": "t1",
@@ -145,7 +144,7 @@ fn 失败原因_能从_dedup_报错里读出来() {
 }
 
 #[test]
-fn 失败原因_大小写不一致时也能找到() {
+fn first_error_is_case_insensitive() {
     let t: TrackResponse = serde_json::from_str(
         r#"{"track_id":"t","total_count":1,"status_summary":{},
             "documents":[{"id":"d","status":"FAILED","file_path":"a.md","error_msg":"boom"}]}"#,
@@ -155,19 +154,19 @@ fn 失败原因_大小写不一致时也能找到() {
 }
 
 #[test]
-fn 失败但没给_error_msg_返回_none_而不是崩() {
-    let t = track(serde_json::json!([文档("doc-1", "failed")]));
+fn first_error_none_when_absent() {
+    let t = track(serde_json::json!([doc("doc-1", "failed")]));
     assert_eq!(t.first_error(), None);
 }
 
 #[test]
-fn 处理成功时_没有失败原因() {
-    let t = track(serde_json::json!([文档("doc-1", "processed")]));
+fn first_error_none_on_success() {
+    let t = track(serde_json::json!([doc("doc-1", "processed")]));
     assert_eq!(t.first_error(), None);
 }
 
 #[test]
-fn 文档元数据_跨阶段字段不同也能解析() {
+fn metadata_parses_across_stages() {
     // 处理中：chunk_method / chunk_opts / process_options
     // 终态：只剩 parse_engine / parse_format / mm_chunks / kg_write_state
     for meta in [
@@ -188,7 +187,7 @@ fn 文档元数据_跨阶段字段不同也能解析() {
 }
 
 #[test]
-fn 可选字段缺失_退成_none() {
+fn missing_optional_fields_default_to_none() {
     let r: DocStatusResponse =
         serde_json::from_str(r#"{"id":"d","status":"pending","file_path":"a.md"}"#).unwrap();
     assert_eq!(r.chunks_count, None);
@@ -200,7 +199,7 @@ fn 可选字段缺失_退成_none() {
 // ---------------------------------------------------------------- 删除
 
 #[test]
-fn 删除响应_三态判定() {
+fn delete_response_three_states() {
     let started: DeleteDocByIdResponse = serde_json::from_str(
         r#"{"status":"deletion_started","message":"...","doc_id":"doc-1"}"#,
     )
@@ -220,7 +219,7 @@ fn 删除响应_三态判定() {
 }
 
 #[test]
-fn 删除响应_缺message与doc_id_不报错() {
+fn delete_response_without_optional_fields() {
     let r: DeleteDocByIdResponse = serde_json::from_str(r#"{"status":"deletion_started"}"#).unwrap();
     assert!(r.is_scheduled());
     assert_eq!(r.message, "");
@@ -228,7 +227,7 @@ fn 删除响应_缺message与doc_id_不报错() {
 }
 
 #[test]
-fn 删除请求体_带两个开关() {
+fn delete_request_body_flags() {
     let req = DeleteDocRequest {
         doc_ids: vec!["doc-1".into()],
         delete_file: true,
@@ -243,7 +242,7 @@ fn 删除请求体_带两个开关() {
 // ---------------------------------------------------------------- 分页
 
 #[test]
-fn 分页请求_首页用服务端上限_200() {
+fn first_page_uses_max_page_size() {
     let r = DocumentsRequest::first_page();
     assert_eq!(r.page, 1);
     assert_eq!(r.page_size, 200, "服务端上限是 200，超了会 422");
@@ -251,7 +250,7 @@ fn 分页请求_首页用服务端上限_200() {
 }
 
 #[test]
-fn 分页响应_pagination_字段缺失_退成_没有下一页() {
+fn missing_pagination_means_no_next_page() {
     // 少给 has_next 时必须停在第一页，不能当成「还有下一页」死循环
     let r: PaginatedDocsResponse =
         serde_json::from_str(r#"{"documents":[],"pagination":{}}"#).unwrap();
@@ -261,7 +260,7 @@ fn 分页响应_pagination_字段缺失_退成_没有下一页() {
 }
 
 #[test]
-fn 上传响应_非_success_不返回_track_id() {
+fn upload_response_non_success_status() {
     let r: UploadResponse = serde_json::from_str(
         r#"{"status":"failure","message":"bad file","track_id":""}"#,
     )

@@ -20,6 +20,23 @@ fn err(file: &db_model::File, msg: impl std::fmt::Display) -> Box<dyn std::error
     format!("{}: {msg}", file.path).into()
 }
 
+/// 状态不是 2xx 时返回带正文与文件路径的错误，否则原样交给调用方。
+async fn ensure_success(
+    resp: reqwest::Response,
+    file: &db_model::File,
+    动作: &str,
+) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if !status.is_success() {
+        // body 必须先读完：错误原因（字段校验、限流…）几乎都只写在 body 里，
+        // 只报状态码等于让人自己猜。
+        let body = crate::http_util::error_body(resp).await;
+        return Err(err(file, format!("{动作}被拒绝（{status}），响应: {body}")));
+    }
+    Ok(resp)
+}
+
+
 async fn upload(
     client: &reqwest::Client,
     file: &db_model::File,
@@ -55,9 +72,7 @@ async fn upload(
         .send()
         .await
         .map_err(|e| err(file, format!("创建上传失败: {e}")))?;
-    let resp = resp
-        .error_for_status()
-        .map_err(|e| err(file, format!("创建上传被拒绝: {e}")))?;
+    let resp = ensure_success(resp, file, "创建上传").await?;
     let upload: UploadObject = resp
         .json()
         .await
@@ -105,8 +120,7 @@ async fn put_content(
         .await
         .map_err(|e| err(file, format!("上传内容失败: {e}")))?;
 
-    resp.error_for_status()
-        .map_err(|e| err(file, format!("上传内容被拒绝: {e}")))?;
+    ensure_success(resp, file, "上传内容").await?;
     Ok(())
 }
 
@@ -122,9 +136,7 @@ async fn complete(
         .send()
         .await
         .map_err(|e| err(file, format!("完成上传请求失败: {e}")))?;
-    let resp = resp
-        .error_for_status()
-        .map_err(|e| err(file, format!("完成上传被拒绝: {e}")))?;
+    let resp = ensure_success(resp, file, "完成上传").await?;
     let upload: UploadObject = resp
         .json()
         .await
@@ -159,9 +171,7 @@ async fn parse(
         .await
         .map_err(|e| err(file, format!("解析请求失败: {e}")))?;
 
-    let resp = resp
-        .error_for_status()
-        .map_err(|e| err(file, format!("解析被拒绝: {e}")))?;
+    let resp = ensure_success(resp, file, "解析").await?;
 
     // 202 与 200 同构，都反序列化成 TaskResponse
     let mut task: TaskResponse = resp
@@ -199,9 +209,7 @@ async fn poll(
             .send()
             .await
             .map_err(|e| err(file, format!("轮询失败: {e}")))?;
-        let resp = resp
-            .error_for_status()
-            .map_err(|e| err(file, format!("轮询被拒绝: {e}")))?;
+        let resp = ensure_success(resp, file, "轮询").await?;
         let task: TaskResponse = resp
             .json()
             .await
@@ -262,9 +270,7 @@ async fn extract_markdown(
         .send()
         .await
         .map_err(|e| err(file, format!("获取解析内容失败: {e}")))?;
-    let resp = resp
-        .error_for_status()
-        .map_err(|e| err(file, format!("获取解析内容被拒绝: {e}")))?;
+    let resp = ensure_success(resp, file, "获取解析内容").await?;
     resp.text()
         .await
         .map_err(|e| err(file, format!("读取解析内容失败: {e}")))
