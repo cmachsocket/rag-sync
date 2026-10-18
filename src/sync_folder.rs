@@ -1,18 +1,20 @@
-
-use crate::{database, db_model};
+use crate::database::DBfunc;
+use crate::file_mime::SUFFIX_MIME;
 use crate::mineru_requests::mineru_tackle;
 use crate::sync_config;
-use crate::file_mime::SUFFIX_MIME;
-use crate::database::DBfunc;
+use crate::{database, db_model, lightrag_requests::RAGRequest};
 use sha2::{Digest, Sha256};
 use std::io::{self};
-use std::{eprintln, path::{Path, PathBuf}};
+use std::{
+    eprintln,
+    path::{Path, PathBuf},
+};
 use tokio;
-use tokio::{fs::File as FsFile, io::AsyncReadExt};
 use tokio::fs;
+use tokio::{fs::File as FsFile, io::AsyncReadExt};
 use walkdir::WalkDir;
 
-
+const NOT_IN_DB: i32 = 0;
 
 async fn sha256_file(path: &str) -> io::Result<String> {
     let mut file = FsFile::open(path).await?;
@@ -39,8 +41,10 @@ async fn is_supported_file(file_path: &Path) -> bool {
         })
 }
 
-async fn get_relative_path(root_dir: &str, file_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    
+async fn get_relative_path(
+    root_dir: &str,
+    file_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
     let root_path = Path::new(root_dir);
     let relative_path = file_path.strip_prefix(root_path).map_err(|_| {
         format!(
@@ -52,7 +56,10 @@ async fn get_relative_path(root_dir: &str, file_path: &Path) -> Result<String, B
     Ok(relative_path.to_string_lossy().into_owned())
 }
 
-async fn create_output_dir(config: &sync_config::SyncConfig, file_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn create_output_dir(
+    config: &sync_config::SyncConfig,
+    file_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = &config.output_dir;
     let rel = get_relative_path(&config.sync_dir, file_path).await?;
     let output_path = Path::new(output_dir).join(rel);
@@ -64,7 +71,10 @@ async fn create_output_dir(config: &sync_config::SyncConfig, file_path: &Path) -
     Ok(())
 }
 
-pub async fn get_files(config: &sync_config::SyncConfig) -> Result<Vec<db_model::File>, Box<dyn std::error::Error>> {
+pub async fn get_files(
+    config: &sync_config::SyncConfig,
+    conn: &mut database::Conn,
+) -> Result<Vec<db_model::File>, Box<dyn std::error::Error>> {
     let root_dir = &config.sync_dir;
     let mut files: Vec<db_model::File> = Vec::new();
 
@@ -78,16 +88,21 @@ pub async fn get_files(config: &sync_config::SyncConfig) -> Result<Vec<db_model:
 
                     // 处理文件路径
                     println!("[文件] {}", file_path.display());
+                    let file_in_db = DBfunc::get_file(conn, file_path.to_str().unwrap()).await?;
                     // 将文件信息添加到 files 向量中
-                    files.push(db_model::File {
-                        id: 0,
-                        path: file_path.to_string_lossy().into_owned(),
-                        sha256: sha256_file(file_path.to_str().unwrap())
-                            .await
-                            .unwrap_or_else(|_| String::new()),
-                        run_id: config.run_id,
-                        rag_id: None, // 初始化为 None，稍后可以根据需要更新
-                    });
+                    let file = match file_in_db {
+                        Some(file) => file,
+                        None => db_model::File {
+                            id: NOT_IN_DB,
+                            path: file_path.to_string_lossy().into_owned(),
+                            sha256: sha256_file(file_path.to_str().unwrap())
+                                .await
+                                .unwrap_or_else(|_| String::new()),
+                            run_id: config.run_id,
+                            rag_id: None, // 初始化为 None，稍后可以根据需要更新
+                        },
+                    };
+                    files.push(file);
                 }
             }
             Err(e) => eprintln!("错误: {}", e),
@@ -96,13 +111,23 @@ pub async fn get_files(config: &sync_config::SyncConfig) -> Result<Vec<db_model:
     Ok(files)
 }
 
-pub async fn create_output_files(config: &sync_config::SyncConfig, files: &[db_model::File],conn: &mut database::Conn) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+pub async fn create_output_files(
+    config: &sync_config::SyncConfig,
+    files: &[db_model::File],
+    conn: &mut database::Conn,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let mut output_files: Vec<PathBuf> = Vec::new();
+    let rag_request = RAGRequest::new(
+        &client,
+        &config.lightrag_url,
+        &config.lightrag_username,
+        &config.lightrag_password,
+    )
+    .await?;
     for file in files {
-        let file_in_db = DBfunc::file_exists(conn, &file.path).await?;
         let file_path = Path::new(&file.path);
-        if file_in_db {
+        if file.id != NOT_IN_DB {
             let old_sha = DBfunc::get_sha256(conn, &file.path).await?;
             if old_sha.as_deref() == Some(&file.sha256) {
                 println!("文件 {} 的 sha256 未变化，跳过处理", file.path);
@@ -115,11 +140,43 @@ pub async fn create_output_files(config: &sync_config::SyncConfig, files: &[db_m
         let rel = get_relative_path(&config.sync_dir, file_path).await?;
         let output_file_path = Path::new(&config.output_dir).join(rel);
         fs::write(&output_file_path, &markdown).await.map_err(|e| {
-            eprintln!("错误: 写入输出文件 {} 失败: {}", output_file_path.display(), e);
+            eprintln!(
+                "错误: 写入输出文件 {} 失败: {}",
+                output_file_path.display(),
+                e
+            );
             "写入输出文件失败"
         })?;
         println!("已生成输出文件: {}", output_file_path.display());
-        output_files.push(output_file_path);
+        output_files.push(output_file_path.clone());
+        match output_file_path.to_str() {
+            Some(path_str) => {
+                let result = rag_request.upload_file(path_str).await?;
+                println!("RAG 上传结果: {}", result);
+                // 更新数据库中的 rag_id
+                if file.id != NOT_IN_DB {
+                    DBfunc::update_rag_id(conn, &file.path, Some(&result)).await?;
+                    DBfunc::update_file_run_id(conn, &file.path, config.run_id).await?;
+                    DBfunc::update_sha256(conn, &file.path, &file.sha256).await?;
+                } else {
+                    // 如果文件不在数据库中，插入新记录
+                    DBfunc::insert_file(
+                        conn,
+                        &file.path,
+                        &file.sha256,
+                        config.run_id,
+                        Some(&result),
+                    )
+                    .await?;
+                }
+            }
+            None => {
+                eprintln!(
+                    "错误: 无法将输出文件路径转换为字符串: {}",
+                    output_file_path.display()
+                );
+            }
+        }
     }
     Ok(output_files)
 }

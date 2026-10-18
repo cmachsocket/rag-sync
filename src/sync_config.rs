@@ -10,7 +10,13 @@ pub struct SyncConfig {
     #[serde(default = "String::new")]
     pub mineru_url: String,
     #[serde(default = "zero")]
-    pub run_id: i32
+    pub run_id: i32,
+    #[serde(default = "String::new")]
+    pub lightrag_password: String,
+    #[serde(default = "String::new")]
+    pub lightrag_url: String,
+    #[serde(default = "String::new")]
+    pub lightrag_username: String,
 }
 
 fn zero() -> i32{

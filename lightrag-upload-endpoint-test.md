@@ -502,10 +502,65 @@ model 侧：
 
 `PipelineStatusResponse` 加过又删了 —— 判定删除完成不需要它，理由见 §5.3。
 
-### 6.2 遗留
+### 6.2 同名冲突自愈放在 `upload_file` 内部
+
+**为什么不放调用方：** 调用方手上只有本地路径，判不出 409 说的是哪个 `doc_id`；而 `doc_id` 必须回服务端按文件名反查（`RAGRequest` 不持有 DB 连接，拿不到调用方存的 `rag_id`）。自愈逻辑放在外面，调用方就只能靠「无条件先删」或「吞掉 409」来绕，两个都不对。
+
+`_upload` 因此拆出 `UploadError`：
+
+| 变体 | 含义 | 处理 |
+| --- | --- | --- |
+| `Conflict(detail)` | `409`，detail 保留原文以区分冲突来源（文档存储 / input 目录） | 清理后**重试一次** |
+| `Fatal(msg)` | 400 / 401 / 5xx / 网络错误 | 原样上抛 |
+
+只对 `Conflict` 重试。对 400/401 也重试会把真实错误掩盖成一次莫名其妙的失败。**只重试一次** —— 删完再传还是 409 说明有别的成因，再循环只是把一次失败拖成无数次请求。
+
+`remove_conflicting` 的三种结果：
+
+| `find_doc_ids_by_filename` 返回 | 动作 |
+| --- | --- |
+| 恰好 1 个 | `delete_document` 后重传 |
+| 0 个 | 报错。冲突多半来自 input 目录里的残留文件（无索引记录），`delete_document` 清不掉，需要人工介入 |
+| > 1 个 | 报错并列出 id。文件名是唯一键，出现多个说明有异常，盲删有误伤风险 |
+
+文件名比对用 `canonical_basename()`：LightRAG 判同名时会剥掉 parser hint（`abc.docx` 与 `abc.[native].docx` 同指一条记录）。实现里**只剥实测见过的 `[native]` 和 `[legacy]`** 两种（§3.2 / §3.3 的 parse_engine），没见过的 hint 不猜 —— 宁可匹配不上让人看一眼，也不要按错名字删掉别人的文档。
+
+### 6.3 `is_finished()` 里那个 `!is_empty()`
+
+写这个测试时当场撞出来的：**上传返回 track_id 的瞬间，`doc_status` 里的记录未必已经注册上，第一次 `track_status` 查询会拿到 `documents: []`**，随后同一个 track_id 就正常了。
+
+空数组上 `all()` 恒为 `true`，于是 `is_finished()` 会把「还没注册」直接判成「处理完成」，紧接着 `first_doc_id()` 返回 `None`，报「没有返回任何 doc_id」。修法是 `!self.documents.is_empty() && all(...)`。
+
+这个空数组和「文档已被删除」的响应**逐字节相同**（§9.1 的 97 B），所以既不能当完成信号，也不能当失败信号，只能继续等。
+
+### 6.4 端到端测试
+
+`lightrag_requests.rs` 内有 `live_upload_conflict`，打真实服务，默认 `--ignore`。覆盖：首传 → 同名重传（走冲突分支）→ 改内容重传（仍走冲突分支）→ 删除并确认消失。
+
+```sh
+RAG_URL=... RAG_USER=... RAG_PASS=... \
+cargo test live_upload_conflict -- --nocapture --ignored
+```
+
+约 90 s（三轮上传各等一次后台抽取）。
+
+实测结果（2026-10-18）：
+
+```text
+第一次上传 -> doc-7499fdee92a749e270800a40e067fbeb
+[冲突] rag_sync_live_conflict_probe.txt 已被 doc-7499fdee92a749e270800a40e067fbeb 占用，先删除再重传
+重传同名 -> doc-7499fdee92a749e270800a40e067fbeb
+[冲突] rag_sync_live_conflict_probe.txt 已被 doc-7499fdee92a749e270800a40e067fbeb 占用，先删除再重传
+改内容重传 -> doc-7499fdee92a749e270800a40e067fbeb
+全部通过
+```
+
+三轮的 doc_id 完全相同 —— 这正是 §9.0 的结论：doc_id 由文件名派生，与内容无关。
+
+### 6.5 遗留
 
 - `lightrag_requests.rs:1` 的 `use tokio::stream;` 是无用 import。
-- `_track` / `upload_file` / `delete_document` 还没有调用点（`main.rs` 未接入），整块带 `dead_code` 警告。
+- `_track` / `upload_file` / `delete_document` 在生产路径上还只有 `sync_folder.rs` 间接用到 `upload_file`，其余带 `dead_code` 警告。
 
 
 ## 7. 结论
@@ -545,6 +600,28 @@ model 侧：
 
 本节列出**没有实测依据**的判断。写代码时不要把这些当既定事实。
 
+### 9.0 `doc_id` 的派生规则 —— 已实测（2026-10-18）
+
+**`doc_id` = `"doc-" + md5(文件名)`**，不含路径、不含扩展名处理、不含内容。对 4 个样本逐一核对，4/4 精确命中：
+
+| 文件名 | md5(文件名) | 观测到的 doc_id |
+| --- | --- | --- |
+| `configuration.md` | `a66b35d20295cb764719ac8bd35837ec` | `doc-a66b35d20295cb764719ac8bd35837ec` ✓ |
+| `experiments.md` | `6645ec8fc76c37978e3ea87c359a975c` | `doc-6645ec8fc76c37978e3ea87c359a975c` ✓ |
+| `互联网链路安全的区块链加固_论文点评.md` | `9c8c165e3a6eceae96a29b4c9c424095` | `doc-9c8c165e3a6eceae96a29b4c9c424095` ✓ |
+| `rag_sync_live_conflict_probe.txt` | `7499fdee92a749e270800a40e067fbeb` | `doc-7499fdee92a749e270800a40e067fbeb` ✓ |
+
+推论：
+
+1. **doc_id 是客户端可预知的**，不必靠上传响应回传。rag-sync 的 `rag_id` 落库时可以自己算，省一次往返。
+2. **改内容不影响 doc_id** —— 实测把探针文件内容改掉后重传，doc_id 一模一样。所以「doc_id 没变」**不能**用来判断内容是否被更新过。
+3. **删掉再传同名文件，doc_id 会原样回来**。这给 §9.1 的删除确认加了一条约束：轮询到 doc_id 消失之后，如果同名文件被重新上传，doc_id 会**再次出现同一个值**。「消失过」不等于「不会再回来」。
+4. 与文件名是唯一键一致 —— 这就是 409 同步判重的根据，也是 §6.2 自愈逻辑能按文件名反查的前提。
+
+**这是逆向观察到的实现细节，不是服务端承诺的契约。** 依赖它去预计算 doc_id 之前，先在自己的库上核对一遍（一条 `md5` 的事）。`remove_conflicting` 仍然走 `paginated` 扫描而不直接用 md5 算，就是因为扫描是权威的、还顺带处理了 parser hint 归一。
+
+注意区分：内容重复检测（§7 的 `Content already exists. Original doc_id: xxx`）是**异步**的，它报的 `Original doc_id` 指向的是**另一个文件名**下内容相同的文档 —— 那种情况 doc_id 自然不同，因为 md5 前像不同。
+
 ### 9.1 删除后 `track_status` 的行为 —— 已实测（2026-10-18）
 
 凭据取自 `config.yml`（该文件在 `.gitignore` 里，未被跟踪）。
@@ -571,6 +648,8 @@ model 侧：
 
 3. **空数组不能单独作为删除成功的证据。** 已删除的 track 和从未存在的 track 返回**逐字节相同**的 97 B 响应。`documents: []` 只说明"这个 track 下现在没有文档"，不说明"曾经有过、被你删掉了"。
 
+   还有一个反向的坑：**上传后立即查询也会拿到 `documents: []`** —— `doc_status` 记录尚未注册（实测撞到过，见 §6.3）。所以空数组既可能是"还没开始"，也可能是"已经删了"，只能靠前后基线区分。
+
    正确用法是**先建立基线，再等它变空**：删除前先确认该 track 下能看到目标 doc_id，之后轮询到空，才能确定是这次删除生效。
 
    ```text
@@ -580,6 +659,8 @@ model 侧：
    ```
 
    没有第 1 步，track_id 写错、被服务端淘汰、文档本来就属于别的 track，都会静默判成"删除成功"。
+
+   另外注意 §9.0：同名文件重传后 **doc_id 会原样回来**。"消失过"不等于"不会再回来"。
 
 `track_status` 不存在的 track_id 返回 `200` + 空数组而不是 404，所以它**不是**一个能用来探测 track_id 是否有效的端点。
 

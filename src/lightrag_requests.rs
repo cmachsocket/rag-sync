@@ -1,4 +1,3 @@
-use tokio::stream;
 use tokio_util::codec::FramedRead;
 
 use crate::lightrag_model;
@@ -19,9 +18,65 @@ const TRACK_TIMEOUT: Duration = Duration::from_secs(900);
 /// 长任务尾巴（pipeline 忙时 delete 会直接返回 busy）。
 const DELETE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// 上传失败的原因。**只有同名冲突能自愈**，其余一律原样上抛 ——
+/// 在 upload_file 里对 400 / 401 也重试，会把真实错误掩盖成一次莫名其妙的失败。
+enum UploadError {
+    /// 409。服务端把文件名当唯一文档键，写文件之前就同步拒绝，
+    /// detail 里要求先删掉已有记录。detail 原样保留，用于区分冲突来源。
+    Conflict(String),
+    Fatal(String),
+}
+
+impl UploadError {
+    fn conflict(detail: &str) -> Self {
+        UploadError::Conflict(detail.to_string())
+    }
+
+    fn fatal(msg: String) -> Self {
+        UploadError::Fatal(msg)
+    }
+
+    fn into_err(self, ctx: &str) -> Box<dyn std::error::Error> {
+        match self {
+            UploadError::Conflict(detail) => {
+                format!("{ctx}：仍为 409 同名冲突，服务端信息: {detail}").into()
+            }
+            UploadError::Fatal(msg) => format!("{ctx}: {msg}").into(),
+        }
+    }
+}
+
+/// 取 basename。上传给服务端的 filename 就是它，服务端存的 file_path 也是它
+/// （不是原始绝对路径），两边靠这个对上。
+fn basename(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// LightRAG 判同名用的是 canonical basename：会剥掉 parser hint，
+/// `abc.docx` 和 `abc.[native].docx` 指向同一条记录（见 upload 的 OpenAPI 描述）。
+///
+/// 这里只剥实测见过的两种（§3.2 的 legacy / §3.3 的 native）。没见过的 hint 不猜 ——
+/// 宁可匹配不上、报出来让人看一眼，也不要按错误的名字删掉别人的文档。
+fn canonical_basename(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let stem = match lower.rfind('.') {
+        Some(dot) => &lower[..dot],
+        None => &lower[..],
+    };
+    for hint in ["[native]", "[legacy]"] {
+        if let Some(stripped) = stem.strip_suffix(hint) {
+            return stripped.to_string();
+        }
+    }
+    stem.to_string()
+}
+
 // 上传接口尚未实现，main 也还没接入，因此暂时没有构造点。
 #[allow(dead_code)]
-struct RAGRequest<'a> {
+pub struct RAGRequest<'a> {
     client: &'a reqwest::Client,
     url: &'a str,
     jwt_token: String,
@@ -80,20 +135,17 @@ impl<'a> RAGRequest<'a> {
             .map_err(|e| format!("解析登录响应失败: {e}，响应: {body}"))?;
         Ok(login_response.access_token)
     }
-    async fn _upload(&self, file_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    async fn _upload(&self, file_path: &str) -> Result<String, UploadError> {
         let upload_url = format!("{}/documents/upload", self.url);
         let file = tokio::fs::File::open(file_path)
             .await
-            .map_err(|e| format!("打开文件失败: {e}"))?;
+            .map_err(|e| UploadError::fatal(format!("打开文件失败: {e}")))?;
         let stream = FramedRead::new(file, tokio_util::codec::BytesCodec::new());
         let body = reqwest::Body::wrap_stream(stream);
         // file_name 必须给 basename，不能传完整路径：服务端拿 filename 判同名，
         // `/home/a/b.md` 会让它按整条路径当键，判重和落盘目录都会跑偏。
         // mime_str 不用设，服务端只看扩展名（见 lightrag-upload-endpoint-test.md §3.1）。
-        let name = std::path::Path::new(file_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| file_path.to_string());
+        let name = basename(file_path);
         let part = reqwest::multipart::Part::stream(body).file_name(name);
         let form = reqwest::multipart::Form::new().part("file", part);
         let resp = self
@@ -103,26 +155,33 @@ impl<'a> RAGRequest<'a> {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| format!("上传文件请求失败: {e}"))?;
+            .map_err(|e| UploadError::fatal(format!("上传文件请求失败: {e}")))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            // 409：同名文档已存在。服务端在写文件之前就同步拒绝，并要求先删掉
+            // 已有记录。detail 区分了两种来源：文档存储里已有 / input 目录里已有。
+            let body = resp.text().await.unwrap_or_default();
+            return Err(UploadError::conflict(&body));
+        }
         if status.is_success() {
             let resp_json: lightrag_model::UploadResponse = resp
                 .json()
                 .await
-                .map_err(|e| format!("解析上传响应失败: {e}"))?;
+                .map_err(|e| UploadError::fatal(format!("解析上传响应失败: {e}")))?;
             // 枚举是 success / partial_success / failure，只有 success 有 track_id。
             if resp_json.status == "success" {
                 Ok(resp_json.track_id)
             } else {
-                Err(format!(
+                Err(UploadError::fatal(format!(
                     "上传文件失败，状态码: {status}，响应: {:?}",
                     resp_json.message
-                )
-                .into())
+                )))
             }
         } else {
             let body = resp.text().await.unwrap_or_default();
-            Err(format!("上传文件失败，状态码: {status}，响应: {body}").into())
+            Err(UploadError::fatal(format!(
+                "上传文件失败，状态码: {status}，响应: {body}"
+            )))
         }
     }
 
@@ -175,7 +234,7 @@ impl<'a> RAGRequest<'a> {
         let delete_request = lightrag_model::DeleteDocRequest {
             doc_ids: vec![file_id.to_string()],
             delete_file: true,
-            delete_llm_cache: false,
+            delete_llm_cache: true,
         };
         let resp = self
             .client
@@ -269,9 +328,92 @@ impl<'a> RAGRequest<'a> {
         }
     }
 
+    /// 按文件名反查占用它的 doc_id。服务端把文件名当唯一文档键，409 只在
+    /// detail 里给文件名，doc_id 得自己从列表里找出来。
+    async fn find_doc_ids_by_filename(
+        &self,
+        name: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let target = canonical_basename(name);
+        let url = format!("{}/documents/paginated", self.url);
+        let mut req = lightrag_model::DocumentsRequest::first_page();
+        let mut found: Vec<String> = Vec::new();
+        loop {
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(&self.jwt_token)
+                .json(&req)
+                .send()
+                .await
+                .map_err(|e| format!("查询文档列表失败: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("查询文档列表失败，状态码: {status}，响应: {body}").into());
+            }
+            let page: lightrag_model::PaginatedDocsResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("解析文档列表失败: {e}"))?;
+            for doc in &page.documents {
+                if canonical_basename(&basename(&doc.file_path)) == target {
+                    found.push(doc.id.clone());
+                }
+            }
+            if !page.pagination.has_next {
+                break;
+            }
+            req.page += 1;
+        }
+        Ok(found)
+    }
+
+    /// 清掉占用该文件名的旧文档，让重传能过。
+    async fn remove_conflicting(
+        &self,
+        name: &str,
+        detail: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let found = self.find_doc_ids_by_filename(name).await?;
+        match found.as_slice() {
+            [] => Err(format!(
+                "上传 {name} 返回 409 同名冲突，但文档列表里找不到它。\
+                 冲突多半来自 input 目录里的残留文件（没有对应索引记录），\
+                 delete_document 清不掉这种情况，需要人工确认。服务端原始信息: {detail}"
+            )
+            .into()),
+            [doc_id] => {
+                println!("[冲突] {name} 已被 {doc_id} 占用，先删除再重传");
+                self.delete_document(doc_id).await
+            }
+            many => Err(format!(
+                "{name} 匹配到多个文档 {many:?}，拒绝自动删除以免误删。服务端原始信息: {detail}"
+            )
+            .into()),
+        }
+    }
+
     /// 上传并等待后台处理完成，返回 doc_id。
+    ///
+    /// 同名冲突的清理由**这里**做，不放在调用方：调用方手上只有本地路径，
+    /// 判不出 409 说的是哪个 doc_id，而 doc_id 必须按文件名回服务端反查。
+    /// `RAGRequest` 也不持有 DB 连接，拿不到调用方存的 rag_id。
     pub async fn upload_file(&self, file_path: &str) -> Result<String, Box<dyn std::error::Error>> {
-        let track_id = self._upload(file_path).await?;
+        let name = basename(file_path);
+        let track_id = match self._upload(file_path).await {
+            Ok(track_id) => track_id,
+            // 只重试一次：删完再传还是 409 说明有别的成因，
+            // 再循环下去只是把一次失败拖成无数次请求。
+            Err(UploadError::Conflict(detail)) => {
+                self.remove_conflicting(&name, &detail).await?;
+                self._upload(file_path)
+                    .await
+                    .map_err(|e| e.into_err(&format!("清理同名冲突后重传 {file_path} 仍失败")))?
+            }
+            Err(e) => return Err(e.into_err(&format!("上传 {file_path} 失败"))),
+        };
+
         let track = self._track(&track_id).await?;
         if let Some(err) = track.first_error() {
             return Err(format!("{file_path} 后台处理失败: {err}").into());
@@ -280,5 +422,64 @@ impl<'a> RAGRequest<'a> {
             .first_doc_id()
             .map(str::to_string)
             .ok_or_else(|| format!("{track_id} 没有返回任何 doc_id").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 端到端验证「同名冲突自愈」。
+    ///
+    /// 默认跳过 —— 它打真实服务、会写入知识库。每个文件约 30 s 后台处理，
+    /// 一次跑两轮上传。显式开启：
+    ///
+    /// ```sh
+    /// RAG_LIVE=1 \
+    /// RAG_URL=http://192.168.2.7:9621 \
+    /// RAG_USER=xxx RAG_PASS=xxx \
+    /// cargo test live_upload_conflict -- --nocapture --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "打真实服务并写入知识库"]
+    async fn live_upload_conflict() -> Result<(), Box<dyn std::error::Error>> {
+        let url = std::env::var("RAG_URL").expect("RAG_URL");
+        let user = std::env::var("RAG_USER").expect("RAG_USER");
+        let pass = std::env::var("RAG_PASS").expect("RAG_PASS");
+
+        let path = std::env::temp_dir().join("rag_sync_live_conflict_probe.txt");
+        std::fs::write(&path, format!("live conflict probe {}\nbody\n", std::process::id()))?;
+        let path = path.to_string_lossy().into_owned();
+
+        let client = reqwest::Client::new();
+        let rag = RAGRequest::new(&client, &url, &user, &pass).await?;
+
+        // 1. 首次上传
+        std::fs::write(&path, format!("probe round 1 {}\nbody\n", std::process::id()))?;
+        let first = rag.upload_file(&path).await?;
+        println!("第一次上传 -> {first}");
+        assert!(rag.document_exists(&first).await?);
+
+        // 2. 相同文件重传：必然 409，走 remove_conflicting 分支。
+        //    doc_id 由文件名派生（= "doc-" + md5(文件名)，已对 4 个样本核对），
+        //    所以重传拿到的 doc_id 与之前完全一样。
+        let same = rag.upload_file(&path).await?;
+        println!("重传同名 -> {same}");
+        assert_eq!(first, same, "doc_id 由文件名派生，同名重传应完全相同");
+
+        // 3. 改内容重传：仍走冲突分支。doc_id 照样不变（它只看文件名），
+        //    变的只有底下的文档内容 —— 这一点是 doc_id 派生自文件名的直接后果。
+        std::fs::write(&path, format!("probe round 2 DIFFERENT {}\nbody\n", std::process::id()))?;
+        let changed = rag.upload_file(&path).await?;
+        println!("改内容重传 -> {changed}");
+        assert_eq!(first, changed, "doc_id 只看文件名，内容变了也不该变");
+        assert!(rag.document_exists(&changed).await?);
+
+        // 4. 删干净。
+        rag.delete_document(&changed).await?;
+        assert!(!rag.document_exists(&changed).await?);
+        std::fs::remove_file(&path).ok();
+        println!("全部通过");
+        Ok(())
     }
 }

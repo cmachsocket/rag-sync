@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-
 /*
 
 ```json
@@ -96,6 +95,9 @@ pub struct DocStatusResponse {
     pub error_msg: Option<String>,
     #[serde(default)]
     pub content_length: Option<u64>,
+    /// 服务端存的是上传时的 filename（我们传的是 basename），不是原始绝对路径。
+    /// 判同名冲突时要靠它反查 doc_id。
+    pub file_path: String,
     #[serde(default)]
     pub metadata: Option<MetadataResponse>,
 }
@@ -115,12 +117,21 @@ impl TrackResponse {
     /// 上传是异步的：549 B 纯文本要 64 s，8.6 KB Markdown 因为含 4 个表格
     /// 要 728 s，绝不能拿到 200 就当处理完了。
     pub fn is_finished(&self) -> bool {
-        self.documents.iter().all(|d| {
-            return matches!(
-                d.status.to_ascii_lowercase().as_str(),
-                "processed" | "failed"
-            )
-        })
+        // 空数组不算完成。上传返回 track_id 的那一刻，doc_status 里的记录未必
+        // 已注册上，第一次查询会拿到 documents: []（实测撞到过，随后同一个
+        // track_id 就正常了）。这个空数组和「文档已被删除」在响应里完全一样，
+        // 都是 97 B 的 {"documents":[],"total_count":0,...}，既不能当完成信号，
+        // 也不能当失败信号，只能继续等。
+        //
+        // 这个 !is_empty() 不是冗余判断：空迭代器上 all() 恒为 true，
+        // 去掉它上面那个竞态就会直接变成误判完成。
+        !self.documents.is_empty()
+            && self.documents.iter().all(|d| {
+                return matches!(
+                    d.status.to_ascii_lowercase().as_str(),
+                    "processed" | "failed"
+                );
+            })
     }
 
     pub fn first_doc_id(&self) -> Option<&str> {
@@ -136,7 +147,6 @@ impl TrackResponse {
             .and_then(|d| d.error_msg.as_deref())
     }
 }
-
 
 /*
 路径是 `DELETE /documents/delete_document`，**DELETE 带 JSON body**（`DeleteDocRequest`），只有 `doc_ids` 必填。
@@ -230,6 +240,9 @@ pub struct DocumentsRequest {
 
 impl DocumentsRequest {
     pub fn first_page() -> Self {
-        DocumentsRequest { page: 1, page_size: 200 }
+        DocumentsRequest {
+            page: 1,
+            page_size: 200,
+        }
     }
 }

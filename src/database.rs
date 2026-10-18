@@ -2,6 +2,8 @@ use diesel::prelude::{ExpressionMethods, OptionalExtension, QueryDsl, Selectable
 use diesel::{self, SqliteConnection};
 use diesel_async::{AsyncConnection, RunQueryDsl, sync_connection_wrapper::SyncConnectionWrapper};
 
+use crate::schema::files::rag_id;
+
 pub type Conn = SyncConnectionWrapper<SqliteConnection>;
 
 pub trait DBfunc {
@@ -20,6 +22,7 @@ pub trait DBfunc {
         file_path: &str,
         sha256: &str,
         id: i32,
+        file_rag_id: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>>;
     async fn get_run_counter(
         &mut self,
@@ -37,7 +40,15 @@ pub trait DBfunc {
         file_path: &str,
         new_run_id: i32,
     ) -> Result<(), Box<dyn std::error::Error>>;
-    
+    async fn get_file(
+        &mut self,
+        file_path: &str,
+    ) -> Result<Option<crate::db_model::File>, Box<dyn std::error::Error>>;
+    async fn update_rag_id(
+        &mut self,
+        file_path: &str,
+        new_rag_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> ;
 }
 
 pub async fn establish_db_connection() -> Result<Conn, Box<dyn std::error::Error>> {
@@ -109,10 +120,16 @@ impl DBfunc for Conn {
         file_path: &str,
         sha256_value: &str,
         id: i32,
+        file_rag_id: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::schema::files::dsl::{files, id as file_id, path, sha256};
         diesel::insert_into(files)
-            .values((file_id.eq(id), path.eq(file_path), sha256.eq(sha256_value)))
+            .values((
+                file_id.eq(id),
+                path.eq(file_path),
+                sha256.eq(sha256_value),
+                rag_id.eq(file_rag_id),
+            ))
             .execute(self)
             .await?;
         Ok(())
@@ -120,8 +137,7 @@ impl DBfunc for Conn {
     async fn get_file_run_id(
         &mut self,
         file_path: &str,
-    ) -> Result<Option<i32>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<Option<i32>, Box<dyn std::error::Error>> {
         use crate::schema::files::dsl::*;
         let result = files
             .filter(path.eq(file_path))
@@ -139,6 +155,32 @@ impl DBfunc for Conn {
         use crate::schema::files::dsl::*;
         diesel::update(files.filter(path.eq(file_path)))
             .set(run_id.eq(new_run_id))
+            .execute(self)
+            .await?;
+        Ok(())
+    }
+    async fn get_file(
+        &mut self,
+        file_path: &str,
+    ) -> Result<Option<crate::db_model::File>, Box<dyn std::error::Error>> {
+        use crate::db_model::File;
+        use crate::schema::files::dsl::*;
+        let result = files
+            .filter(path.eq(file_path))
+            .select(File::as_select())
+            .first::<File>(self)
+            .await
+            .optional()?;
+        Ok(result)
+    }
+    async fn update_rag_id(
+        &mut self,
+        file_path: &str,
+        new_rag_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::schema::files::dsl::*;
+        diesel::update(files.filter(path.eq(file_path)))
+            .set(rag_id.eq(new_rag_id))
             .execute(self)
             .await?;
         Ok(())
