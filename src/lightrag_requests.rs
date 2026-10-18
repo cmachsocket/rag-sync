@@ -62,16 +62,26 @@ pub fn basename(path: &str) -> String {
 /// 宁可匹配不上、报出来让人看一眼，也不要按错误的名字删掉别人的文档。
 pub fn canonical_basename(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    let stem = match lower.rfind('.') {
+    let mut stem = match lower.rfind('.') {
         Some(dot) => &lower[..dot],
         None => &lower[..],
     };
-    for hint in ["[native]", "[legacy]"] {
-        if let Some(stripped) = stem.strip_suffix(hint) {
-            return stripped.to_string();
+    // 循环剥而不是剥一次：`a.[native].[legacy].md` 这种叠着的也要归到同一个键。
+    loop {
+        let mut stripped = false;
+        for hint in ["[native]", "[legacy]"] {
+            if let Some(rest) = stem.strip_suffix(hint) {
+                // 连同紧挨着的分隔点号一起剥掉。否则 `a.[native].md` 会归一成
+                // `a.`，而 `a.md` 归一成 `a`，同一个文档被算成两个名字，
+                // 409 之后按文件名反查就永远查不到自己。
+                stem = rest.trim_end_matches('.');
+                stripped = true;
+            }
+        }
+        if !stripped {
+            return stem.to_string();
         }
     }
-    stem.to_string()
 }
 
 pub struct RAGRequest<'a> {
@@ -293,11 +303,13 @@ impl<'a> RAGRequest<'a> {
         }
     }
 
-    /// 文档是否还在库里。查 paginated 列表，是判定删除是否生效的唯一权威依据。
-    /// 必须翻完所有页：服务端 page_size 上限 200，只看第一页会漏判。
-    pub async fn document_exists(&self, doc_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    /// 翻完所有页拉回文档列表。必须翻完：服务端 page_size 上限 200，
+    /// 只看第一页会漏判。两处判定（存在性 / 按文件名反查）都走这里，
+    /// 免得修一处漏一处。
+    async fn 全部文档(&self) -> Result<Vec<lightrag_model::DocStatusResponse>, Box<dyn std::error::Error>> {
         let url = format!("{}/documents/paginated", self.url);
         let mut req = lightrag_model::DocumentsRequest::first_page();
+        let mut all = Vec::new();
         loop {
             let resp = self
                 .client
@@ -316,14 +328,21 @@ impl<'a> RAGRequest<'a> {
                 .json()
                 .await
                 .map_err(|e| format!("解析文档列表失败: {e}"))?;
-            if page.documents.iter().any(|d| d.id == doc_id) {
-                return Ok(true);
-            }
+            all.extend(page.documents);
             if !page.pagination.has_next {
-                return Ok(false);
+                return Ok(all);
             }
             req.page += 1;
         }
+    }
+
+    /// 文档是否还在库里。查 paginated 列表，是判定删除是否生效的唯一权威依据。
+    pub async fn document_exists(&self, doc_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        Ok(self
+            .全部文档()
+            .await?
+            .iter()
+            .any(|d| d.id == doc_id))
     }
 
     /// 按文件名反查占用它的 doc_id。服务端把文件名当唯一文档键，409 只在
@@ -333,38 +352,13 @@ impl<'a> RAGRequest<'a> {
         name: &str,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let target = canonical_basename(name);
-        let url = format!("{}/documents/paginated", self.url);
-        let mut req = lightrag_model::DocumentsRequest::first_page();
-        let mut found: Vec<String> = Vec::new();
-        loop {
-            let resp = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.jwt_token)
-                .json(&req)
-                .send()
-                .await
-                .map_err(|e| format!("查询文档列表失败: {e}"))?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(format!("查询文档列表失败，状态码: {status}，响应: {body}").into());
-            }
-            let page: lightrag_model::PaginatedDocsResponse = resp
-                .json()
-                .await
-                .map_err(|e| format!("解析文档列表失败: {e}"))?;
-            for doc in &page.documents {
-                if canonical_basename(&basename(&doc.file_path)) == target {
-                    found.push(doc.id.clone());
-                }
-            }
-            if !page.pagination.has_next {
-                break;
-            }
-            req.page += 1;
-        }
-        Ok(found)
+        Ok(self
+            .全部文档()
+            .await?
+            .iter()
+            .filter(|doc| canonical_basename(&basename(&doc.file_path)) == target)
+            .map(|doc| doc.id.clone())
+            .collect())
     }
 
     /// 清掉占用该文件名的旧文档，让重传能过。

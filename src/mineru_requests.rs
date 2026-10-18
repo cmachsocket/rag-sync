@@ -20,18 +20,6 @@ fn err(file: &db_model::File, msg: impl std::fmt::Display) -> Box<dyn std::error
     format!("{}: {msg}", file.path).into()
 }
 
-/// 取得 file_id：优先复用已有映射，否则走完整上传流程。
-async fn ensure_file_id(
-    client: &reqwest::Client,
-    file: &db_model::File,
-    config: &SyncConfig,
-) -> Result<String> {
-    if file.id != 0 {
-        return Ok(file.id.to_string());
-    }
-    upload(client, file, config).await
-}
-
 async fn upload(
     client: &reqwest::Client,
     file: &db_model::File,
@@ -283,11 +271,16 @@ async fn extract_markdown(
 }
 
 /// 单个文件的完整流程：上传 → 解析 → 返回 markdown。
+///
+/// 每轮都重新走一遍上传，**不复用任何本地记录**：`files.id` 是 DB 的行号，
+/// 不是 MinerU 的 file_id，拿它去解析等于查了另一个东西。真正让重复上传
+/// 不花钱的是服务端按 sha256 幂等 —— 命中时 `upload` 直接拿回已有的
+/// `file.id`，不会真的再传一次内容（见上面 `status == "completed"` 分支）。
 pub async fn mineru_tackle(
     client: &reqwest::Client,
     file: &db_model::File,
     config: &SyncConfig,
 ) -> Result<String> {
-    let file_id = ensure_file_id(&client, &file, &config).await?;
-    parse(&client, &file, &config, &file_id).await
+    let file_id = upload(client, file, config).await?;
+    parse(client, file, config, &file_id).await
 }

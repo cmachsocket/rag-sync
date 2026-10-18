@@ -2,10 +2,14 @@ use diesel::prelude::{ExpressionMethods, OptionalExtension, QueryDsl, Selectable
 use diesel::{self, SqliteConnection};
 use diesel_async::{AsyncConnection, RunQueryDsl, sync_connection_wrapper::SyncConnectionWrapper};
 
-use crate::schema::files::rag_id;
 
 pub type Conn = SyncConnectionWrapper<SqliteConnection>;
 
+/// 所有方法都直接给 `Conn` 实现。trait 里用 `async fn` 只是为了按职责分组，
+/// 代价是拿不到 `Send` 边界（`async fn` in trait 的固有限制，
+/// 编译器会给 11 条 warning）。将来真要 `tokio::spawn` 包一层时，
+/// 改成 `fn x(&mut self) -> impl Future<Output = ...> + Send` 即可。
+#[allow(async_fn_in_trait)]
 pub trait DBfunc {
     async fn file_exists(&mut self, file_path: &str) -> Result<bool, Box<dyn std::error::Error>>;
     async fn get_sha256(
@@ -17,13 +21,17 @@ pub trait DBfunc {
         file_path: &str,
         new_sha256: &str,
     ) -> Result<(), Box<dyn std::error::Error>>;
+    /// `id` 交给 AUTOINCREMENT，不接受外部指定。
+    /// 曾经这里有一个 `id: i32` 形参，调用方传的是 `run_id`，
+    /// 结果轮次号写进了主键列、run_id 停在 0 —— 详见 tests/known_issues_test.rs。
     async fn insert_file(
         &mut self,
         file_path: &str,
         sha256: &str,
-        id: i32,
+        run_id: i32,
         file_rag_id: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>>;
+    async fn delete_file(&mut self, file_path: &str) -> Result<(), Box<dyn std::error::Error>>;
     async fn get_run_counter(
         &mut self,
     ) -> Result<Option<crate::db_model::RunCounter>, Box<dyn std::error::Error>>;
@@ -130,17 +138,25 @@ impl DBfunc for Conn {
         &mut self,
         file_path: &str,
         sha256_value: &str,
-        id: i32,
+        run_id: i32,
         file_rag_id: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::schema::files::dsl::{files, id as file_id, path, sha256};
+        use crate::schema::files::dsl::{files, path, rag_id, run_id as file_run_id, sha256};
+        // 显式列出四个字段，不写 id：让它走 AUTOINCREMENT。
         diesel::insert_into(files)
             .values((
-                file_id.eq(id),
                 path.eq(file_path),
                 sha256.eq(sha256_value),
+                file_run_id.eq(run_id),
                 rag_id.eq(file_rag_id),
             ))
+            .execute(self)
+            .await?;
+        Ok(())
+    }
+    async fn delete_file(&mut self, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::schema::files::dsl::*;
+        diesel::delete(files.filter(path.eq(file_path)))
             .execute(self)
             .await?;
         Ok(())

@@ -8,6 +8,7 @@
 mod common;
 
 use common::{test_db, Env};
+use rag_sync::database::DBfunc;
 use rag_sync::sync_folder::{delete_old_files, get_files, get_relative_path, sha256_file};
 use std::path::Path;
 
@@ -150,7 +151,7 @@ async fn 扫描_库里没有的文件算新增_并现算_sha256() {
 }
 
 #[tokio::test]
-async fn 扫描_库里已有时原样返回_不重算_sha256() {
+async fn 扫描_库里已有时沿用库里的身份信息_但_sha256_用磁盘实况() {
     let mut db = test_db().await;
     let env = Env::new();
     env.write_source("a.pdf", "hello");
@@ -162,13 +163,32 @@ async fn 扫描_库里已有时原样返回_不重算_sha256() {
 
     let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
     let a = files.iter().find(|f| f.path.ends_with("a.pdf")).unwrap();
-    assert_eq!(a.id, 5);
-    assert_eq!(a.sha256, "db-sha");
+    assert_eq!(a.id, 5, "库里的身份信息要留用");
     assert_eq!(a.rag_id.as_deref(), Some("doc-a"));
-    assert_eq!(a.run_id, 3, "DB 行的 run_id 原样带出");
+    assert_eq!(a.run_id, 3, "run_id 原样带出，create_output_files 据此判断是否刷新");
+    assert_eq!(
+        a.sha256,
+        sha256_file(&format!("{}/a.pdf", env.sync_dir)).await.unwrap(),
+        "sha256 必须取磁盘实况，否则文件改了永远看不出来"
+    );
+    assert_ne!(a.sha256, "db-sha");
 
     let b = files.iter().find(|f| f.path.ends_with("b.pdf")).unwrap();
-    assert_eq!(b.sha256, "sha-b");
+    assert_eq!(b.sha256, sha256_file(&path).await.unwrap());
+}
+
+#[tokio::test]
+async fn 扫描_返回顺序按路径排序() {
+    let mut db = test_db().await;
+    let env = Env::new();
+    for name in ["c.pdf", "a.pdf", "b.pdf"] {
+        env.write_source(name, name);
+    }
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "处理顺序要可复现，不能跟着文件系统顺序走");
 }
 
 #[tokio::test]
@@ -181,25 +201,37 @@ async fn 扫描_空目录返回空vec() {
 // ---------------------------------------------------------------- delete_old_files
 
 #[tokio::test]
-async fn 删旧文件_只删_run_id_更小的() {
+async fn 删旧文件_没有旧记录时直接返回_不碰任何服务() {
+    // Env 的 lightrag_url 是空串，登录必然失败。这里能过，说明清理动作
+    // 在「没有旧文件」时确实一步都没做 —— 服务不可达不该拖垮一轮同步。
     let mut db = test_db().await;
     let env = Env::new();
-    let old = env.write_source("old.pdf", "old");
-    let cur = env.write_source("cur.pdf", "cur");
-    db.insert_file_row(1, &old, "s1", 3, Some("doc-old")).await;
-    db.insert_file_row(2, &cur, "s2", 4, None).await;
-
     delete_old_files(&env.config(4), &mut db.conn).await.unwrap();
-
-    assert!(!std::path::Path::new(&old).exists(), "run_id=3 < 4 的应当被删");
-    assert!(std::path::Path::new(&cur).exists(), "本轮的文件不能被删");
 }
 
 #[tokio::test]
-async fn 删旧文件_磁盘上已不存在时不算失败() {
+async fn 清理_缺产物或不在当前目录下_都不卡住() {
     let mut db = test_db().await;
     let env = Env::new();
-    db.insert_file_row(1, "/nowhere/gone.pdf", "s1", 1, None).await;
-    // 库里还留着、磁盘上已经没了 —— 这正是「用户自己把文件删了」的情况
-    delete_old_files(&env.config(5), &mut db.conn).await.unwrap();
+    let cur = env.write_source("a.pdf", "x");
+    db.insert_file_row(1, "/nowhere/gone.pdf", "s1", 1, None).await; // 路径不在 sync_dir 下
+    db.insert_file_row(2, &cur, "s2", 1, None).await; // 路径在，但没有产物文件
+
+    let server = common::MockServer::start(vec![
+        common::Route::post("/login")
+            .and(common::CannedResponse::json(200, r#"{"access_token":"t"}"#)),
+    ])
+    .await;
+    let mut cfg = env.config(5);
+    cfg.lightrag_url = server.base_url.clone();
+
+    delete_old_files(&cfg, &mut db.conn).await.unwrap();
+
+    assert!(!DBfunc::file_exists(&mut db.conn, "/nowhere/gone.pdf").await.unwrap());
+    assert!(!DBfunc::file_exists(&mut db.conn, &cur).await.unwrap());
+    assert_eq!(
+        server.count_to("DELETE", "/documents/delete_document"),
+        0,
+        "没有 rag_id 就不该去删知识库文档"
+    );
 }

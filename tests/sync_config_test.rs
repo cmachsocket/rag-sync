@@ -49,13 +49,13 @@ async fn 缺省键取默认值_不影响加载() {
         r#"
 sync_dir: "/data/sync"
 output_dir: "/data/out"
+mineru_url: "http://m:9777"
+lightrag_url: "http://r:9621"
 "#,
     );
     let c = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap();
-    assert_eq!(c.mineru_url, "");
-    assert_eq!(c.lightrag_url, "");
     assert_eq!(c.lightrag_username, "");
     assert_eq!(c.lightrag_password, "");
     // run_id 在解析后被计数器 +1 无条件覆盖，serde 上的 `default = "zero"`
@@ -67,7 +67,7 @@ output_dir: "/data/out"
 async fn 缺_sync_dir_报错并指出字段名() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "output_dir: \"/data/out\"\n");
+    let path = 写配置(&d, "output_dir: \"/data/out\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
     let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap_err()
@@ -79,7 +79,7 @@ async fn 缺_sync_dir_报错并指出字段名() {
 async fn 缺_output_dir_报错并指出字段名() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "sync_dir: \"/data/sync\"\n");
+    let path = 写配置(&d, "sync_dir: \"/data/sync\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
     let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap_err()
@@ -91,12 +91,40 @@ async fn 缺_output_dir_报错并指出字段名() {
 async fn 空字符串等同于缺失() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "sync_dir: \"\"\noutput_dir: \"/data/out\"\n");
+    let path = 写配置(&d, "sync_dir: \"\"\noutput_dir: \"/data/out\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
     let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("sync_dir"), "空串应被当成缺失: {err}");
+}
+
+#[tokio::test]
+async fn 缺_mineru_url_报错并指出字段名() {
+    let mut db = test_db().await;
+    let d = tempfile::tempdir().unwrap();
+    let path = 写配置(
+        &d,
+        "sync_dir: \"/a\"\noutput_dir: \"/b\"\nlightrag_url: \"http://r\"\n",
+    );
+    let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
+        .await
+        .unwrap_err()
+        .to_string();
+    // 不校验的话会拖到发请求时报 reqwest 的 "builder error"，看不出是哪个键没配
+    assert!(err.contains("mineru_url"), "{err}");
+}
+
+#[tokio::test]
+async fn 缺_lightrag_url_报错并指出字段名() {
+    let mut db = test_db().await;
+    let d = tempfile::tempdir().unwrap();
+    let path = 写配置(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nmineru_url: \"http://m\"\n");
+    let err = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("lightrag_url"), "{err}");
 }
 
 #[tokio::test]
@@ -127,7 +155,7 @@ async fn 语法错误_报错要指出解析失败() {
 async fn run_id_等于计数器加一_不会覆盖计数器() {
     let mut db = test_db().await;
     let d = tempfile::tempdir().unwrap();
-    let path = 写配置(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\n");
+    let path = 写配置(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
 
     let c = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
@@ -162,7 +190,7 @@ async fn 配置里的_run_id_不参与计算() {
         .unwrap();
     let d = tempfile::tempdir().unwrap();
     // 就算配置里写了 run_id: 999，也必须以计数器为准
-    let path = 写配置(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nrun_id: 999\n");
+    let path = 写配置(&d, "sync_dir: \"/a\"\noutput_dir: \"/b\"\nrun_id: 999\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n");
     let c = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, &path)
         .await
         .unwrap();

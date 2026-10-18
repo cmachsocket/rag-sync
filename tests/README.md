@@ -11,22 +11,21 @@
 | --- | --- |
 | `common/mod.rs` | 脚手架：临时 SQLite 库（跑真 migration）、临时目录、手写 mock HTTP 服务端 |
 | `file_mime_test.rs` | 扩展名 → MIME 映射表 |
-| `sync_config_test.rs` | 配置加载、字段校验、`run_id` 推导 |
+| `sync_config_test.rs` | 配置加载、字段校验、`run_id` 推导、`~` 展开 |
 | `database_test.rs` | `DBfunc` 全部方法（真 SQLite） |
 | `sync_folder_test.rs` | sha256、相对路径、目录扫描、`delete_old_files` |
 | `mineru_test.rs` | MinerU 上传 / 解析 / 取产物，对 mock 服务端跑 |
 | `lightrag_model_test.rs` | LightRAG 响应体反序列化与状态判定（纯函数） |
 | `lightrag_requests_test.rs` | LightRAG 上传、409 自愈、删除、分页 |
 | `sync_flow_test.rs` | 端到端：扫描 → 转换 → 写产物 → 上传 → 落库 |
-| `known_issues_test.rs` | **已知缺陷的行为快照**，见下 |
+| `regression_test.rs` | 回归防护：每个曾丢用户数据的缺陷一条 |
 | `live_lightrag_test.rs` | 打真实服务的端到端测试，默认 `#[ignore]` |
 
-## known_issues_test.rs 要留意
+## regression_test.rs
 
-这个文件里的断言钉的是**当前的错误行为**，不是正确行为。每条注释里都写了
-「应该是什么」。修掉某个缺陷后，把对应断言翻过来，翻过来的测试才会拦回归。
-
-`cargo test` 全绿 ≠ 同步流程是对的。
+每条用例对应一个曾经真实存在的缺陷（多半会**删掉用户的原始文档**）。
+修复后断言已翻转为正确行为，作用是挡回归 —— 其中一条红掉多半是真退化了，
+别直接改断言去迁就。
 
 ## 跑
 
