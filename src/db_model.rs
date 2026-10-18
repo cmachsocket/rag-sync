@@ -9,6 +9,7 @@ pub struct File {
     pub id: i32,
     pub path: String,
     pub sha256: String,
+    pub rag_id: Option<String>,
     pub run_id: i32,
 }
 

@@ -86,6 +86,7 @@ pub async fn get_files(config: &sync_config::SyncConfig) -> Result<Vec<db_model:
                             .await
                             .unwrap_or_else(|_| String::new()),
                         run_id: config.run_id,
+                        rag_id: None, // 初始化为 None，稍后可以根据需要更新
                     });
                 }
             }

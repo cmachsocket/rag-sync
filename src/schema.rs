@@ -5,6 +5,7 @@ diesel::table! {
         id -> Integer,
         path -> Text,
         sha256 -> Text,
+        rag_id -> Nullable<Text>,
         run_id -> Integer,
     }
 }
