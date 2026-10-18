@@ -1,7 +1,5 @@
-//! MinerU 的上传 -> 解析 -> 取产物链路，对着 mock 服务端跑。
-//!
-//! 这条链路有两个坑：契约是 `additionalProperties: false`（字段名写错直接 422），
-//! 以及「按 sha256 幂等命中时 upload_url 为 null，再 PUT 会 409」。
+//! MinerU 的上传 -> 解析 -> 取产物链路。两个坑：契约是 `additionalProperties: false`
+//! （字段名写错直接 422），以及 sha256 幂等命中时 upload_url 为 null、再 PUT 会 409。
 
 mod common;
 
@@ -151,8 +149,7 @@ async fn new_file_uploads_content_then_completes() {
 
 #[tokio::test]
 async fn idempotent_hit_skips_content_upload() {
-    // 服务端已按 sha256 收过这份内容，直接 completed。再 PUT 会得到
-    // 409 upload_already_terminal。
+    // 服务端已按 sha256 收过这份内容，直接 completed。再 PUT 会 409。
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
     let (server, cfg) = setup(

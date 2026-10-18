@@ -1,9 +1,7 @@
-//! 集成测试的公共脚手架。
-//!
-//! 三个东西：
-//!   1. `test_db` —— 临时 SQLite 库 + 真实 migration，不用仓库里的 rag-sync.db。
-//!   2. `MockServer` —— 手写的最小 HTTP/1.1 服务端，用来替 MinerU / LightRAG。
-//!      离线环境拿不到 wiremock / httpmock，所以自己实现；只依赖已有的 tokio。
+//! 集成测试的公共脚手架：
+//!   1. `test_db` —— 临时 SQLite 库 + 真实 migration，不碰仓库里的 rag-sync.db。
+//!   2. `MockServer` —— 手写的最小 HTTP/1.1 服务端，替 MinerU / LightRAG
+//!      （离线环境拿不到 wiremock / httpmock，只依赖已有的 tokio）。
 //!   3. `SyncConfig` 之类的构造辅助。
 #![allow(dead_code)]
 
@@ -15,8 +13,7 @@ use rag_sync::sync_config::SyncConfig;
 
 // ---------------------------------------------------------------- 临时目录 / 库
 
-/// 用真实的 migration 建表。改 migration 时测试跟着变，
-/// 不会出现「测试里写死一份 DDL、线上 schema 已经变了」的假绿。
+/// 用真实的 migration 建表：避免「测试里写死一份 DDL、线上 schema 已经变了」的假绿。
 pub const MIGRATION_UP: &str = include_str!("../../migrations/2026-10-16-181726-0000_init/up.sql");
 
 pub struct TestDb {

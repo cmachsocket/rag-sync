@@ -1,7 +1,5 @@
-//! LightRAG 响应体的反序列化与状态判定。
-//!
-//! 这层全是「服务端改一个字段名 / 多一个字段就静默拿到空值」的雷区，
-//! 所以直接拿 lightrag-upload-endpoint-test.md 里记录的**实测报文**当样本。
+//! LightRAG 响应体的反序列化与状态判定，样本取自
+//! lightrag-upload-endpoint-test.md 记录的实测报文。
 
 use rag_sync::lightrag_model::*;
 
@@ -98,8 +96,8 @@ fn failed_is_terminal() {
 
 #[test]
 fn empty_documents_is_not_finished() {
-    // 拿到 track_id 的瞬间查列表可能返回空数组，和「文档已被删除」在响应里
-    // 一模一样。去掉这个判断，`all()` 在空迭代器上恒为 true，会立刻误判完成。
+    // 拿到 track_id 的瞬间查列表可能返回空数组，和「文档已被删除」响应一模一样。
+    // 去掉这个判断，`all()` 在空迭代器上恒为 true，会立刻误判完成。
     let t = track(serde_json::json!([]));
     assert!(!t.is_finished());
     assert_eq!(t.documents.len(), 0);

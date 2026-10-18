@@ -5,10 +5,8 @@ use diesel_async::{AsyncConnection, RunQueryDsl, sync_connection_wrapper::SyncCo
 
 pub type Conn = SyncConnectionWrapper<SqliteConnection>;
 
-/// 所有方法都直接给 `Conn` 实现。trait 里用 `async fn` 只是为了按职责分组，
-/// 代价是拿不到 `Send` 边界（`async fn` in trait 的固有限制，
-/// 编译器会给 11 条 warning）。将来真要 `tokio::spawn` 包一层时，
-/// 改成 `fn x(&mut self) -> impl Future<Output = ...> + Send` 即可。
+/// 所有方法都直接给 `Conn` 实现。trait 里的 `async fn` 只是为了按职责分组，
+/// 代价是拿不到 `Send` 边界（会出 11 条 warning）；真要 `tokio::spawn` 时再改。
 #[allow(async_fn_in_trait)]
 pub trait DBfunc {
     async fn file_exists(&mut self, file_path: &str) -> Result<bool, Box<dyn std::error::Error>>;
@@ -21,9 +19,7 @@ pub trait DBfunc {
         file_path: &str,
         new_sha256: &str,
     ) -> Result<(), Box<dyn std::error::Error>>;
-    /// `id` 交给 AUTOINCREMENT，不接受外部指定。
-    /// 曾经这里有一个 `id: i32` 形参，调用方传的是 `run_id`，
-    /// 结果轮次号写进了主键列、run_id 停在 0 —— 详见 tests/known_issues_test.rs。
+    /// `id` 交给 AUTOINCREMENT，不接受外部指定（曾有调用方误传 run_id）。
     async fn insert_file(
         &mut self,
         file_path: &str,
@@ -69,8 +65,7 @@ pub async fn establish_db_connection() -> Result<Conn, Box<dyn std::error::Error
     Ok(connection)
 }
 
-/// 与 `establish_db_connection` 相同，但库路径可指定。测试要用临时库，
-/// 否则每个用例都会打到仓库里那个真的 rag-sync.db 上。
+/// 与 `establish_db_connection` 相同，但库路径可指定（测试要用临时库）。
 pub async fn establish_db_connection_at(database_url: &str) -> Result<Conn, Box<dyn std::error::Error>> {
     let connection = Conn::establish(database_url).await?;
     Ok(connection)
@@ -142,7 +137,7 @@ impl DBfunc for Conn {
         file_rag_id: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::schema::files::dsl::{files, path, rag_id, run_id as file_run_id, sha256};
-        // 显式列出四个字段，不写 id：让它走 AUTOINCREMENT。
+        // 不写 id：让它走 AUTOINCREMENT
         diesel::insert_into(files)
             .values((
                 path.eq(file_path),

@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// POST /v1/uploads 请求体。契约为 additionalProperties: false，
-// 字段名必须严格一致：filename / bytes / mime_type。
-// sha256sum 可选，但传了服务端才能做幂等去重，本地已算好的 sha256 直接复用。
+// POST /v1/uploads 请求体。契约为 additionalProperties: false，字段名必须严格一致。
+// sha256sum 可选，但传了服务端才能幂等去重，本地算好的 sha256 直接复用。
 #[derive(Serialize)]
 pub struct FileUploadRequest<'a> {
     /// 只取文件名，不含目录。服务端据此决定解析器与产物命名。
@@ -34,8 +33,7 @@ pub struct OutputFileRef {
     pub bytes: u64,
 }
 
-/// source 的四种变体。序列化时只填 type 对应的那个字段，
-/// 其余为 None 会被 serde 跳过（配合 skip_serializing_if）。
+/// source 的四种变体，只填 type 对应的那一个字段，其余 None 会被跳过。
 #[derive(Serialize)]
 pub struct FileSource {
     pub r#type: &'static str,
@@ -74,8 +72,8 @@ pub struct FileParseItem {
     pub source: FileSource,
 }
 
-/// /v1/file_parse 与 GET /v1/tasks/{id} 返回同构的响应，
-/// 故复用同一结构体。progress 是嵌套对象，不是平铺字段。
+/// /v1/file_parse 与 GET /v1/tasks/{id} 返回同构的响应，故复用同一结构体。
+/// progress 是嵌套对象。
 #[derive(Deserialize)]
 pub struct Progress {
     pub completed: u64,

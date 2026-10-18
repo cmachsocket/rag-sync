@@ -67,7 +67,7 @@ async fn create_output_dir(
     let parent = output_file_path.parent().ok_or_else(|| {
         format!("无法获取输出文件的父目录: {}", output_file_path.display())
     })?;
-    // 只在返回的错误里带一次详细信息：eprintln + 固定文案会让上层拿到
+    // 错误信息里带一次详细信息即可：eprintln + 固定文案会让上层拿到
     // 一条没有原因的错误，真正的原因只留在 stderr 里。
     fs::create_dir_all(parent)
         .await
@@ -94,15 +94,14 @@ pub async fn get_files(
                     let path_str = file_path.to_str().ok_or_else(|| {
                         format!("路径不是合法 UTF-8: {}", file_path.display())
                     })?;
-                    // sha256 一律现算。库里的 sha256 只能说明「上次同步时是什么样」，
-                    // 拿它和自己比永远相等，文件改了也看不见。
+                    // sha256 一律现算：库里的值只说明「上次同步时是什么样」，文件改了也看不见。
                     let sha256 = sha256_file(path_str).await.map_err(|e| {
                         format!("计算 {} 的 sha256 失败: {e}", file_path.display())
                     })?;
 
                     let file = match DBfunc::get_file(conn, path_str).await? {
                         Some(mut file) => {
-                            // 库里的 id / rag_id / run_id 要留用，只有 sha256 换成磁盘上的实况
+                            // 库里的 id / rag_id / run_id 留用，只换 sha256
                             file.sha256 = sha256;
                             file
                         }
@@ -118,9 +117,8 @@ pub async fn get_files(
                 }
             }
             Err(e) => {
-                // 任何一处读不出来都必须让整轮停下来，不能只警告。
-                // 「没扫到」在 delete_old_files 眼里等于「用户把它删了」：
-                // 一个权限错误就会让这一支的产物和知识库文档被清掉。
+                // 任何一处读不出来都必须让整轮停下来：「没扫到」在 delete_old_files
+                // 眼里等于「用户把它删了」，一个权限错误就会清掉这一支的产物和知识库文档。
                 let at = e
                     .path()
                     .map(|p| p.display().to_string())
@@ -129,17 +127,15 @@ pub async fn get_files(
             }
         }
     }
-    // WalkDir 按文件系统顺序返回。排序后处理顺序可复现，
-    // 否则同一批文件在不同机器上会以不同顺序打服务端。
+    // 排序后处理顺序可复现，否则同一批文件在不同机器上会以不同顺序打服务端。
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
 /// 挑出本轮真正要处理的文件，顺带把没变化的文件的 run_id 刷成本轮。
 ///
-/// 「本轮扫到过」这个信号只能靠刷新 run_id 表达：delete_old_files 靠
-/// run_id < 本轮 判定「上轮见过、这轮没了」。跳过的文件不刷新，
-/// 下一轮就会被当成用户已删除而连带清掉它的产物与知识库条目。
+/// 「本轮扫到过」只能靠刷新 run_id 表达（delete_old_files 靠 run_id < 本轮 判定
+/// 「上轮见过、这轮没了」）。跳过的文件不刷新，下一轮就会被当成用户已删除。
 async fn select_pending<'a>(
     config: &sync_config::SyncConfig,
     files: &'a [db_model::File],
@@ -169,8 +165,7 @@ pub async fn create_output_files(
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let todo = select_pending(config, files, conn).await?;
     let mut output_files: Vec<PathBuf> = Vec::new();
-    // 没有要处理的文件就不去连 MinerU / LightRAG。服务不可达不该让
-    // 「这轮没事可做」变成一轮失败。
+    // 没有要处理的文件就不去连 MinerU / LightRAG：服务不可达不该让「没事可做」变成失败。
     if todo.is_empty() {
         return Ok(output_files);
     }
@@ -217,13 +212,11 @@ pub async fn create_output_files(
     Ok(output_files)
 }
 
-/// 清理「上轮见过、这轮没扫到」的文件。
+/// 清理「上轮见过、这轮没扫到」的文件。只清理我们自己造出来的东西，
+/// **绝不碰同步目录里的原始文档**。
 ///
-/// 只清理我们自己造出来的东西，**绝不碰同步目录里的原始文档** ——
-/// 那是用户的文件，本程序只读。
-///
-/// 单个文件失败不拖累其余：逐个尽力处理，最后把失败汇总成一个错误返回。
-/// 汇总失败会让整轮以非零码退出、计数器不推进，下一轮重试这些条目。
+/// 单个文件失败不拖累其余，最后汇总成一个错误返回：整轮会非零退出、
+/// 计数器不推进，下一轮重试这些条目。
 pub async fn delete_old_files(
     config: &sync_config::SyncConfig,
     conn: &mut database::Conn,
@@ -259,9 +252,8 @@ pub async fn delete_old_files(
     .into())
 }
 
-/// 单个旧文件的清理。顺序：撤知识库 -> 删产物 -> 删 DB 行。
-/// 任一步失败就**保留 DB 行**，下轮重试。反过来做的话，
-/// 中途失败会留下「产物没了、DB 里还留着」或「文档还在、记录没了」的无主状态。
+/// 单个旧文件的清理：撤知识库 -> 删产物 -> 删 DB 行。
+/// 任一步失败就保留 DB 行下轮重试，否则会留下无主状态。
 async fn cleanup_one_old_file(
     rag_request: &RAGRequest<'_>,
     config: &sync_config::SyncConfig,
@@ -276,8 +268,8 @@ async fn cleanup_one_old_file(
         println!("已删除知识库文档: {rag_id}");
     }
 
-    // 记录里的路径定位不到输出目录 —— 通常是用户改过 sync_dir 配置。
-    // 跳过产物清理，但知识库与 DB 行照清，否则这一行会把整个清理步骤永久卡死。
+    // 路径定位不到输出目录（通常用户改过 sync_dir）：跳过产物清理，
+    // 但知识库与 DB 行照清，否则这一行会把整个清理步骤永久卡死。
     match get_relative_path(&config.sync_dir, Path::new(&file.path)).await {
         Ok(rel) => {
             let output_file_path = Path::new(&config.output_dir).join(rel);
@@ -285,8 +277,8 @@ async fn cleanup_one_old_file(
                 Ok(()) => println!("已删除输出文件: {}", output_file_path.display()),
                 // 已经不在了正是预期结果（用户自己删过产物）
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                // 权限不足之类不能当成「不存在」：那样会跳过删除、
-                // 接着把 DB 行删掉，产物从此永久失去关联、再也找不到。
+                // 权限不足之类不能当成「不存在」：那样会删掉 DB 行，
+                // 产物从此永久失去关联、再也找不到。
                 Err(e) => {
                     return Err(format!(
                         "删除输出文件 {} 失败: {e}",

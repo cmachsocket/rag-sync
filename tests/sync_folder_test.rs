@@ -1,8 +1,7 @@
 //! sha256、相对路径、扫描、以及 delete_old_files。
 //!
-//! `delete_old_files` 的测试特意分成两段：一段断言它确实在删某个文件，
-//! 一段断言它**没有**删它不该删的东西。两段都要有 —— 只写前半段的话，
-//! 把同步目录当成输出目录这种错会一路绿灯。
+//! `delete_old_files` 分两段断言：确实在删某个文件，且没有删不该删的。
+//! 只写前半段的话，「把同步目录当输出目录」这种错会一路绿灯。
 
 mod common;
 
@@ -34,8 +33,8 @@ async fn sha256_matches_known_vectors() {
 
 #[tokio::test]
 async fn sha256_handles_buffer_boundaries() {
-    // 循环每次读 8 KiB。构造多个长度都验一遍，能抓到「补零」「少读一字节」
-    // 这类只在特定长度出现的错误。
+    // 循环每次读 8 KiB。构造多个长度都验一遍，能抓到「补零」这类只在特定长度
+    // 出现的错误
     let d = tempfile::tempdir().unwrap();
     let mut baseline: Option<String> = None;
     for len in [1usize, 8191, 8192, 8193, 16384, 20000] {
@@ -92,8 +91,8 @@ async fn relative_path_strips_root() {
 
 #[tokio::test]
 async fn relative_path_outside_root_errors() {
-    // get_files 之后按相对路径写输出文件，strip_prefix 失败却当成
-    // 「相对路径就是原样」的话，会把输出写到 output_dir 外面去。
+    // get_files 之后按相对路径写输出文件，strip_prefix 失败却当成「原样」的话，
+    // 会把输出写到 output_dir 外面去
     let err = get_relative_path("/data/sync", Path::new("/other/a.pdf"))
         .await
         .unwrap_err()
@@ -237,11 +236,8 @@ async fn unreadable_subdirectory_aborts_the_run() {
 }
 
 /// HTTP 客户端必须带超时。reqwest 默认既不限制连接也不限制读取，
-/// 而轮询里的「上限」只在请求**返回之后**才检查得到 ——
-/// 也就是说服务端不回包的话，上限完全失效，整个进程会永久挂住。
-///
-/// 用 tokio 的自动推进时钟：READ_TIMEOUT 是 60 s 真实时间，
-/// 这里不会真的等 60 s。
+/// 而轮询里的「上限」只在请求返回之后才检查得到，服务端不回包就会永久挂住。
+/// 用 tokio 的自动推进时钟，这里不会真的等 60 s。
 #[tokio::test(start_paused = true)]
 async fn http_client_times_out_on_silent_server() {
     // 只 accept 不回应：请求永远拿不到响应
@@ -274,9 +270,8 @@ async fn http_client_times_out_on_silent_server() {
 
 #[tokio::test]
 async fn undeletable_artifact_keeps_db_row() {
-    // 「产物删不掉」和「产物不存在」必须区别对待：当成不存在就等于
-    // 跳过删除、接着把 DB 行删掉，产物从此永久失去关联再也找不到。
-    // 这里在产物路径上放一个**目录**来触发删除失败，无需依赖权限位。
+    // 「产物删不掉」和「产物不存在」必须区别对待：当成不存在就等于删掉 DB 行，
+    // 产物从此永久失去关联。这里在产物路径上放一个**目录**来触发删除失败。
     let mut db = test_db().await;
     let env = Env::new();
     let src = env.write_source("a.pdf", "原件");
@@ -380,8 +375,8 @@ async fn scan_empty_dir_returns_empty() {
 
 #[tokio::test]
 async fn delete_old_returns_early_when_nothing_is_old() {
-    // Env 的 lightrag_url 是空串，登录必然失败。这里能过，说明清理动作
-    // 在「没有旧文件」时确实一步都没做 —— 服务不可达不该拖垮一轮同步。
+    // Env 的 lightrag_url 是空串，登录必然失败。这里能过说明「没有旧文件」
+    // 时确实一步都没做 —— 服务不可达不该拖垮一轮同步。
     let mut db = test_db().await;
     let env = Env::new();
     delete_old_files(&env.config(4), &mut db.conn).await.unwrap();

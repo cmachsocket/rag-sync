@@ -1,7 +1,6 @@
 
-/// 扩展名 -> MIME 类型，取自 MinerU 自身的 `MIME_TYPE_BY_EXTENSION`
-/// (`mineru/filetypes.py`)。不能用各语言标准库的对照表，它们对
-/// `mhtml` / `mht` / `rst` / `tex` / `ofd` / `shtml` 给的值与服务端不一致。
+/// 扩展名 -> MIME，取自 MinerU 自身的 `MIME_TYPE_BY_EXTENSION`
+/// (`mineru/filetypes.py`)：标准库对 `mhtml` / `rst` / `tex` 等给的值与服务端不一致。
 use std::path::Path;
 pub const SUFFIX_MIME: [(&str, &str); 25] = [
     ("pdf", "application/pdf"),
@@ -39,8 +38,7 @@ pub const SUFFIX_MIME: [(&str, &str); 25] = [
     ("tex", "text/x-tex"),
     ("txt", "text/plain"),
 ];
-/// 由扩展名查 MIME。查不到返回 `application/octet-stream`。
-/// 比较前统一转小写，避免 `REPORT.PDF` 被漏掉。
+/// 由扩展名查 MIME，查不到返回 `application/octet-stream`；比较前统一转小写。
 pub fn mime_for(file_path: &Path) -> &'static str {
     file_path
         .extension()

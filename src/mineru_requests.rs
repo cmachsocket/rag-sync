@@ -28,8 +28,7 @@ async fn ensure_success(
 ) -> Result<reqwest::Response> {
     let status = resp.status();
     if !status.is_success() {
-        // body 必须先读完：错误原因（字段校验、限流…）几乎都只写在 body 里，
-        // 只报状态码等于让人自己猜。
+        // body 必须先读完：错误原因（字段校验、限流…）几乎都只在 body 里
         let body = crate::http_util::error_body(resp).await;
         return Err(err(file, format!("{动作}被拒绝（{status}），响应: {body}")));
     }
@@ -78,8 +77,8 @@ async fn upload(
         .await
         .map_err(|e| err(file, format!("解析上传响应失败: {e}")))?;
 
-    // 按 sha256 幂等：内容已存在时服务端直接返回 completed，
-    // 此时 upload_url 为 null，再 PUT 会得到 409 upload_already_terminal。
+    // 按 sha256 幂等：内容已存在时直接返回 completed，upload_url 为 null，
+    // 再 PUT 会得到 409 upload_already_terminal。
     if upload.status == "completed" {
         if let Some(f) = upload.file {
             return Ok(f.id);
@@ -256,7 +255,7 @@ async fn extract_markdown(
         }
     }
 
-    // 回退到产物 id。注意轮询终态的 content 恒为空，必须走这条路
+    // 回退到产物 id：轮询终态的 content 恒为空，必须走这条路
     let product_id = parsed
         .output_files
         .as_ref()
@@ -278,10 +277,8 @@ async fn extract_markdown(
 
 /// 单个文件的完整流程：上传 → 解析 → 返回 markdown。
 ///
-/// 每轮都重新走一遍上传，**不复用任何本地记录**：`files.id` 是 DB 的行号，
-/// 不是 MinerU 的 file_id，拿它去解析等于查了另一个东西。真正让重复上传
-/// 不花钱的是服务端按 sha256 幂等 —— 命中时 `upload` 直接拿回已有的
-/// `file.id`，不会真的再传一次内容（见上面 `status == "completed"` 分支）。
+/// 每轮都重新上传，**不复用本地记录**：`files.id` 是 DB 行号，不是 MinerU 的
+/// file_id。重复上传不花钱靠的是服务端按 sha256 幂等（见上面 completed 分支）。
 pub async fn mineru_tackle(
     client: &reqwest::Client,
     file: &db_model::File,

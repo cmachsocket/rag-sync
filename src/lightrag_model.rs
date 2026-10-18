@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 /*
-
 ```json
 {
   "access_token": "<JWT, 长度 199>",
@@ -12,8 +11,7 @@ use serde::{Deserialize, Serialize};
   "api_version": "0344"
 }
 ```
-只有 access_token 是必需的。其余字段带 serde(default)，
-服务端增删字段不会让登录整体失效。
+只有 access_token 必需，其余带 serde(default)。
 */
 #[derive(Deserialize)]
 pub struct LoginResponse {
@@ -31,14 +29,12 @@ pub struct LoginResponse {
 }
 
 /*
-
 ```json
 {
   "status": "success",
   "message": "File 'configuration.md' uploaded successfully. Processing will continue in background.",
   "track_id": "upload_20261017_002603_f93bcf1d"
 }
-```
 */
 
 #[derive(Deserialize)]
@@ -69,18 +65,12 @@ pub struct UploadResponse {
   "status_summary": {"processing": 1}
 }
 ```
-
 */
-
-/// 文档元数据用 map 而不是定长 struct：字段随流水线阶段增减。
-/// 处理中的快照带 `chunk_method` / `chunk_opts` / `process_options`，
-/// 终态只剩 `parse_engine` / `parse_format` / `mm_chunks` / `kg_write_state`，
-/// 写死字段在任一阶段都会反序列化失败。
+/// 文档元数据用 map 而非定长 struct：字段随流水线阶段增减，写死字段会反序列化失败。
 pub type MetadataResponse = std::collections::HashMap<String, serde_json::Value>;
 
-/// `status_summary` 是 map，键是状态名、值是计数。
-/// 大小写不稳定：OpenAPI 示例给 `"PROCESSED"`，实测响应给 `"processed"`，
-/// 只能用 map + 忽略大小写比对，不能按固定字段名反序列化。
+/// `status_summary` 键是状态名、值是计数，大小写不稳定（OpenAPI 给 "PROCESSED"，
+/// 实测给 "processed"），只能用 map + 忽略大小写比对。
 pub type StatusSummary = std::collections::HashMap<String, u64>;
 
 #[derive(Deserialize, Debug)]
@@ -95,15 +85,13 @@ pub struct DocStatusResponse {
     pub error_msg: Option<String>,
     #[serde(default)]
     pub content_length: Option<u64>,
-    /// 服务端存的是上传时的 filename（我们传的是 basename），不是原始绝对路径。
-    /// 判同名冲突时要靠它反查 doc_id。
+    /// 服务端存的是上传时的 filename（我们传 basename），判同名冲突靠它反查 doc_id。
     pub file_path: String,
     #[serde(default)]
     pub metadata: Option<MetadataResponse>,
 }
 
-/// 信封结构：文档在 `documents[]` 里，顶层只有 track_id / total_count /
-/// status_summary。**顶层没有 id、没有 status** —— 按顶层解析会静默拿到空值。
+/// 信封结构：文档在 `documents[]` 里，顶层**没有 id、没有 status**，按顶层解析会静默拿到空值。
 #[derive(Deserialize, Debug)]
 pub struct TrackResponse {
     pub track_id: String,
@@ -113,18 +101,10 @@ pub struct TrackResponse {
 }
 
 impl TrackResponse {
-    /// 全部文档都进入终态才算处理完。
-    /// 上传是异步的：549 B 纯文本要 64 s，8.6 KB Markdown 因为含 4 个表格
-    /// 要 728 s，绝不能拿到 200 就当处理完了。
+    /// 全部文档都进入终态才算处理完（上传是异步的，绝不能拿到 200 就当完成）。
     pub fn is_finished(&self) -> bool {
-        // 空数组不算完成。上传返回 track_id 的那一刻，doc_status 里的记录未必
-        // 已注册上，第一次查询会拿到 documents: []（实测撞到过，随后同一个
-        // track_id 就正常了）。这个空数组和「文档已被删除」在响应里完全一样，
-        // 都是 97 B 的 {"documents":[],"total_count":0,...}，既不能当完成信号，
-        // 也不能当失败信号，只能继续等。
-        //
-        // 这个 !is_empty() 不是冗余判断：空迭代器上 all() 恒为 true，
-        // 去掉它上面那个竞态就会直接变成误判完成。
+        // 空数组不算完成：拿到 track_id 的那一刻记录未必已注册，第一次查询会拿到
+        // documents: []。空迭代器上 all() 恒为 true，这个 !is_empty() 不能省。
         !self.documents.is_empty()
             && self.documents.iter().all(|d| {
                 return matches!(
@@ -139,7 +119,7 @@ impl TrackResponse {
     }
 
     /// 失败时的原因。内容重复（`Content already exists. Original doc_id: xxx`）
-    /// 只在异步阶段暴露，且同样以 failed 收场。
+    /// 只在异步阶段暴露，同样以 failed 收场。
     pub fn first_error(&self) -> Option<&str> {
         self.documents
             .iter()
@@ -165,7 +145,7 @@ pub struct DeleteDocRequest {
 }
 
 /*
-`status` 枚举只有三个值，全部是 **HTTP 200**，靠状态码分不出来：
+`status` 枚举三个值全是 **HTTP 200**，靠状态码分不出来：
 
 ```json
 {
@@ -180,9 +160,6 @@ pub struct DeleteDocRequest {
 | `deletion_started` | 已在后台调度，**还没删完** |
 | `busy` | **什么都没删**，pipeline 被别的写者占着，要重试 |
 | `not_allowed` | 拒绝 |
-
-这就是「如何知道已经成功删除」的答案：光看 200 不够，
-必须先判 status != "busy"，再等 pipeline 的 destructive_busy 清掉。
 */
 #[derive(Deserialize, Debug)]
 pub struct DeleteDocByIdResponse {
@@ -205,12 +182,10 @@ impl DeleteDocByIdResponse {
 }
 
 /*
-`POST /documents/paginated` —— 判定删除是否生效的**唯一权威依据**。
+`POST /documents/paginated` —— 判定删除是否生效的唯一权威依据。
 
-不用 pipeline_status 的原因：`destructive_busy` / `busy` / `scanning` 都是
-**全局共享**标志。并发删除、`DELETE /documents`、`/documents/scan` 都会置位，
-分不清标志背后是谁的任务 —— 既可能等错对象，也可能在自己的后台任务尚未启动的
-瞬间读到 false 而提前判定成功。文档列表没有这种歧义。
+不用 pipeline_status：它的标志位都是全局共享的（并发删除 / clear / scan 都会置位），
+既可能等错对象，也可能在自己的任务尚未启动时读到 false 而提前判定成功。
 */
 #[derive(Deserialize, Debug)]
 pub struct PaginationInfo {

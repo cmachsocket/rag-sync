@@ -1,7 +1,5 @@
-//! 配置加载与 run_id 的推导。
-//!
-//! run_id 是整个同步流程的时钟：它既决定「哪些文件算这轮新增」，
-//! 又决定 `delete_old_files` 会删谁。推错一位就是误删，所以单独钉死。
+//! 配置加载与 run_id 的推导。run_id 既决定「哪些文件算这轮新增」，
+//! 又决定 `delete_old_files` 会删谁，推错一位就是误删。
 
 mod common;
 
@@ -57,8 +55,7 @@ lightrag_url: "http://r:9621"
         .unwrap();
     assert_eq!(c.lightrag_username, "");
     assert_eq!(c.lightrag_password, "");
-    // run_id 在解析后被计数器 +1 无条件覆盖，serde 上的 `default = "zero"`
-    // 实际不可达（配置里写什么都不影响，见下面「配置里的_run_id_不参与计算」）
+    // run_id 被计数器 +1 无条件覆盖，serde 上的 `default = "zero"` 实际不可达
     assert_eq!(c.run_id, 1);
 }
 

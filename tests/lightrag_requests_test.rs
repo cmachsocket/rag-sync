@@ -1,7 +1,5 @@
-//! RAGRequest 对着 mock 服务端跑完整链路。
-//!
-//! 覆盖的是最贵的那条路径：409 同名冲突 -> 按文件名反查 doc_id -> 删除 ->
-//! 重传 -> 轮询到终态。任何一步退化成「看起来成功」，知识库里就会留下
+//! RAGRequest 对着 mock 服务端跑完整链路，重点是 409 同名冲突 -> 反查 doc_id ->
+//! 删除 -> 重传 -> 轮询到终态。任何一步退化成「看起来成功」，知识库里就会留下
 //! 旧文档或半截文档，而接口全程返回 200。
 
 mod common;
@@ -248,8 +246,7 @@ async fn upload_non_success_status_is_failure() {
 #[tokio::test]
 async fn upload_401_is_not_retried() {
     let client = reqwest::Client::new();
-    // 401 重试没有意义（凭据错），只会把一次失败拖成两次请求，
-    // 并把真实错误掩盖成一次莫名其妙的冲突失败。
+    // 401 重试没有意义（凭据错），只会把真实错误掩盖成一次冲突失败
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(R::json(401, r#"{"detail":"token 过期"}"#)),
@@ -295,8 +292,7 @@ async fn background_failure_surfaces_error_msg() {
 }
 
 // 终态但 documents 为空数组的情况在这里没法测：is_finished() 对空数组恒为 false，
-// _track 会一直轮询到 TRACK_TIMEOUT（900 s）才报错，测试得跑一刻钟。
-// 判定逻辑本身见 tests/lightrag_model_test.rs 的 `documents_为空数组_不算完成`。
+// _track 会轮询到 TRACK_TIMEOUT（900 s）才报错。判定逻辑见 tests/lightrag_model_test.rs。
 
 // ---------------------------------------------------------------- 409 自愈
 

@@ -1,5 +1,4 @@
-//! 扩展名 -> MIME 映射。表是照抄 MinerU 服务端的，抄错一个字符就是解析器选错，
-//! 而且要到解析阶段才暴露，所以固定住整张表。
+//! 扩展名 -> MIME 映射。表照抄自 MinerU 服务端，抄错要到解析阶段才暴露，故固定整张表。
 
 use rag_sync::file_mime::{mime_for, SUFFIX_MIME};
 use rag_sync::sync_folder::is_supported_file;
