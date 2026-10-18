@@ -340,6 +340,8 @@ let resp = client
 3. 轮询 POST /documents/paginated，确认 doc_id 不在列表里
 ```
 
+该端点的响应结构和边界条件见 §5.7。
+
 **不要用 `pipeline_status` 判定删除完成。** `destructive_busy` / `busy` / `scanning` / `pending_enqueues` 都是**全局共享**标志：
 
 - 并发删除、`DELETE /documents`（Clear Documents）、`/documents/scan` 都会置位 —— 分不清标志背后是**谁**的任务在跑，可能等错对象
@@ -395,7 +397,85 @@ recovery_required, scanning, scanning_exclusive, update_status
 
 这个端点适合**人看**和排查 409，不适合做程序化的完成判定 —— 理由见 §5.3。
 
-## 6. 对 rag-sync 的影响
+### 5.7 `paginated` 响应与边界（2026-10-18 实测）
+
+删除确认（§5.3）依赖的查询端点。`POST /documents/paginated`，请求体 `DocumentsRequest`：
+
+```json
+{"page": 1, "page_size": 200}
+```
+
+完整响应（3 条文档的真实数据）：
+
+```json
+{
+  "documents": [
+    {
+      "id": "doc-a66b35d20295cb764719ac8bd35837ec",
+      "content_summary": "# Configuration\n\nEvery flag of the long-running commands, the YAML key that mirrors it, its\ndefault, and its scope. `--help` lists the same flags; ...",
+      "content_length": 8869,
+      "status": "processed",
+      "created_at": "2026-10-16T16:26:04.002629+00:00",
+      "updated_at": "2026-10-16T16:38:12.633572+00:00",
+      "track_id": "upload_20261017_002603_f93bcf1d",
+      "chunks_count": 6,
+      "error_msg": null,
+      "metadata": {
+        "mm_chunks": 4,
+        "chunk_opts": "size=2000, overlap=100",
+        "source_file": "configuration.md",
+        "chunk_method": "paragraph_semantic",
+        "parse_engine": "native",
+        "parse_format": "lightrag",
+        "kg_write_state": "graph_mutation_started",
+        "parse_end_time": 1792167964,
+        "process_options": "teP",
+        "parse_start_time": 1792167964,
+        "process_end_time": 1792168692,
+        "analyzing_end_time": 1792167988,
+        "process_start_time": 1792167988,
+        "analyzing_start_time": 1792167964
+      },
+      "file_path": "configuration.md"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "page_size": 200,
+    "total_count": 3,
+    "total_pages": 1,
+    "has_next": false,
+    "has_prev": false
+  },
+  "status_counts": {
+    "processed": 3,
+    "all": 3
+  }
+}
+```
+
+单条约 1.1 KB（3 条共 3382 B）。**重**在两处：`content_summary` 是必返字段且约 200 字，`metadata` 是自由键值 map（这里 15 个键）。只为了确认一个 id 存在却要拉这些，是 `paginated` 方案的根本开销。
+
+`status_counts` 是**全库**统计，不受当前页和 `status_filters` 影响（实测传 `status_filters:["processed"]`，`total_count` 仍是 3）。
+
+边界实测：
+
+| 请求体 | 状态码 | 结果 |
+| --- | --- | --- |
+| `{"page":1,"page_size":9}` | `422` | `greater_than_equal` — 下限 10 |
+| `{"page":1,"page_size":201}` | `422` | `less_than_equal` — 上限 200 |
+| `{"page":0,"page_size":50}` | `422` | `greater_than_equal` — page 下限 1 |
+| `{"page":2,"page_size":200}`（越界页） | `200` | `documents: []`，但 `total_count:3`、`total_pages:1` |
+| `{"page_size":50}`（省略 page） | `200` | `page` 和 `page_size` 都有默认值 |
+| `sort_field: "bogus"` | `422` | `literal_error`，只接受 4 个枚举值 |
+| `status_filters: ["不存在的状态"]` | `422` | `enum`，只接受 7 个小写状态名 |
+
+两个容易踩的点：
+
+1. **越界页返回 `200` + 空 `documents`**，和"库里没有文档"形状一样。别用 `documents.is_empty()` 判断翻页结束，要用 `pagination.has_next`。
+2. **`total_pages` 不随请求的 `page` 变化**（越界时仍是 1）。别拿 `page / page_size` 自己算总页数，信 `has_next`。
+
+**没有**按 `doc_id` 或 `file_path` 过滤的选项 —— `DocumentsRequest` 可筛的只有 `status_filter` / `status_filters` / `page` / `page_size` / `sort_field` / `sort_direction`。所以"doc X 还在吗"只能扫。
 
 `src/lightrag_requests.rs` / `src/lightrag_model.rs` 已按本文修正，以下是改掉的东西。
 
