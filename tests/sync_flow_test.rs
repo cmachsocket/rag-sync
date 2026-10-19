@@ -47,14 +47,18 @@ fn mineru_routes(markdown: &str) -> Vec<Route> {
         Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
         Route::post("/v1/uploads/up-1/complete")
             .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-        Route::post("/v1/file_parse").and(R::json(
-            200,
-            format!(
-                r#"{{"status":"completed","task_id":"t1","files":[
-                     {{"name":"a.pdf","status":"done","content":{{"markdown":{}}}}}]}}"#,
-                serde_json::Value::String(markdown.to_string())
-            ),
+        // 任务接口：建任务恒 202 queued，正文不内联，要按产物 id 再取一次
+        Route::post("/v1/parse/jobs").and(R::json(
+            202,
+            r#"{"job_id":"j-1","status":"queued","files":[]}"#,
         )),
+        Route::get("/v1/parse/jobs/j-1").and(R::json(
+            200,
+            r#"{"job_id":"j-1","status":"completed","files":[
+                 {"name":"a.pdf","status":"completed",
+                  "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
+        )),
+        Route::get("/v1/files/out-1/content").and(R::text(200, markdown)),
     ]
 }
 
@@ -323,7 +327,7 @@ async fn one_failure_is_not_swallowed() {
             200,
             r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#,
         )),
-        Route::post("/v1/file_parse").and(R::json(
+        Route::post("/v1/parse/jobs").and(R::json(
             500,
             r#"{"detail":"boom"}"#,
         )),
@@ -348,7 +352,7 @@ async fn one_failure_is_not_swallowed() {
 
     assert!(res.is_err(), "单个文件失败必须冒泡，不能当成功收尾");
     assert_eq!(
-        server.count_to("POST", "/v1/file_parse"),
+        server.count_to("POST", "/v1/parse/jobs"),
         5,
         "冒泡之前要先把 5 次机会用完"
     );

@@ -62,44 +62,53 @@ impl FileSource {
     }
 }
 
+// POST /v1/parse/jobs 的请求体。契约同为 additionalProperties: false，
+// 顶层只有 files 一个必填字段，多塞字段直接 422。
 #[derive(Serialize)]
-pub struct FileParseRequest {
-    pub files: Vec<FileParseItem>,
+pub struct CreateJobRequest {
+    pub files: Vec<JobFileEntry>,
 }
 
+// 不建模 page_range：不传就是整份文档，而我们要的从来不是「解析某几页」。
 #[derive(Serialize)]
-pub struct FileParseItem {
+pub struct JobFileEntry {
     pub source: FileSource,
 }
 
-/// /v1/file_parse 与 GET /v1/tasks/{id} 返回同构的响应，故复用同一结构体。
-/// progress 是嵌套对象。
+/// POST /v1/parse/jobs（恒 202）与 GET /v1/parse/jobs/{job_id} 返回同构，
+/// 故复用同一结构体。tier / links 等字段与取 markdown 无关，不建模，
+/// serde 解析时会忽略。
+#[derive(Deserialize)]
+pub struct JobResponse {
+    pub job_id: String,
+    /// queued / running / completed / partial / failed / canceled。
+    /// 注意取消是 canceled（一个 l），与 /v1/tasks 的 cancelled 不同。
+    pub status: String,
+    #[serde(default)]
+    pub progress: Option<Progress>,
+    #[serde(default)]
+    pub files: Vec<JobFileResult>,
+}
+
+/// 单个文件的结果。**没有内联 content**（/v1/file_parse 才有），
+/// markdown 只能拿 output_files.markdown.file_id 去 Files API 取。
+#[derive(Deserialize)]
+pub struct JobFileResult {
+    pub name: String,
+    /// queued / running / completed / failed
+    pub status: String,
+    #[serde(default)]
+    pub output_files: Option<HashMap<String, Option<OutputFileRef>>>,
+    /// ErrorDetail（type/code/message/param），留成 Value：错误正文是排查时
+    /// 唯一的线索，解析失败反而会把整份响应带崩。
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
+}
+
+/// 轮询进度，progress 是嵌套对象。
 #[derive(Deserialize)]
 pub struct Progress {
     pub completed: u64,
     pub failed: u64,
     pub total: u64,
-}
-
-#[derive(Deserialize)]
-pub struct ParsedFile {
-    pub name: String,
-    pub status: String,
-    pub error: Option<serde_json::Value>,
-    #[serde(default)]
-    pub output_files: Option<HashMap<String, Option<OutputFileRef>>>,
-    #[serde(default)]
-    pub content: Option<HashMap<String, Option<String>>>,
-}
-
-#[derive(Deserialize)]
-pub struct TaskResponse {
-    /// completed / running / failed / cancelled，注意没有 "success"
-    pub status: String,
-    pub task_id: String,
-    pub finished_at: Option<String>,
-    #[serde(default)]
-    pub progress: Option<Progress>,
-    #[serde(default)]
-    pub files: Vec<ParsedFile>,
 }

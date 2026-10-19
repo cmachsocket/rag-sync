@@ -1,5 +1,7 @@
-//! MinerU 的上传 -> 解析 -> 取产物链路。两个坑：契约是 `additionalProperties: false`
-//! （字段名写错直接 422），以及 sha256 幂等命中时 upload_url 为 null、再 PUT 会 409。
+//! MinerU 的上传 -> 解析 -> 取产物链路。三个坑：契约是 `additionalProperties: false`
+//! （字段名写错直接 422）、sha256 幂等命中时 upload_url 为 null、再 PUT 会 409，
+//! 以及任务接口 `/v1/parse/jobs` **不内联正文**，只能拿 `output_files` 的
+//! file_id 二次取（同步的 `/v1/file_parse` 才内联，两条路别搞混）。
 
 mod common;
 
@@ -37,6 +39,44 @@ async fn setup(
     (server, cfg)
 }
 
+/// 上传三步：created -> PUT 内容 -> completed，MinerU 的 file_id 是 f-1。
+fn upload_routes() -> Vec<Route> {
+    vec![
+        Route::post("/v1/uploads")
+            .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
+        Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
+        Route::post("/v1/uploads/up-1/complete").and(R::json(
+            200,
+            r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#,
+        )),
+    ]
+}
+
+/// 建任务（202 queued）-> 轮询到 completed -> 取 markdown 产物。
+/// 产物 id 恒为 out-1，正文由 `md` 给。
+fn job_routes(md: &str) -> Vec<Route> {
+    vec![
+        Route::post("/v1/parse/jobs").and(R::json(
+            202,
+            r#"{"job_id":"j-1","status":"queued","files":[]}"#,
+        )),
+        Route::get("/v1/parse/jobs/j-1").and(R::json(
+            200,
+            r#"{"job_id":"j-1","status":"completed",
+                "progress":{"completed":1,"failed":0,"total":1},
+                "files":[{"name":"a.pdf","status":"completed",
+                          "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
+        )),
+        Route::get("/v1/files/out-1/content").and(R::text(200, md)),
+    ]
+}
+
+fn concat(routes: Vec<Route>, more: Vec<Route>) -> Vec<Route> {
+    let mut all = routes;
+    all.extend(more);
+    all
+}
+
 // ---------------------------------------------------------------- 请求体形状
 
 #[test]
@@ -64,9 +104,11 @@ fn upload_request_body_matches_contract() {
 }
 
 #[test]
-fn parse_request_body_shape() {
-    let req = rag_sync::mineru_model::FileParseRequest {
-        files: vec![rag_sync::mineru_model::FileParseItem {
+fn create_job_body_matches_contract() {
+    // 同为 additionalProperties: false：顶层只有 files，项内只有 source，
+    // 多一个自造字段就是 422
+    let req = rag_sync::mineru_model::CreateJobRequest {
+        files: vec![rag_sync::mineru_model::JobFileEntry {
             source: rag_sync::mineru_model::FileSource::from_file_id("f-1".into()),
         }],
     };
@@ -100,24 +142,7 @@ fn upload_response_file_may_be_null() {
 async fn new_file_uploads_content_then_completes() {
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello world");
-    let (server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
-            Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete").and(R::json(
-                200,
-                r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#,
-            )),
-            Route::post("/v1/file_parse").and(R::json(
-                200,
-                r##"{"status":"completed","task_id":"t1","files":[
-                     {"name":"a.pdf","status":"done","content":{"markdown":"# 转换结果"}}]}"##,
-            )),
-        ],
-    )
-    .await;
+    let (server, cfg) = setup(&d, concat(upload_routes(), job_routes("# 转换结果"))).await;
 
     let md = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
@@ -142,9 +167,33 @@ async fn new_file_uploads_content_then_completes() {
     );
     assert_eq!(put.body_str(), "hello world", "流式上传不能少字节");
 
-    // 完成后拿 file_id 去解析
-    let parse = &server.requests_to("POST", "/v1/file_parse")[0];
-    assert_eq!(parse.json()["files"][0]["source"]["file_id"], "f-1");
+    // 完成后拿 file_id 去建任务，再轮询到终态、按产物 id 取正文
+    let job = &server.requests_to("POST", "/v1/parse/jobs")[0];
+    assert_eq!(job.json()["files"][0]["source"]["file_id"], "f-1");
+    assert_eq!(server.count_to("GET", "/v1/parse/jobs/j-1"), 1, "202 queued 必须轮询");
+    assert_eq!(server.count_to("GET", "/v1/files/out-1/content"), 1);
+}
+
+#[tokio::test]
+async fn terminal_on_create_skips_polling() {
+    // 任务已经跑完就没必要再问一次：少一轮请求，也少一次失败机会
+    let d = tempfile::tempdir().unwrap();
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let mut routes = upload_routes();
+    routes.push(Route::post("/v1/parse/jobs").and(R::json(
+        202,
+        r#"{"job_id":"j-1","status":"completed",
+            "files":[{"name":"a.pdf","status":"completed",
+                      "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
+    )));
+    routes.push(Route::get("/v1/files/out-1/content").and(R::text(200, "md")));
+    let (server, cfg) = setup(&d, routes).await;
+
+    assert_eq!(
+        mineru_tackle(&MockServer::client(), &file, &cfg).await.unwrap(),
+        "md"
+    );
+    assert_eq!(server.count_to("GET", "/v1/parse/jobs/j-1"), 0);
 }
 
 #[tokio::test]
@@ -152,20 +201,13 @@ async fn idempotent_hit_skips_content_upload() {
     // 服务端已按 sha256 收过这份内容，直接 completed。再 PUT 会 409。
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
-    let (server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-7"}}"#)),
-            Route::put("/v1/uploads/up-1/content").once(),
-            Route::post("/v1/file_parse").and(R::json(
-                200,
-                r#"{"status":"completed","task_id":"t1","files":[
-                     {"name":"a.pdf","status":"done","content":{"markdown":"md"}}]}"#,
-            )),
-        ],
-    )
-    .await;
+    let mut routes = vec![
+        Route::post("/v1/uploads")
+            .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-7"}}"#)),
+        Route::put("/v1/uploads/up-1/content").once(),
+    ];
+    routes.extend(job_routes("md"));
+    let (server, cfg) = setup(&d, routes).await;
 
     mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
@@ -176,7 +218,7 @@ async fn idempotent_hit_skips_content_upload() {
         "已 completed 还去 PUT 内容，必然 409"
     );
     assert_eq!(
-        server.requests_to("POST", "/v1/file_parse")[0].json()["files"][0]["source"]["file_id"],
+        server.requests_to("POST", "/v1/parse/jobs")[0].json()["files"][0]["source"]["file_id"],
         "f-7",
         "要直接复用响应里的 file.id"
     );
@@ -200,7 +242,7 @@ async fn idempotent_hit_without_file_is_error() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("file.id"), "{err}");
-    assert_eq!(server.count_to("POST", "/v1/file_parse"), 0);
+    assert_eq!(server.count_to("POST", "/v1/parse/jobs"), 0);
 }
 
 #[tokio::test]
@@ -312,61 +354,61 @@ async fn complete_non_terminal_is_error() {
 // ---------------------------------------------------------------- 解析
 
 #[tokio::test]
-async fn parse_running_polls_then_fetches_artifact() {
+async fn queued_job_polls_until_terminal_then_fetches_artifact() {
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
-    let (server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
-            Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete")
-                .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-            Route::post("/v1/file_parse")
-                .and(R::json(202, r#"{"status":"running","task_id":"t1","files":[]}"#)),
-            // 轮询终态的 content 恒为空，必须走 output_files 的 file_id 二次取
-            Route::get("/v1/tasks/t1").and(R::json(
+    let mut routes = upload_routes();
+    routes.push(Route::post("/v1/parse/jobs").and(R::json(
+        202,
+        r#"{"job_id":"j-1","status":"queued","files":[]}"#,
+    )));
+    // 第一次轮询还没跑完，第二次才是终态；终态的正文恒为空，
+    // 必须拿 output_files 的 file_id 二次取。同一个路径的两份响应
+    // 必须挂在同一条路由上（响应队列按顺序消费）。
+    routes.push(
+        Route::get("/v1/parse/jobs/j-1")
+            .and(R::json(
                 200,
-                r#"{"status":"completed","task_id":"t1","progress":{"completed":1,"failed":0,"total":1},
-                    "files":[{"name":"a.pdf","status":"done",
+                r#"{"job_id":"j-1","status":"queued","progress":{"completed":0,"failed":0,"total":1},
+                    "files":[]}"#,
+            ))
+            .and(R::json(
+                200,
+                r#"{"job_id":"j-1","status":"completed","progress":{"completed":1,"failed":0,"total":1},
+                    "files":[{"name":"a.pdf","status":"completed",
                               "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
             )),
-            Route::get("/v1/files/out-1/content").and(R::text(200, "# 正文\n")),
-        ],
-    )
-    .await;
+    );
+    routes.push(Route::get("/v1/files/out-1/content").and(R::text(200, "# 正文\n")));
+    let (server, cfg) = setup(&d, routes).await;
 
     let md = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap();
     assert_eq!(md, "# 正文\n");
-    assert_eq!(server.count_to("GET", "/v1/tasks/t1"), 1, "一次就轮询到终态");
+    assert_eq!(
+        server.count_to("GET", "/v1/parse/jobs/j-1"),
+        2,
+        "非终态要继续轮，终态就停"
+    );
     assert_eq!(server.count_to("GET", "/v1/files/out-1/content"), 1);
 }
 
 #[tokio::test]
-async fn parse_failed_surfaces_file_error() {
+async fn job_failed_surfaces_file_error() {
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
-            Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete")
-                .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-            Route::post("/v1/file_parse")
-                .and(R::json(202, r#"{"status":"running","task_id":"t1","files":[]}"#)),
-            Route::get("/v1/tasks/t1").and(R::json(
-                200,
-                r#"{"status":"failed","task_id":"t1","files":[
-                     {"name":"a.pdf","status":"failed","error":{"message":"OCR 引擎崩了"}}]}"#,
-            )),
-        ],
-    )
-    .await;
+    let mut routes = upload_routes();
+    routes.push(Route::post("/v1/parse/jobs").and(R::json(
+        202,
+        r#"{"job_id":"j-1","status":"queued","files":[]}"#,
+    )));
+    routes.push(Route::get("/v1/parse/jobs/j-1").and(R::json(
+        200,
+        r#"{"job_id":"j-1","status":"failed","files":[
+             {"name":"a.pdf","status":"failed","error":{"message":"OCR 引擎崩了"}}]}"#,
+    )));
+    let (_server, cfg) = setup(&d, routes).await;
 
     let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
@@ -377,87 +419,71 @@ async fn parse_failed_surfaces_file_error() {
 }
 
 #[tokio::test]
-async fn parse_cancelled_is_failure() {
-    // 终态有四种，只判 completed 会让失败/取消的任务被当成成功
+async fn job_canceled_is_failure() {
+    // 任务接口的取消拼写是 canceled（一个 l），与 /v1/tasks 的 cancelled 不同；
+    // 少一个终态判断，这类任务就会被当成「还在跑」轮到超时
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
-            Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete")
-                .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-            Route::post("/v1/file_parse").and(R::json(
-                202,
-                r#"{"status":"running","task_id":"t1","files":[]}"#,
-            )),
-            Route::get("/v1/tasks/t1").and(R::json(
-                200,
-                r#"{"status":"cancelled","task_id":"t1","files":[]}"#,
-            )),
-        ],
-    )
-    .await;
+    let mut routes = upload_routes();
+    routes.push(Route::post("/v1/parse/jobs").and(R::json(
+        202,
+        r#"{"job_id":"j-1","status":"queued","files":[]}"#,
+    )));
+    routes.push(Route::get("/v1/parse/jobs/j-1").and(R::json(
+        200,
+        r#"{"job_id":"j-1","status":"canceled","files":[]}"#,
+    )));
+    let (_server, cfg) = setup(&d, routes).await;
 
     let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("cancelled"), "{err}");
+    assert!(err.contains("canceled"), "{err}");
 }
 
 #[tokio::test]
-async fn null_inline_content_falls_back_to_artifact() {
+async fn partial_job_is_failure() {
+    // partial = 有文件失败；单文件任务里它就等于失败，当成功会让产物是空的
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
-    let (server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
-            Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete")
-                .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-            Route::post("/v1/file_parse").and(R::json(
-                200,
-                r#"{"status":"completed","task_id":"t1","files":[
-                     {"name":"a.pdf","status":"done",
-                      "content":{"markdown":null,"images":null},
-                      "output_files":{"markdown":{"file_id":"out-2","bytes":4}}}]}"#,
-            )),
-            Route::get("/v1/files/out-2/content").and(R::text(200, "abcd")),
-        ],
-    )
-    .await;
+    let mut routes = upload_routes();
+    routes.push(Route::post("/v1/parse/jobs").and(R::json(
+        202,
+        r#"{"job_id":"j-1","status":"queued","files":[]}"#,
+    )));
+    routes.push(Route::get("/v1/parse/jobs/j-1").and(R::json(
+        200,
+        r#"{"job_id":"j-1","status":"partial","files":[
+             {"name":"a.pdf","status":"failed","output_files":null,
+              "error":{"message":"第 3 页图片解码失败"}}]}"#,
+    )));
+    let (_server, cfg) = setup(&d, routes).await;
 
-    assert_eq!(
-        mineru_tackle(&MockServer::client(), &file, &cfg).await.unwrap(),
-        "abcd"
-    );
-    assert_eq!(server.count_to("GET", "/v1/files/out-2/content"), 1);
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("partial"), "{err}");
+    assert!(err.contains("第 3 页图片解码失败"), "{err}");
 }
 
 #[tokio::test]
-async fn no_content_and_no_artifact_is_error() {
+async fn completed_job_without_artifact_is_error() {
+    // 任务接口不内联正文，没有产物 id 就等于没有结果 —— 得报错，
+    // 不能默默写出一个空文件
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
-            Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete")
-                .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-            Route::post("/v1/file_parse").and(R::json(
-                200,
-                r#"{"status":"completed","task_id":"t1","files":[{"name":"a.pdf","status":"done"}]}"#,
-            )),
-        ],
-    )
-    .await;
+    let mut routes = upload_routes();
+    routes.push(Route::post("/v1/parse/jobs").and(R::json(
+        202,
+        r#"{"job_id":"j-1","status":"queued","files":[]}"#,
+    )));
+    routes.push(Route::get("/v1/parse/jobs/j-1").and(R::json(
+        200,
+        r#"{"job_id":"j-1","status":"completed","files":[{"name":"a.pdf","status":"completed"}]}"#,
+    )));
+    let (_server, cfg) = setup(&d, routes).await;
 
     let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
@@ -467,22 +493,19 @@ async fn no_content_and_no_artifact_is_error() {
 }
 
 #[tokio::test]
-async fn parse_response_without_files_is_error() {
+async fn job_response_without_files_is_error() {
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
-            Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete")
-                .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-            Route::post("/v1/file_parse")
-                .and(R::json(200, r#"{"status":"completed","task_id":"t1","files":[]}"#)),
-        ],
-    )
-    .await;
+    let mut routes = upload_routes();
+    routes.push(Route::post("/v1/parse/jobs").and(R::json(
+        202,
+        r#"{"job_id":"j-1","status":"queued","files":[]}"#,
+    )));
+    routes.push(Route::get("/v1/parse/jobs/j-1").and(R::json(
+        200,
+        r#"{"job_id":"j-1","status":"completed","files":[]}"#,
+    )));
+    let (_server, cfg) = setup(&d, routes).await;
 
     let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
@@ -492,29 +515,44 @@ async fn parse_response_without_files_is_error() {
 }
 
 #[tokio::test]
+async fn create_job_rejected_surfaces_status_and_body() {
+    // 建任务被 422（契约写错）时，原因只在 body 里
+    let d = tempfile::tempdir().unwrap();
+    let file = sample_file(&d, 0, "a.pdf", "hello");
+    let mut routes = upload_routes();
+    routes.push(Route::post("/v1/parse/jobs").and(R::json(
+        422,
+        r#"{"detail":[{"loc":["body","files"],"msg":"Field required"}]}"#,
+    )));
+    let (_server, cfg) = setup(&d, routes).await;
+
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("422"), "{err}");
+    assert!(err.contains("Field required"), "{err}");
+}
+
+#[tokio::test]
 async fn artifact_content_is_plain_text() {
     // GET /v1/files/{id}/content 直接返回 markdown 原文，
     // 按 JSON 解会得到一个空串再写进输出文件
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
-    let (_server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
-            Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete")
-                .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-            Route::post("/v1/file_parse").and(R::json(
-                200,
-                r#"{"status":"completed","task_id":"t1","files":[
-                     {"name":"a.pdf","status":"done",
-                      "output_files":{"markdown":{"file_id":"o","bytes":1}}}]}"#,
-            )),
-            Route::get("/v1/files/o/content").and(R::text(200, "标题\n\n正文 **加粗**")),
-        ],
-    )
-    .await;
+    let mut routes = upload_routes();
+    routes.push(Route::post("/v1/parse/jobs").and(R::json(
+        202,
+        r#"{"job_id":"j-1","status":"queued","files":[]}"#,
+    )));
+    routes.push(Route::get("/v1/parse/jobs/j-1").and(R::json(
+        200,
+        r#"{"job_id":"j-1","status":"completed","files":[
+             {"name":"a.pdf","status":"completed",
+              "output_files":{"markdown":{"file_id":"o","bytes":1}}}]}"#,
+    )));
+    routes.push(Route::get("/v1/files/o/content").and(R::text(200, "标题\n\n正文 **加粗**")));
+    let (_server, cfg) = setup(&d, routes).await;
 
     assert_eq!(
         mineru_tackle(&MockServer::client(), &file, &cfg).await.unwrap(),
@@ -528,22 +566,7 @@ async fn large_file_uploads_with_declared_length() {
     let d = tempfile::tempdir().unwrap();
     let body = "x".repeat(300_000);
     let file = sample_file(&d, 0, "big.pdf", &body);
-    let (server, cfg) = setup(
-        &d,
-        vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
-            Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete")
-                .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-            Route::post("/v1/file_parse").and(R::json(
-                200,
-                r#"{"status":"completed","task_id":"t1","files":[
-                     {"name":"big.pdf","status":"done","content":{"markdown":"ok"}}]}"#,
-            )),
-        ],
-    )
-    .await;
+    let (server, cfg) = setup(&d, concat(upload_routes(), job_routes("ok"))).await;
 
     mineru_tackle(&MockServer::client(), &file, &cfg)
         .await

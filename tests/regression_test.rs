@@ -31,14 +31,18 @@ fn mineru_routes(md: &str) -> Vec<Route> {
         Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
         Route::post("/v1/uploads/up-1/complete")
             .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
-        Route::post("/v1/file_parse").and(R::json(
-            200,
-            format!(
-                r#"{{"status":"completed","task_id":"t1","files":[
-                     {{"name":"a.pdf","status":"done","content":{{"markdown":{}}}}}]}}"#,
-                serde_json::Value::String(md.to_string())
-            ),
+        // 任务接口：建任务恒 202 queued，正文只在产物里，要再取一次
+        Route::post("/v1/parse/jobs").and(R::json(
+            202,
+            r#"{"job_id":"j-1","status":"queued","files":[]}"#,
         )),
+        Route::get("/v1/parse/jobs/j-1").and(R::json(
+            200,
+            r#"{"job_id":"j-1","status":"completed","files":[
+                 {"name":"a.pdf","status":"completed",
+                  "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
+        )),
+        Route::get("/v1/files/out-1/content").and(R::text(200, md)),
     ]
 }
 
@@ -144,7 +148,7 @@ async fn changed_content_is_reprocessed() {
     sync_once(&env, &mut db, 2).await;
 
     assert_eq!(
-        server.count_to("POST", "/v1/file_parse"),
+        server.count_to("POST", "/v1/parse/jobs"),
         2,
         "内容变了必须重跑 MinerU"
     );
@@ -166,7 +170,7 @@ async fn unchanged_content_only_refreshes_run_id() {
     sync_once(&env, &mut db, 1).await;
     sync_once(&env, &mut db, 2).await;
 
-    assert_eq!(server.count_to("POST", "/v1/file_parse"), 1, "没变就不该重跑");
+    assert_eq!(server.count_to("POST", "/v1/parse/jobs"), 1, "没变就不该重跑");
     assert_eq!(
         db.run_id_of(&src).await,
         2,
@@ -388,7 +392,7 @@ async fn reprocess_uses_real_mineru_file_id() {
         1,
         "没有可复用的 MinerU file_id，就必须走上传"
     );
-    let body = server.requests_to("POST", "/v1/file_parse")[0].json();
+    let body = server.requests_to("POST", "/v1/parse/jobs")[0].json();
     assert_eq!(
         body["files"][0]["source"]["file_id"], "f-1",
         "解析要用上传返回的 file_id，不是 DB 行号"

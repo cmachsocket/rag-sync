@@ -1,5 +1,9 @@
 # MinerU `/v1/file_parse` 接口测试记录
 
+> **生产链路已改走 `/v1/parse/jobs`**（见 `mineru-parse-jobs-test.md`）：大文件在同步接口上
+> 只能卡在 `wait_timeout`（上限 3600 s）里等，超时才转 `202` + 轮询，客户端挂的时间都花在干等上。
+> 本篇是 `file_parse` 的历史测试记录，上传三步（§3、§11）与 source 契约（§2）对任务接口同样成立。
+
 测试时间：2026-10-17
 目标服务：`http://127.0.0.1:9777`（`mineru-kit api-server --host 127.0.0.1 --port 9777 --tier standard`，版本 `4.0.12`）
 被测端点：`POST /v1/file_parse` — *File Parse*

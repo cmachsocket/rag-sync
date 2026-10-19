@@ -1,4 +1,5 @@
 //! cargo test --test e2e_config_test -- --ignored --nocapture           # 配置 + 连通性，只读
+//! cargo test --test e2e_config_test mineru_job -- --ignored --nocapture # 只打真 MinerU（任务接口）
 //! cargo test --test e2e_config_test probe -- --ignored --nocapture     # 单文件往返，结束自动删
 //! cargo test --test e2e_config_test full_sync -- --ignored --nocapture # 全量入库，见下
 
@@ -315,6 +316,49 @@ async fn lightrag_accepts_mineru_markdown_output() {
         Ok(id) => println!("清理 {:?}", [id]),
         Err(e) => panic!("清理 {doc_id} 失败，知识库里会留下它: {e}"),
     }
+}
+
+/// 只打真 MinerU 的最小往返：上传 -> `POST /v1/parse/jobs` -> 轮询 -> 按产物 id 取正文。
+/// 不碰 LightRAG、不写库，比 `probe_round_trip` 便宜得多：MinerU 升级后跑一次，
+/// 就知道任务接口（状态枚举、不内联正文这些坑）还对不对。
+#[tokio::test]
+#[ignore = "需要真实 MinerU"]
+async fn mineru_job_round_trip_against_real_service() {
+    let real = real_config().await;
+    let probe = match smallest_parsable_file(&real.sync_dir).await {
+        Some(path) => path,
+        None => panic!(
+            "{} 下没有 MinerU 收得下的受支持文件，没法探针",
+            real.sync_dir
+        ),
+    };
+    println!(
+        "探针文件: {} ({} 字节)",
+        probe.display(),
+        std::fs::metadata(&probe).unwrap().len()
+    );
+
+    let path = probe.to_string_lossy().into_owned();
+    let sha256 = rag_sync::sync_folder::sha256_file(&path).await.unwrap();
+    let file = db_model::File {
+        // id 是 DB 行号，这里不落库，给 0 占位
+        id: 0,
+        path,
+        sha256,
+        rag_id: None,
+        run_id: 1,
+    };
+
+    let client = http_util::client().unwrap();
+    let markdown = rag_sync::mineru_requests::mineru_tackle(&client, &file, &real)
+        .await
+        .unwrap_or_else(|e| panic!("任务接口走不通，先别跑 full_sync: {e}"));
+    assert!(
+        !markdown.trim().is_empty(),
+        "MinerU 返回了空 markdown: {}",
+        probe.display()
+    );
+    println!("拿到 {} 字节 markdown", markdown.len());
 }
 
 /// 单文件全链路：真 MinerU 转换 -> 写产物 -> 真 LightRAG 入库 -> 落库，结束即删。

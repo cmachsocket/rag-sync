@@ -1,6 +1,6 @@
 use crate::db_model;
 use crate::mineru_model::{
-    FileParseItem, FileParseRequest, FileSource, OutputFileRef, TaskResponse, UploadObject,
+    CreateJobRequest, FileSource, JobFileEntry, JobResponse, OutputFileRef, UploadObject,
 };
 use crate::sync_config::SyncConfig;
 use reqwest::Body;
@@ -10,10 +10,19 @@ use tokio_util::io::ReaderStream;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// 稳态轮询间隔。任务已经跑起来了，问得再密也不会更快。
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 轮询上限。仅防服务端任务卡死导致无限等待，与 HTTP 层的 wait_timeout 无关。
-const MAX_POLL_ROUNDS: u32 = 720;
+/// 起步几轮用 1 秒：纯文本类文件（docx）服务端 1 秒内就出结果，
+/// 一轮固定 5 秒会让「一堆小文件」每个白等 5 秒。
+const FAST_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const FAST_POLL_ROUNDS: u32 = 3;
+
+/// 轮询上限。仅防服务端任务卡死导致无限等待，与 HTTP 层无关。
+/// 实测 13 页扫描件要 83 秒（约 6.4 秒/页），914 页量级在 1.6 小时以上，
+/// 已超同步接口 wait_timeout 的 3600 s；故按 7200 轮 × 5 秒 ≈ 10 小时给足，
+/// 别把大文件的正常解析掐断。
+const MAX_POLL_ROUNDS: u32 = 7200;
 
 /// 错误信息统一带上文件路径，便于定位是哪个文件出的问题。
 fn err(file: &db_model::File, msg: impl std::fmt::Display) -> Box<dyn std::error::Error> {
@@ -34,7 +43,6 @@ async fn ensure_success(
     }
     Ok(resp)
 }
-
 
 async fn upload(
     client: &reqwest::Client,
@@ -110,7 +118,10 @@ async fn put_content(
         .len();
 
     let resp = client
-        .put(format!("{}/v1/uploads/{upload_id}/content", config.mineru_url))
+        .put(format!(
+            "{}/v1/uploads/{upload_id}/content",
+            config.mineru_url
+        ))
         .header("Content-Type", mime_type)
         // 声明长度，避免服务端使用 chunked 编码
         .header("Content-Length", body_len)
@@ -131,7 +142,10 @@ async fn complete(
     upload_id: &str,
 ) -> Result<String> {
     let resp = client
-        .post(format!("{}/v1/uploads/{upload_id}/complete", config.mineru_url))
+        .post(format!(
+            "{}/v1/uploads/{upload_id}/complete",
+            config.mineru_url
+        ))
         .send()
         .await
         .map_err(|e| err(file, format!("完成上传请求失败: {e}")))?;
@@ -150,122 +164,138 @@ async fn complete(
         .ok_or_else(|| err(file, "完成响应中缺少 file.id"))
 }
 
-/// 触发解析。202 时轮询到终态并取回产物内容。
+/// 创建解析任务并轮询到终态，返回 markdown。
+///
+/// 走任务接口而不是同步的 `/v1/file_parse`：大文件逐页 OCR（实测 6.4 秒/页）在同步
+/// 接口上只能一直卡在 wait_timeout 里，服务端 3600 s 的上限根本不够；
+/// 任务接口把等待交给服务端排队，这里只是每几秒醒一次。
 async fn parse(
     client: &reqwest::Client,
     file: &db_model::File,
     config: &SyncConfig,
     file_id: &str,
 ) -> Result<String> {
-    let req = FileParseRequest {
-        files: vec![FileParseItem {
+    let req = CreateJobRequest {
+        files: vec![JobFileEntry {
             source: FileSource::from_file_id(file_id.to_string()),
         }],
     };
-
+    println!("[解析] {} → {}", file.path, file_id);
     let resp = client
-        .post(format!("{}/v1/file_parse", config.mineru_url))
+        .post(format!("{}/v1/parse/jobs", config.mineru_url))
         .json(&req)
         .send()
         .await
-        .map_err(|e| err(file, format!("解析请求失败: {e}")))?;
+        .map_err(|e| err(file, format!("创建解析任务失败: {e}")))?;
 
-    let resp = ensure_success(resp, file, "解析").await?;
+    let resp = ensure_success(resp, file, "创建解析任务").await?;
 
-    // 202 与 200 同构，都反序列化成 TaskResponse
-    let mut task: TaskResponse = resp
+    let mut job: JobResponse = resp
         .json()
         .await
-        .map_err(|e| err(file, format!("解析响应失败: {e}")))?;
+        .map_err(|e| err(file, format!("解析任务响应失败: {e}")))?;
 
-    if task.status == "running" {
-        task = poll(client, file, config, &task.task_id).await?;
+    // 恒回 202 + queued，但万一服务端已经跑完就别白轮询一轮
+    if !is_terminal(&job.status) {
+        job = poll(client, file, config, &job.job_id).await?;
     }
 
-    // 终态校验。注意 status 取值为 completed/failed/cancelled，没有 "success"
-    if task.status != "completed" {
-        let detail = task
+    // 终态五种，只有 completed 算成功：partial 是「有文件失败」，
+    // 单文件任务里等同于失败，同样要冒泡。
+    if job.status != "completed" {
+        let detail = job
             .files
             .first()
             .and_then(|f| f.error.as_ref())
             .map(|e| format!("，错误: {e}"))
             .unwrap_or_default();
-        return Err(err(file, format!("解析未成功，状态: {}{detail}", task.status)));
+        return Err(err(
+            file,
+            format!("解析未成功，状态: {}{detail}", job.status),
+        ));
     }
 
-    extract_markdown(client, file, config, &task).await
+    extract_markdown(client, file, config, &job).await
+}
+
+/// queued / running 之外都是终态。没有终态就一直轮，失败任务才不会被当成「还在跑」。
+fn is_terminal(status: &str) -> bool {
+    return matches!(status, "completed" | "partial" | "failed" | "canceled");
+}
+
+/// 第几轮该睡多久：起步快，小文件 1 秒内就捞到结果；稳态慢，大文件不必问密。
+fn poll_interval(round: u32) -> Duration {
+    if round <= FAST_POLL_ROUNDS {
+        FAST_POLL_INTERVAL
+    } else {
+        POLL_INTERVAL
+    }
 }
 
 async fn poll(
     client: &reqwest::Client,
     file: &db_model::File,
     config: &SyncConfig,
-    task_id: &str,
-) -> Result<TaskResponse> {
+    job_id: &str,
+) -> Result<JobResponse> {
     for round in 1..=MAX_POLL_ROUNDS {
         let resp = client
-            .get(format!("{}/v1/tasks/{task_id}", config.mineru_url))
+            .get(format!("{}/v1/parse/jobs/{job_id}", config.mineru_url))
             .send()
             .await
             .map_err(|e| err(file, format!("轮询失败: {e}")))?;
         let resp = ensure_success(resp, file, "轮询").await?;
-        let task: TaskResponse = resp
+        let job: JobResponse = resp
             .json()
             .await
             .map_err(|e| err(file, format!("解析轮询响应失败: {e}")))?;
 
-        // 终态有四种，不能只判 completed，否则失败任务会一直轮询
-        if matches!(
-            task.status.as_str(),
-            "completed" | "failed" | "cancelled"
-        ) {
-            return Ok(task);
+        if is_terminal(&job.status) {
+            return Ok(job);
         }
 
-        if let Some(p) = &task.progress {
+        if let Some(p) = &job.progress {
             println!(
                 "[轮询 {round}/{MAX_POLL_ROUNDS}] {} 状态: {} ({}/{})",
-                file.path, task.status, p.completed, p.total
+                file.path, job.status, p.completed, p.total
             );
         } else {
-            println!("[轮询 {round}/{MAX_POLL_ROUNDS}] {} 状态: {}", file.path, task.status);
+            println!(
+                "[轮询 {round}/{MAX_POLL_ROUNDS}] {} 状态: {}",
+                file.path, job.status
+            );
         }
 
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(poll_interval(round)).await;
     }
     Err(err(file, "轮询超时，任务可能仍在服务端运行"))
 }
 
-/// 取 markdown 内容。同步完成时内联在 content 里，轮询完成后需二次请求。
+/// 取 markdown 内容。任务接口不内联正文，只能拿产物 id 二次请求。
 async fn extract_markdown(
     client: &reqwest::Client,
     file: &db_model::File,
     config: &SyncConfig,
-    task: &TaskResponse,
+    job: &JobResponse,
 ) -> Result<String> {
-    let parsed = task
+    let parsed = job
         .files
         .first()
         .ok_or_else(|| err(file, "响应中缺少 files 条目"))?;
 
-    // 优先用内联内容
-    if let Some(md) = parsed.content.as_ref().and_then(|c| c.get("markdown")) {
-        if let Some(text) = md {
-            return Ok(text.clone());
-        }
-    }
-
-    // 回退到产物 id：轮询终态的 content 恒为空，必须走这条路
     let product_id = parsed
         .output_files
         .as_ref()
         .and_then(|m| m.get("markdown"))
         .and_then(|o| o.as_ref())
         .map(|o: &OutputFileRef| o.file_id.as_str())
-        .ok_or_else(|| err(file, "既无内联内容也无 markdown 产物 id"))?;
+        .ok_or_else(|| err(file, "既无 markdown 产物 id，无法取回正文"))?;
 
     let resp = client
-        .get(format!("{}/v1/files/{product_id}/content", config.mineru_url))
+        .get(format!(
+            "{}/v1/files/{product_id}/content",
+            config.mineru_url
+        ))
         .send()
         .await
         .map_err(|e| err(file, format!("获取解析内容失败: {e}")))?;
