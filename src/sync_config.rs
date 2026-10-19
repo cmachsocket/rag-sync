@@ -80,8 +80,8 @@ impl SyncConfig {
                 return Err(format!("配置文件中缺少 {键} 配置").into());
             }
         }
-        // 统一在加载时展开：之后 sync_dir / output_dir 一定是绝对路径，
-        // get_files 存进 DB 的 path 与 delete_old_files 拼回的路径才对得上
+        // 加载时展开：之后 sync_dir / output_dir 一定是绝对路径，
+        // 存进 DB 的 path 与清理时拼回的路径才对得上
         config.sync_dir = expand_home_dir(&config.sync_dir);
         config.output_dir = expand_home_dir(&config.output_dir);
         let old_counter: crate::db_model::RunCounter =match database::DBfunc::get_run_counter(conn).await? {

@@ -1,12 +1,10 @@
 //! 库里有 failed 文档时，删除与反查还能不能工作。
 //!
-//! `DocStatusResponse.chunks_count` 曾经是 `Option<u64>`，而真实 LightRAG 对
-//! 失败的文档给 `-1`。后果不是「这一个字段读不出来」，而是**整个响应解析失败**：
-//! `documents/paginated` 里只要混着一条 failed 文档，`document_exists` /
-//! `find_doc_ids_by_filename` / `delete_document` 就全部瘫痪 —— 知识库里有失败
-//! 记录时，rag-sync 再也删不掉任何东西，409 同名冲突也无法自愈。
+//! `chunks_count` 曾经是 `Option<u64>`，而真实 LightRAG 对失败的文档给 `-1` ——
+//! 不是「这个字段读不出来」，而是整个响应解析失败：paginated 里混着一条 failed
+//! 文档，`document_exists` / `find_doc_ids_by_filename` / `delete_document` 就全瘫，
+//! 409 自愈也失效。
 //!
-//! 线上回归用例，需要真实服务：
 //! ```sh
 //! cargo test --test live_chunks_count_test -- --ignored --nocapture
 //! ```

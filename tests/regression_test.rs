@@ -379,7 +379,7 @@ async fn reprocess_uses_real_mineru_file_id() {
         run_id: 2,
     };
 
-    rag_sync::mineru_requests::mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    rag_sync::mineru_requests::mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap();
 
@@ -418,7 +418,7 @@ fn parser_hint_normalises_to_same_key() {
 
 #[tokio::test]
 async fn conflict_selfheal_works_with_parser_hint() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let server = MockServer::start(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload")

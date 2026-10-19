@@ -1,12 +1,11 @@
-//! 打真实 LightRAG 服务的端到端测试，默认全部跳过。需要真实账号与网络：
-//!
+//! 打真实 LightRAG 服务的端到端测试，默认全部跳过：
 //! ```sh
 //! RAG_URL=http://192.168.2.7:9621 RAG_USER=xxx RAG_PASS=xxx \
 //!   cargo test --test live_lightrag_test -- --nocapture --ignored
 //! ```
-//!
 //! 会往知识库里写文档并在结束时删掉，但每个文件后台处理要 30 s 以上，别在 CI 里跑。
 
+use rag_sync::http_util;
 use rag_sync::lightrag_requests::RAGRequest;
 
 fn credentials() -> (String, String, String) {
@@ -28,7 +27,8 @@ async fn live_upload_conflict() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(&path, format!("live conflict probe {}\nbody\n", std::process::id()))?;
     let path = path.to_string_lossy().into_owned();
 
-    let client = reqwest::Client::new();
+    // 用带超时的客户端：reqwest::Client::new() 在主机不可达时会一直挂着
+    let client = http_util::client()?;
     let rag = RAGRequest::new(&client, &url, &user, &pass).await?;
 
     // 1. 首次上传
@@ -50,7 +50,7 @@ async fn live_upload_conflict() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(first, changed, "doc_id 只看文件名，内容变了也不该变");
     assert!(rag.document_exists(&changed).await?);
 
-    // 4. 删干净。
+    // 4. 删干净
     rag.delete_document(&changed).await?;
     assert!(!rag.document_exists(&changed).await?);
     std::fs::remove_file(&path).ok();

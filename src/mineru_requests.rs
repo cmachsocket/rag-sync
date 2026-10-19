@@ -277,8 +277,8 @@ async fn extract_markdown(
 
 /// 单个文件的完整流程：上传 → 解析 → 返回 markdown。
 ///
-/// 每轮都重新上传，**不复用本地记录**：`files.id` 是 DB 行号，不是 MinerU 的
-/// file_id。重复上传不花钱靠的是服务端按 sha256 幂等（见上面 completed 分支）。
+/// 每轮都重新上传：`files.id` 是 DB 行号，不是 MinerU 的 file_id。重复上传不花钱
+/// 靠的是服务端按 sha256 幂等（见上面 completed 分支）。
 pub async fn mineru_tackle(
     client: &reqwest::Client,
     file: &db_model::File,

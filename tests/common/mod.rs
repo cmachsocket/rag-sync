@@ -2,7 +2,7 @@
 //!   1. `test_db` —— 临时 SQLite 库 + 真实 migration，不碰仓库里的 rag-sync.db。
 //!   2. `MockServer` —— 手写的最小 HTTP/1.1 服务端，替 MinerU / LightRAG
 //!      （离线环境拿不到 wiremock / httpmock，只依赖已有的 tokio）。
-//!   3. `SyncConfig` 之类的构造辅助。
+//!   3. `Env` —— 临时 sync/out 目录与配置构造。
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -266,6 +266,17 @@ pub struct MockServer {
 }
 
 impl MockServer {
+    /// mock 只监听回环地址，请求**必须**直连。
+    ///
+    /// reqwest 默认读 HTTP_PROXY / HTTPS_PROXY，于是打向 127.0.0.1 的请求
+    /// 可能被塞给环境里那个代理：表现为时好时坏的 502，且和被测代码毫无关系。
+    pub fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("构造测试用 HTTP 客户端失败")
+    }
+
     pub async fn start(routes: Vec<Route>) -> Self {
         use std::sync::Arc;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

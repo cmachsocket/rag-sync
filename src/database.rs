@@ -5,8 +5,7 @@ use diesel_async::{AsyncConnection, RunQueryDsl, sync_connection_wrapper::SyncCo
 
 pub type Conn = SyncConnectionWrapper<SqliteConnection>;
 
-/// 所有方法都直接给 `Conn` 实现。trait 里的 `async fn` 只是为了按职责分组，
-/// 代价是拿不到 `Send` 边界（会出 11 条 warning）；真要 `tokio::spawn` 时再改。
+/// 方法都直接给 `Conn` 实现，trait 只是为了按职责分组。代价是拿不到 `Send` 边界。
 #[allow(async_fn_in_trait)]
 pub trait DBfunc {
     async fn file_exists(&mut self, file_path: &str) -> Result<bool, Box<dyn std::error::Error>>;

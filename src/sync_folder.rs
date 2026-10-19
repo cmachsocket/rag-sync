@@ -78,22 +78,14 @@ pub async fn get_relative_path(
     Ok(relative_path.to_string_lossy().into_owned())
 }
 
-/// 产物在 output_dir 里的相对路径。
+/// 产物在 output_dir 里的相对路径：以 `.md` 收尾，原扩展名留在中间段。
 ///
-/// 两件事必须同时成立：
+/// - 必须 `.md`：LightRAG 按扩展名选解析器，`.docx` 里装 markdown 会被拒。
+/// - 必须带原扩展名：同名的 `竞选.pdf` 与 `竞选.pptx` 都改成 `竞选.md` 会互相覆盖，
+///   409 自愈还会把先传成功的那份从知识库里删掉。源文件本身是 `.md` 的不加中间段。
 ///
-/// 1. **必须以 `.md` 收尾**。MinerU 的产物是 markdown 文本，而 LightRAG 按扩展名
-///    选解析器：`X.docx` 里装 markdown 会被判成
-///    `File is not a valid DOCX document`，`X.pdf` 则是
-///    `Stream has ended unexpectedly`。只有 `.md` 能过。
-/// 2. **原扩展名要留在中间段**。同一目录下 `竞选.pdf` 与 `竞选.pptx` 这种同名主干
-///    很常见（实测 sync_dir 里有 5 组）。都改成 `竞选.md` 会互相覆盖产物，
-///    上传时再撞 409 自愈，把先传成功的那份**从知识库里删掉** —— 静默丢一份文档。
-///    `竞选.pdf.md` / `竞选.pptx.md` 既唯一又以 `.md` 结尾。
-///    源文件本来就是 `.md` 的不加中间段，否则 `X.md` 与 `X.md.md` 会撞在一起。
-///
-/// 映射只依赖源路径本身，不依赖同批次的其他文件：`cleanup_one_old_file` 手上只有
-/// 一条 DB 记录，也必须算出同一个产物路径，否则删产物会找不到文件。
+/// 只依赖源路径，不依赖同批次的其他文件 —— `cleanup_one_old_file` 手上只有一条 DB 记录，
+/// 也必须算出同一个产物路径。
 pub async fn output_relative_path(
     root_dir: &str,
     file_path: &Path,
@@ -132,8 +124,7 @@ async fn create_output_dir(
     let parent = output_file_path.parent().ok_or_else(|| {
         format!("无法获取输出文件的父目录: {}", output_file_path.display())
     })?;
-    // 错误信息里带一次详细信息即可：eprintln + 固定文案会让上层拿到
-    // 一条没有原因的错误，真正的原因只留在 stderr 里。
+    // 细节放在返回的 Err 里，不要 eprintln 一次再返回一个没原因的固定文案
     fs::create_dir_all(parent)
         .await
         .map_err(|e| format!("创建输出目录 {} 失败: {e}", parent.display()))?;
@@ -182,8 +173,8 @@ pub async fn get_files(
                 }
             }
             Err(e) => {
-                // 任何一处读不出来都必须让整轮停下来：「没扫到」在 delete_old_files
-                // 眼里等于「用户把它删了」，一个权限错误就会清掉这一支的产物和知识库文档。
+                // 任何一处读不出来都要中止：「没扫到」在 delete_old_files 眼里
+                // 等于「用户删了」，一个权限错误就会清掉这一支的产物与知识库文档。
                 let at = e
                     .path()
                     .map(|p| p.display().to_string())
@@ -197,10 +188,8 @@ pub async fn get_files(
     Ok(files)
 }
 
-/// 挑出本轮真正要处理的文件，顺带把没变化的文件的 run_id 刷成本轮。
-///
-/// 「本轮扫到过」只能靠刷新 run_id 表达（delete_old_files 靠 run_id < 本轮 判定
-/// 「上轮见过、这轮没了」）。跳过的文件不刷新，下一轮就会被当成用户已删除。
+/// 挑出本轮要处理的文件；没变化的也要把 run_id 刷成本轮 ——「本轮扫到过」
+/// 只能靠 run_id 表达，不刷新的话下一轮会被当成用户已删除。
 async fn select_pending<'a>(
     config: &sync_config::SyncConfig,
     files: &'a [db_model::File],
@@ -286,8 +275,7 @@ pub async fn create_output_files(
 /// 清理「上轮见过、这轮没扫到」的文件。只清理我们自己造出来的东西，
 /// **绝不碰同步目录里的原始文档**。
 ///
-/// 单个文件失败不拖累其余，最后汇总成一个错误返回：整轮会非零退出、
-/// 计数器不推进，下一轮重试这些条目。
+/// 单个失败不拖累其余，最后汇总报错：整轮非零退出、计数器不推进，下轮重试。
 pub async fn delete_old_files(
     config: &sync_config::SyncConfig,
     conn: &mut database::Conn,
@@ -339,10 +327,8 @@ async fn cleanup_one_old_file(
         println!("已删除知识库文档: {rag_id}");
     }
 
-    // 路径定位不到输出目录（通常用户改过 sync_dir）：跳过产物清理，
-    // 但知识库与 DB 行照清，否则这一行会把整个清理步骤永久卡死。
-    // 用 output_relative_path 而不是 get_relative_path：产物名是换过扩展名的，
-    // 这里算错就等于「产物永远删不掉」，每轮都当成删失败。
+    // 定位不到输出目录（通常改过 sync_dir）：跳过产物清理，知识库与 DB 行照清，
+    // 否则这一行会把清理步骤永久卡死。
     match output_relative_path(&config.sync_dir, Path::new(&file.path)).await {
         Ok(rel) => {
             let output_file_path = Path::new(&config.output_dir).join(rel);
@@ -350,8 +336,7 @@ async fn cleanup_one_old_file(
                 Ok(()) => println!("已删除输出文件: {}", output_file_path.display()),
                 // 已经不在了正是预期结果（用户自己删过产物）
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                // 权限不足之类不能当成「不存在」：那样会删掉 DB 行，
-                // 产物从此永久失去关联、再也找不到。
+                // 权限不足之类不能当成「不存在」：那样会删掉 DB 行，产物永远失去关联。
                 Err(e) => {
                     return Err(format!(
                         "删除输出文件 {} 失败: {e}",

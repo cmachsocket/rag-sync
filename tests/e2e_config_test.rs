@@ -1,37 +1,6 @@
-//! 打真实服务、读仓库里那份 config.yml 的端到端测试。
-//!
-//! 和 sync_flow_test.rs 的分工：那里打的是手写 mock，验的是「我发出去的请求
-//! 形状对不对」；这里打的是 config.yml 里那两台真服务，验的是「服务端真的认
-//! 这些请求、真的返回能解析的响应」。mock 永远发现不了服务端改契约。
-//!
-//! 全部 `#[ignore]`：会消耗真实 MinerU 算力、写真实知识库。
-//!
-//! ```sh
-//! cargo test --test e2e_config_test -- --ignored --nocapture   # 配置 + 连通性，不写任何东西
-//! cargo test --test e2e_config_test probe -- --ignored --nocapture  # 单文件往返，结束自动删
-//! cargo test --test e2e_config_test full_sync -- --ignored --nocapture
-//! ```
-//!
-//! ## 副作用
-//!
-//! - `config_yml_*` / `real_services_are_reachable`：只读，不落任何东西。
-//! - `probe_...`：真传一份文档进知识库，结束时删掉；删不掉会在断言里报出来，
-//!   需要手工去 LightRAG 里收拾。
-//! - `full_sync_...`：把 sync_dir 下**全部**受支持的文件灌进知识库。这是生产入库
-//!   本身，不是「可以随便重跑」的测试，代价是真金白银的图谱抽取算力。
-//!
-//! ## full_sync 的续跑与限流
-//!
-//! 中途被 Ctrl-C / 断网打断后直接重跑即可：`create_output_files` 按 sha256 跳过
-//! 没变的文件，每个成功的又立刻落库，所以是从断点接着走，不会重传。
-//!
-//! `E2E_LIMIT=N` 只处理前 N 个 —— 这是给「想先看看跑得通不通」用的。它有个必须
-//! 知道的副作用：被截断掉的文件本轮不会刷新 run_id，下一轮就会被 `delete_old_files`
-//! 当成「用户已删除」而从知识库里清掉。所以限流跑完之后，测试会把扫到的所有文件
-//! 的 run_id 刷成本轮，堵掉这个洞。
-//!
-//! `E2E_ALLOW_DELETE=1` 才会真的执行 `delete_old_files`。默认不跑：那是唯一会
-//! 主动删知识库文档的步骤，测试不该默认打开它。
+//! cargo test --test e2e_config_test -- --ignored --nocapture           # 配置 + 连通性，只读
+//! cargo test --test e2e_config_test probe -- --ignored --nocapture     # 单文件往返，结束自动删
+//! cargo test --test e2e_config_test full_sync -- --ignored --nocapture # 全量入库，见下
 
 mod common;
 
@@ -165,11 +134,8 @@ fn mineru_would_reject(path: &std::path::Path) -> bool {
         || MINERU_ENGINE_BROKEN.contains(&lower.as_str())
 }
 
-/// 拿真实 sync_dir 里体积最小的、且真实 MinerU 收得下的文件 —— MinerU 得吃真
-/// 文档才有意义，越小这轮越快。
-///
-/// 刻意跳过 MinerU 拒收的类型：`create_output_files` 里 `mineru_tackle(...)?`
-/// 一失败就整轮中止，探针撞上必然红，而红的原因与服务无关。
+/// 真实 sync_dir 里体积最小、且真实 MinerU 收得下的文件。跳过 MinerU 拒收的类型：
+/// `mineru_tackle(...)?` 一失败就整轮中止，探针撞上必然红，而红的原因与服务无关。
 async fn smallest_parsable_file(sync_dir: &str) -> Option<PathBuf> {
     let mut best: Option<(u64, PathBuf)> = None;
     for entry in WalkDir::new(sync_dir).into_iter().filter_map(|e| e.ok()) {
@@ -282,13 +248,9 @@ async fn purge_probe(
     println!("  没在知识库里找到 {name}，无需清理");
 }
 
-/// 真实 LightRAG 按**扩展名**选解析器，而 `create_output_files` 把 MinerU 的
-/// markdown 产物沿用原始扩展名写盘、再按原名上传 —— 于是 `X.docx` 里装的是
-/// markdown 文本，服务端回 `File is not a valid DOCX document`；
-/// `.pdf` 回 `Stream has ended unexpectedly`。只有 `.md` 能过。
-///
-/// 断言的是**应该成立**的行为，所以现在是红的：产物命名改掉（或上传时改用
-/// `.md` 名）之后才会转绿。跑完无条件清理，不留残余。
+/// LightRAG 按**扩展名**选解析器，`X.docx` 里装 markdown 会回
+/// `File is not a valid DOCX document`，只有 `.md` 能过。
+/// 断言的是**应该成立**的行为，所以现在是红的：产物命名改掉之后才会转绿。
 #[tokio::test]
 #[ignore = "打真实 LightRAG，写入并删除一份文档"]
 async fn lightrag_accepts_mineru_markdown_output() {
@@ -355,11 +317,8 @@ async fn lightrag_accepts_mineru_markdown_output() {
     }
 }
 
-/// 单文件全链路：真 MinerU 转换 -> 写产物 -> 真 LightRAG 入库 -> 落库，
-/// 断言齐全，结束时把文档从知识库删掉。
-///
-/// 只把 sync_dir / output_dir 换成临时的：真服务、真凭据、真文档，但知识库里
-/// 不留痕。跑它先确认链路是通的，再去跑 full_sync。
+/// 单文件全链路：真 MinerU 转换 -> 写产物 -> 真 LightRAG 入库 -> 落库，结束即删。
+/// 只把 sync_dir / output_dir 换成临时的：真服务、真凭据、真文档，知识库里不留痕。
 #[tokio::test]
 #[ignore = "会往真实知识库写一份文档再删掉"]
 async fn probe_round_trip_against_real_services() {

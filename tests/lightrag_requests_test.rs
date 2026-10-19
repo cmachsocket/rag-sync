@@ -97,7 +97,7 @@ async fn login_with_empty_token_is_rejected() {
     ])
     .await;
 
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let err = RAGRequest::new(&client, &server.base_url, "u", "p")
         .await
         .err()
@@ -113,7 +113,7 @@ async fn login_with_empty_token_is_rejected() {
 
 #[tokio::test]
 async fn successful_login_sends_bearer_token() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(
             200,
@@ -141,7 +141,7 @@ async fn successful_login_sends_bearer_token() {
 
 #[tokio::test]
 async fn failed_login_surfaces_response_body() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, _d) = setup(vec![Route::post("/login").and(R::json(
         401,
         r#"{"detail":"Incorrect username or password"}"#,
@@ -162,7 +162,7 @@ async fn failed_login_surfaces_response_body() {
 
 #[tokio::test]
 async fn non_json_login_response_is_rejected() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::text(200, "not json at all")),
         Route::post("/documents/upload").once(),
@@ -182,7 +182,7 @@ async fn non_json_login_response_is_rejected() {
 
 #[tokio::test]
 async fn upload_returns_doc_id_after_polling() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(upload_ok("track-9")),
@@ -198,7 +198,7 @@ async fn upload_returns_doc_id_after_polling() {
 
 #[tokio::test]
 async fn upload_filename_is_basename() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(upload_ok("t1")),
@@ -219,7 +219,7 @@ async fn upload_filename_is_basename() {
 
 #[tokio::test]
 async fn upload_non_success_status_is_failure() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(R::json(
@@ -245,7 +245,7 @@ async fn upload_non_success_status_is_failure() {
 
 #[tokio::test]
 async fn upload_401_is_not_retried() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     // 401 重试没有意义（凭据错），只会把真实错误掩盖成一次冲突失败
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
@@ -270,7 +270,7 @@ async fn upload_401_is_not_retried() {
 
 #[tokio::test]
 async fn background_failure_surfaces_error_msg() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(upload_ok("t1")),
@@ -298,7 +298,7 @@ async fn background_failure_surfaces_error_msg() {
 
 #[tokio::test]
 async fn conflict_409_deletes_then_reuploads() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         // 第一次上传：409；第二次：成功
@@ -354,7 +354,7 @@ async fn conflict_409_deletes_then_reuploads() {
 
 #[tokio::test]
 async fn conflict_409_without_list_entry_reports_input_dir() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(R::json(
@@ -381,7 +381,7 @@ async fn conflict_409_without_list_entry_reports_input_dir() {
 
 #[tokio::test]
 async fn conflict_409_with_multiple_matches_refuses_to_delete() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(R::json(409, r#"{"detail":"dup"}"#)),
@@ -409,7 +409,7 @@ async fn conflict_409_with_multiple_matches_refuses_to_delete() {
 
 #[tokio::test]
 async fn conflict_409_retries_only_once() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     // 只重试一次：再循环下去只是把一次失败拖成无数次请求
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
@@ -444,7 +444,7 @@ async fn conflict_409_retries_only_once() {
 
 #[tokio::test]
 async fn delete_busy_fails_without_polling() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::delete("/documents/delete_document")
@@ -469,7 +469,7 @@ async fn delete_busy_fails_without_polling() {
 
 #[tokio::test]
 async fn delete_unknown_status_is_failure() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::delete("/documents/delete_document")
@@ -483,7 +483,7 @@ async fn delete_unknown_status_is_failure() {
 
 #[tokio::test]
 async fn delete_waits_for_doc_to_disappear() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::delete("/documents/delete_document").and(R::json(
@@ -508,7 +508,7 @@ async fn delete_waits_for_doc_to_disappear() {
 
 #[tokio::test]
 async fn document_exists_reads_all_pages() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/paginated")
@@ -550,7 +550,7 @@ async fn document_exists_reads_all_pages() {
 
 #[tokio::test]
 async fn find_by_filename_matches_stored_basename() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/paginated").and(R::json(
@@ -573,7 +573,7 @@ async fn find_by_filename_matches_stored_basename() {
 
 #[tokio::test]
 async fn find_by_filename_returns_all_case_matches() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/paginated").and(R::json(
@@ -596,7 +596,7 @@ async fn find_by_filename_returns_all_case_matches() {
 
 #[tokio::test]
 async fn pagination_non_2xx_surfaces_body() {
-    let client = reqwest::Client::new();
+    let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/paginated").and(R::json(503, r#"{"detail":"维护中"}"#)),

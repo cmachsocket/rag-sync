@@ -10,9 +10,8 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 建一个带超时的 HTTP 客户端。
 ///
-/// reqwest 默认既不限制连接时间也不限制读取时间，主机不可达时会一直挂着；
-/// 轮询里的上限只在请求返回之后才检查得到，挡不住不回包的服务端。
-/// 这里不设整体 `timeout()`：`put_content` 是流式上传大文件，整体超时会把它腰斩。
+/// reqwest 默认不限制连接与读取时间，而轮询里的上限只在请求返回之后才检查得到，
+/// 挡不住不回包的服务端。不设整体 `timeout()`：`put_content` 是流式上传大文件。
 pub fn client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)

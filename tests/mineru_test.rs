@@ -119,7 +119,7 @@ async fn new_file_uploads_content_then_completes() {
     )
     .await;
 
-    let md = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let md = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap();
     assert_eq!(md, "# 转换结果");
@@ -167,7 +167,7 @@ async fn idempotent_hit_skips_content_upload() {
     )
     .await;
 
-    mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap();
     assert_eq!(
@@ -195,7 +195,7 @@ async fn idempotent_hit_without_file_is_error() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -214,7 +214,7 @@ async fn missing_sha256_rejected_before_upload() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -233,7 +233,7 @@ async fn vanished_file_reports_path() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -255,7 +255,7 @@ async fn upload_rejected_surfaces_status_and_body() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -279,7 +279,7 @@ async fn empty_error_body_is_labelled() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -302,7 +302,7 @@ async fn complete_non_terminal_is_error() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -337,7 +337,7 @@ async fn parse_running_polls_then_fetches_artifact() {
     )
     .await;
 
-    let md = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let md = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap();
     assert_eq!(md, "# 正文\n");
@@ -368,7 +368,7 @@ async fn parse_failed_surfaces_file_error() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -401,7 +401,7 @@ async fn parse_cancelled_is_failure() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -433,7 +433,7 @@ async fn null_inline_content_falls_back_to_artifact() {
     .await;
 
     assert_eq!(
-        mineru_tackle(&reqwest::Client::new(), &file, &cfg).await.unwrap(),
+        mineru_tackle(&MockServer::client(), &file, &cfg).await.unwrap(),
         "abcd"
     );
     assert_eq!(server.count_to("GET", "/v1/files/out-2/content"), 1);
@@ -459,7 +459,7 @@ async fn no_content_and_no_artifact_is_error() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -484,7 +484,7 @@ async fn parse_response_without_files_is_error() {
     )
     .await;
 
-    let err = mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap_err()
         .to_string();
@@ -517,7 +517,7 @@ async fn artifact_content_is_plain_text() {
     .await;
 
     assert_eq!(
-        mineru_tackle(&reqwest::Client::new(), &file, &cfg).await.unwrap(),
+        mineru_tackle(&MockServer::client(), &file, &cfg).await.unwrap(),
         "标题\n\n正文 **加粗**"
     );
 }
@@ -545,7 +545,7 @@ async fn large_file_uploads_with_declared_length() {
     )
     .await;
 
-    mineru_tackle(&reqwest::Client::new(), &file, &cfg)
+    mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
         .unwrap();
     let put = &server.requests_to("PUT", "/v1/uploads/up-1/content")[0];
