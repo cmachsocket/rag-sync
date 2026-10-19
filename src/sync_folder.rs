@@ -17,6 +17,26 @@ use walkdir::WalkDir;
 
 pub const NOT_IN_DB: i32 = 0;
 
+/// 直接透传、不走 MinerU 的扩展名。纯文本送进解析器只会被原样吐回来，
+/// 却要搭上一次上传 + 解析的等待和一次失败的可能。
+const PASSTHROUGH_EXTS: [&str; 3] = ["txt", "md", "markdown"];
+
+/// 该文件走透传就返回原文，否则返回 None。
+async fn passthrough_content(file_path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let is_text = file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| PASSTHROUGH_EXTS.contains(&ext.to_ascii_lowercase().as_str()));
+    if !is_text {
+        return Ok(None);
+    }
+    // 非 UTF-8 按替换字符处理：坏一个字节不该让整个文件同步失败
+    let bytes = fs::read(file_path)
+        .await
+        .map_err(|e| format!("读取透传文件 {} 失败: {e}", file_path.display()))?;
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
 /// 供 `tests/` 直接调用：sha256 是「文件变了没有」的唯一判据，不能只测调用方。
 pub async fn sha256_file(path: &str) -> io::Result<String> {
     let mut file = FsFile::open(path).await?;
@@ -58,11 +78,56 @@ pub async fn get_relative_path(
     Ok(relative_path.to_string_lossy().into_owned())
 }
 
+/// 产物在 output_dir 里的相对路径。
+///
+/// 两件事必须同时成立：
+///
+/// 1. **必须以 `.md` 收尾**。MinerU 的产物是 markdown 文本，而 LightRAG 按扩展名
+///    选解析器：`X.docx` 里装 markdown 会被判成
+///    `File is not a valid DOCX document`，`X.pdf` 则是
+///    `Stream has ended unexpectedly`。只有 `.md` 能过。
+/// 2. **原扩展名要留在中间段**。同一目录下 `竞选.pdf` 与 `竞选.pptx` 这种同名主干
+///    很常见（实测 sync_dir 里有 5 组）。都改成 `竞选.md` 会互相覆盖产物，
+///    上传时再撞 409 自愈，把先传成功的那份**从知识库里删掉** —— 静默丢一份文档。
+///    `竞选.pdf.md` / `竞选.pptx.md` 既唯一又以 `.md` 结尾。
+///    源文件本来就是 `.md` 的不加中间段，否则 `X.md` 与 `X.md.md` 会撞在一起。
+///
+/// 映射只依赖源路径本身，不依赖同批次的其他文件：`cleanup_one_old_file` 手上只有
+/// 一条 DB 记录，也必须算出同一个产物路径，否则删产物会找不到文件。
+pub async fn output_relative_path(
+    root_dir: &str,
+    file_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let rel = get_relative_path(root_dir, file_path).await?;
+    let rel_path = Path::new(&rel);
+    let stem = rel_path
+        .file_stem()
+        .ok_or_else(|| format!("无法从 {rel} 取到文件名主干（隐藏文件?）"))?
+        .to_string_lossy()
+        .into_owned();
+    let ext = rel_path
+        .extension()
+        .ok_or_else(|| format!("{rel} 没有扩展名，不该出现在扫描结果里"))?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let name = if ext == "md" {
+        format!("{stem}.md")
+    } else {
+        format!("{stem}.{ext}.md")
+    };
+    Ok(rel_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(name)
+        .to_string_lossy()
+        .into_owned())
+}
+
 async fn create_output_dir(
     config: &sync_config::SyncConfig,
     file_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let rel = get_relative_path(&config.sync_dir, file_path).await?;
+    let rel = output_relative_path(&config.sync_dir, file_path).await?;
     let output_file_path = Path::new(&config.output_dir).join(rel);
     let parent = output_file_path.parent().ok_or_else(|| {
         format!("无法获取输出文件的父目录: {}", output_file_path.display())
@@ -181,9 +246,15 @@ pub async fn create_output_files(
     for file in todo {
         let file_path = Path::new(&file.path);
         create_output_dir(config, file_path).await?;
-        let markdown = mineru_tackle(&client, file, config).await?;
+        let markdown = match passthrough_content(file_path).await? {
+            Some(content) => {
+                println!("[透传] {} 已跳过 MinerU", file_path.display());
+                content
+            }
+            None => mineru_tackle(&client, file, config).await?,
+        };
 
-        let rel = get_relative_path(&config.sync_dir, file_path).await?;
+        let rel = output_relative_path(&config.sync_dir, file_path).await?;
         let output_file_path = Path::new(&config.output_dir).join(rel);
         fs::write(&output_file_path, &markdown).await.map_err(|e| {
             format!("写入输出文件 {} 失败: {e}", output_file_path.display())
@@ -270,7 +341,9 @@ async fn cleanup_one_old_file(
 
     // 路径定位不到输出目录（通常用户改过 sync_dir）：跳过产物清理，
     // 但知识库与 DB 行照清，否则这一行会把整个清理步骤永久卡死。
-    match get_relative_path(&config.sync_dir, Path::new(&file.path)).await {
+    // 用 output_relative_path 而不是 get_relative_path：产物名是换过扩展名的，
+    // 这里算错就等于「产物永远删不掉」，每轮都当成删失败。
+    match output_relative_path(&config.sync_dir, Path::new(&file.path)).await {
         Ok(rel) => {
             let output_file_path = Path::new(&config.output_dir).join(rel);
             match tokio::fs::remove_file(&output_file_path).await {

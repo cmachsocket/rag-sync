@@ -10,7 +10,7 @@ use rag_sync::lightrag_requests::canonical_basename;
 use rag_sync::sync_folder::{create_output_files, delete_old_files, get_files};
 
 fn rag_routes(doc_id: &str) -> Vec<Route> {
-    vec![
+    return vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload")
             .and(R::json(200, r#"{"status":"success","message":"ok","track_id":"tr-1"}"#)),
@@ -25,7 +25,7 @@ fn rag_routes(doc_id: &str) -> Vec<Route> {
 }
 
 fn mineru_routes(md: &str) -> Vec<Route> {
-    vec![
+    return vec![
         Route::post("/v1/uploads")
             .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
         Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
@@ -137,7 +137,7 @@ async fn changed_content_is_reprocessed() {
     let src = env.write_source("a.pdf", "第一次的内容");
 
     sync_once(&env, &mut db, 1).await;
-    assert_eq!(env.output_text("a.pdf"), "# 第一版");
+    assert_eq!(env.output_text("a.pdf.md"), "# 第一版");
 
     // 用户改了文件
     std::fs::write(&src, "完全不同的内容").unwrap();
@@ -243,7 +243,7 @@ async fn cleanup_skips_service_when_nothing_is_old() {
         before,
         "没东西要清就别登录 —— 否则 LightRAG 挂掉会连一轮空同步都跑不完"
     );
-    assert!(env.output_path("a.pdf").exists(), "本轮文件的产物要留着");
+    assert!(env.output_path("a.pdf.md").exists(), "本轮文件的产物要留着");
     assert!(
         DBfunc::file_exists(&mut db.conn, &format!("{}/a.pdf", env.sync_dir))
             .await
@@ -261,7 +261,7 @@ async fn current_run_files_are_never_cleaned() {
 
     delete_old_files(&env.config(5), &mut db.conn).await.unwrap();
 
-    assert!(env.output_path("a.pdf").exists());
+    assert!(env.output_path("a.pdf.md").exists());
     assert_eq!(server.count_to("DELETE", "/documents/delete_document"), 0);
 }
 

@@ -79,8 +79,13 @@ pub struct DocStatusResponse {
     /// DocStatus 枚举：pending / parsing / analyzing / processing /
     /// preprocessed / processed / failed。值是小写。
     pub status: String,
+    /// **有符号**：失败的文档服务端给 `-1`（实测 track_status 与
+    /// documents/paginated 都这样）。写成 `u64` 会让**整个**响应反序列化失败
+    /// ——paginated 列表里只要有一条 failed 文档，`document_exists` /
+    /// `find_doc_ids_by_filename` / `delete_document` 就全挂，等于知识库里
+    /// 存在一条失败记录时再也删不掉任何东西。
     #[serde(default)]
-    pub chunks_count: Option<u64>,
+    pub chunks_count: Option<i64>,
     #[serde(default)]
     pub error_msg: Option<String>,
     #[serde(default)]

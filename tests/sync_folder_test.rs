@@ -8,7 +8,9 @@ mod common;
 use common::{test_db, Env};
 use rag_sync::database::DBfunc;
 use rag_sync::http_util;
-use rag_sync::sync_folder::{delete_old_files, get_files, get_relative_path, sha256_file};
+use rag_sync::sync_folder::{
+    delete_old_files, get_files, get_relative_path, output_relative_path, sha256_file,
+};
 use std::path::Path;
 
 // ---------------------------------------------------------------- sha256
@@ -268,6 +270,72 @@ async fn http_client_times_out_on_silent_server() {
     );
 }
 
+// ================================================================ 产物命名
+//
+// MinerU 的产物是 markdown 文本，LightRAG 按扩展名选解析器，产物名必须以
+// `.md` 收尾。但直接改成 `X.md` 会让同目录同名主干的文件互相覆盖，
+// 保留原扩展名作中间段才是唯一无损的映射。
+
+#[tokio::test]
+async fn output_relative_path_switches_to_markdown() {
+    assert_eq!(
+        output_relative_path("/root", Path::new("/root/a.pdf"))
+            .await
+            .unwrap(),
+        "a.pdf.md"
+    );
+}
+
+#[tokio::test]
+async fn output_relative_path_keeps_nested_dirs() {
+    assert_eq!(
+        output_relative_path("/root", Path::new("/root/2024/一季度/a.docx"))
+            .await
+            .unwrap(),
+        "2024/一季度/a.docx.md"
+    );
+}
+
+/// 同名主干（`竞选.pdf` / `竞选.pptx`）不能映射到同一个产物名，否则后写的
+/// 覆盖先写的，上传时还会 409 自愈把先传成功的那份从知识库里删掉。
+#[tokio::test]
+async fn output_relative_path_avoids_stem_collisions() {
+    let from_pdf = output_relative_path("/root", Path::new("/root/竞选/竞选.pdf"))
+        .await
+        .unwrap();
+    let from_pptx = output_relative_path("/root", Path::new("/root/竞选/竞选.pptx"))
+        .await
+        .unwrap();
+    assert_ne!(from_pdf, from_pptx, "同名主干必须映射到不同产物名");
+    assert!(from_pdf.ends_with(".md") && from_pptx.ends_with(".md"));
+}
+
+/// 源文件本来就是 `.md` 的不加中间段，否则 `X.md` 会和 `X.md.md` 撞在一起。
+#[tokio::test]
+async fn output_relative_path_does_not_double_markdown_suffix() {
+    assert_eq!(
+        output_relative_path("/root", Path::new("/root/发言稿.md"))
+            .await
+            .unwrap(),
+        "发言稿.md"
+    );
+}
+
+/// 映射只能依赖源路径本身：cleanup_one_old_file 手上只有一条 DB 记录，
+/// 也得算出同一个产物名，否则删产物永远找不到文件。
+#[tokio::test]
+async fn output_relative_path_is_stable_across_calls() {
+    let first = output_relative_path("/root", Path::new("/root/x/a.docx"))
+        .await
+        .unwrap();
+    let second = output_relative_path("/root", Path::new("/root/x/a.docx"))
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+}
+
+// ================================================================ 清理
+
 #[tokio::test]
 async fn undeletable_artifact_keeps_db_row() {
     // 「产物删不掉」和「产物不存在」必须区别对待：当成不存在就等于删掉 DB 行，
@@ -275,7 +343,9 @@ async fn undeletable_artifact_keeps_db_row() {
     let mut db = test_db().await;
     let env = Env::new();
     let src = env.write_source("a.pdf", "原件");
-    std::fs::create_dir_all(env.output_path("a.pdf")).unwrap();
+    // 放的是产物真正所在的位置：产物名换过扩展名，写 a.pdf 的话 remove_file
+    // 拿到的是 NotFound，会被当成「已经不在了」而静默跳过，测试假绿。
+    std::fs::create_dir_all(env.output_path("a.pdf.md")).unwrap();
     db.insert_file_row(1, &src, "sha", 1, Some("doc-1")).await;
 
     let server = common::MockServer::start(vec![

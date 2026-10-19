@@ -28,7 +28,7 @@ fn track_terminal(doc_id: &str) -> Route {
 }
 
 fn mineru_routes(markdown: &str) -> Vec<Route> {
-    vec![
+    return vec![
         Route::post("/v1/uploads")
             .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
         Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
@@ -70,14 +70,20 @@ async fn new_file_end_to_end() {
         .unwrap();
 
     assert_eq!(out.len(), 1);
-    assert_eq!(env.output_text("a.pdf"), "# 标题\n\n正文", "产物内容应原样落盘");
+    assert_eq!(
+        env.output_text("a.pdf.md"),
+        "# 标题\n\n正文",
+        "产物内容应原样落盘"
+    );
     assert!(out[0].starts_with(&env.output_dir));
 
-    // 上传给 LightRAG 的就是刚写出来的产物文件
+    // 上传给 LightRAG 的就是刚写出来的产物文件，文件名以 .md 收尾：
+    // LightRAG 按扩展名选解析器，产物里装的是 markdown，带 .docx 会判成
+    // "File is not a valid DOCX document"。
     let upload = server.requests_to("POST", "/documents/upload");
     assert_eq!(upload.len(), 1);
     assert!(
-        upload[0].body_str().contains(r#"filename="a.pdf""#),
+        upload[0].body_str().contains(r#"filename="a.pdf.md""#),
         "{}",
         upload[0].body_str()
     );
@@ -103,7 +109,79 @@ async fn nested_layout_preserved_in_output() {
         .await
         .unwrap();
 
-    assert!(env.output_path("2024/一季度/a.pdf").exists());
+    assert!(env.output_path("2024/一季度/a.pdf.md").exists());
+}
+
+#[tokio::test]
+async fn txt_md_and_markdown_are_passed_through() {
+    let mut db = common::test_db().await;
+    let (env, server) = env_with_services("# MinerU 的产物").await;
+    let md = "# 标题\n\n正文 **加粗**\n";
+    let txt = "纯文本第一行\n纯文本第二行\n";
+    let markdown = "### 三级标题\n";
+    env.write_source("a.md", md);
+    env.write_source("b.txt", txt);
+    env.write_source("c.markdown", markdown);
+    env.write_source("d.pdf", "pdf 内容");
+
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    create_output_files(&env.config(1), &files, &mut db.conn)
+        .await
+        .unwrap();
+
+    // 产物内容与原文逐字一致，没有经过 MinerU
+    assert_eq!(env.output_text("a.md"), md);
+    assert_eq!(env.output_text("b.txt.md"), txt);
+    assert_eq!(env.output_text("c.markdown.md"), markdown);
+    // pdf 照旧走 MinerU，产物名不变
+    assert_eq!(env.output_text("d.pdf.md"), "# MinerU 的产物");
+
+    // 只有 pdf 碰过 MinerU；四个文件都上传了 LightRAG
+    assert_eq!(
+        server.count_to("POST", "/v1/uploads"),
+        1,
+        "txt / md / markdown 不该发往 MinerU"
+    );
+    assert_eq!(
+        server.count_to("POST", "/documents/upload"),
+        4,
+        "透传的文件照样要进知识库"
+    );
+    let uploaded: Vec<String> = server
+        .requests_to("POST", "/documents/upload")
+        .iter()
+        .map(|r| {
+            let b = r.body_str();
+            let s = b.find("filename=\"").unwrap() + "filename=\"".len();
+            b[s..b[s..].find('"').unwrap() + s].to_string()
+        })
+        .collect();
+    assert!(uploaded.contains(&"a.md".to_string()), "{uploaded:?}");
+    assert!(uploaded.contains(&"b.txt.md".to_string()), "{uploaded:?}");
+    assert!(uploaded.contains(&"c.markdown.md".to_string()), "{uploaded:?}");
+
+    // 透传的文件也照常落库
+    let src = env.write_source("a.md", md);
+    let row = DBfunc::get_file(&mut db.conn, &src).await.unwrap().unwrap();
+    assert_eq!(row.rag_id.as_deref(), Some("doc-1"));
+}
+
+#[tokio::test]
+async fn passthrough_is_case_insensitive() {
+    let mut db = common::test_db().await;
+    let (env, server) = env_with_services("x").await;
+    let body = "大写扩展名\n";
+    env.write_source("NOTES.TXT", body);
+
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    assert_eq!(files.len(), 1, "大写扩展名也要被扫到");
+
+    create_output_files(&env.config(1), &files, &mut db.conn)
+        .await
+        .unwrap();
+
+    assert_eq!(env.output_text("NOTES.txt.md"), body);
+    assert_eq!(server.count_to("POST", "/v1/uploads"), 0);
 }
 
 #[tokio::test]
@@ -147,7 +225,10 @@ async fn mineru_failure_writes_nothing() {
         .to_string();
 
     assert!(err.contains("a.pdf"), "{err}");
-    assert!(!env.output_path("a.pdf").exists(), "失败时不该留下空产物");
+    assert!(
+        !env.output_path("a.pdf.md").exists(),
+        "失败时不该留下空产物"
+    );
     assert!(
         !DBfunc::file_exists(&mut db.conn, &src).await.unwrap(),
         "失败的文件不能记成已入库"

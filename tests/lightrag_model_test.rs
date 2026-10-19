@@ -194,6 +194,44 @@ fn missing_optional_fields_default_to_none() {
     assert_eq!(r.metadata, None);
 }
 
+/// 真实 LightRAG 给失败的文档 `chunks_count: -1`。写成 u64 时整个响应解析失败，
+/// 而 paginated 列表里混一条 failed 就足以让 `document_exists` / 删除 / 409 自愈
+/// 全部瘫痪 —— 曾经真的发生过：知识库里躺着一条解析失败的文档，
+/// rag-sync 就再也删不掉任何东西了。
+#[test]
+fn failed_document_negative_chunks_count_parses() {
+    let s = serde_json::json!({
+        "track_id": "t", "total_count": 2,
+        "status_summary": {"processed": 1, "failed": 1},
+        "documents": [
+            {"id": "ok", "status": "processed", "file_path": "a.md", "chunks_count": 6},
+            {"id": "bad", "status": "failed", "file_path": "b.docx.md",
+             "chunks_count": -1, "error_msg": "File is not a valid DOCX document"}
+        ]
+    });
+    let r: TrackResponse = serde_json::from_str(&s.to_string()).unwrap();
+    assert_eq!(r.documents.len(), 2);
+    assert_eq!(r.documents[0].chunks_count, Some(6));
+    assert_eq!(r.documents[1].chunks_count, Some(-1i64));
+    assert_eq!(r.first_error(), Some("File is not a valid DOCX document"));
+    assert!(r.is_finished(), "failed 也是终态");
+}
+
+/// 同一个字段在 documents/paginated 的响应里也是 -1，走的是同一个结构体。
+#[test]
+fn paginated_page_with_failed_document_parses() {
+    let s = serde_json::json!({
+        "documents": [
+            {"id": "ok", "status": "processed", "file_path": "a.md", "chunks_count": 6},
+            {"id": "bad", "status": "failed", "file_path": "b.docx.md", "chunks_count": -1}
+        ],
+        "pagination": {"page": 1, "total_pages": 1, "total_count": 2, "has_next": false}
+    });
+    let r: PaginatedDocsResponse = serde_json::from_str(&s.to_string()).unwrap();
+    assert_eq!(r.documents.len(), 2);
+    assert_eq!(r.documents[1].chunks_count, Some(-1i64));
+}
+
 // ---------------------------------------------------------------- 删除
 
 #[test]
