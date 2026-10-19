@@ -136,17 +136,16 @@ impl<'a> RAGRequest<'a> {
         }
         Ok(login_response.access_token)
     }
-    async fn _upload(&self, file_path: &str) -> Result<String, UploadError> {
+    async fn _upload(&self, file_path: &str, upload_name: &str) -> Result<String, UploadError> {
         let upload_url = format!("{}/documents/upload", self.url);
         let file = tokio::fs::File::open(file_path)
             .await
             .map_err(|e| UploadError::fatal(format!("打开文件失败: {e}")))?;
         let stream = FramedRead::new(file, tokio_util::codec::BytesCodec::new());
         let body = reqwest::Body::wrap_stream(stream);
-        // file_name 必须给 basename：服务端拿它判同名，传整条路径会让判重和落盘跑偏
-        // mime_str 不用设，服务端只看扩展名
-        let name = basename(file_path);
-        let part = reqwest::multipart::Part::stream(body).file_name(name);
+        // file_name 必须只给文件名部分：传整条路径会让服务端的判重与落盘跑偏。
+        // 传的是什么名，就是服务端拿来判同名的键，也是 409 反查时要比对的那个。
+        let part = reqwest::multipart::Part::stream(body).file_name(upload_name.to_string());
         let form = reqwest::multipart::Form::new().part("file", part);
         let resp = self
             .client
@@ -372,17 +371,31 @@ impl<'a> RAGRequest<'a> {
         }
     }
 
-    /// 上传并等待后台处理完成，返回 doc_id。
+    /// 上传并等待后台处理完成，返回 doc_id。上传名取本地路径的 basename。
     ///
     /// 409 的清理由这里做：调用方只有本地路径，判不出该删哪个 doc_id。
     pub async fn upload_file(&self, file_path: &str) -> Result<String, Box<dyn std::error::Error>> {
         let name = basename(file_path);
-        let track_id = match self._upload(file_path).await {
+        self.upload_file_as(file_path, &name).await
+    }
+
+    /// 与 [`RAGRequest::upload_file`] 相同，但用指定的名字上传。
+    ///
+    /// 多同步目录共用一个 output_dir 时必须走这里：服务端的唯一键是**文件名**，
+    /// 本地路径它只取 basename，因此产物所在的子目录区分不开两个目录下的同名文件 ——
+    /// 后传的那个会 409，然后自愈流程把先传成功的那份删掉。调用方要带上别名前缀。
+    pub async fn upload_file_as(
+        &self,
+        file_path: &str,
+        upload_name: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let name = upload_name.to_string();
+        let track_id = match self._upload(file_path, upload_name).await {
             Ok(track_id) => track_id,
             // 只重试一次：再 409 说明有别的成因，循环只是白打请求。
             Err(UploadError::Conflict(detail)) => {
                 self.remove_conflicting(&name, &detail).await?;
-                self._upload(file_path)
+                self._upload(file_path, upload_name)
                     .await
                     .map_err(|e| e.into_err(&format!("清理同名冲突后重传 {file_path} 仍失败")))?
             }

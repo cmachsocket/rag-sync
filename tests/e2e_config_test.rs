@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use rag_sync::database::{self, DBfunc};
 use rag_sync::http_util;
 use rag_sync::lightrag_requests::RAGRequest;
-use rag_sync::sync_config::SyncConfig;
+use rag_sync::sync_config::{SyncConfig, SyncFolder};
 use rag_sync::sync_folder::{create_output_files, delete_old_files, get_files, is_supported_file};
 use rag_sync::db_model;
 use walkdir::WalkDir;
@@ -48,21 +48,25 @@ fn env_flag(name: &str) -> bool {
 async fn config_yml_loads_with_expanded_paths() {
     let config = real_config().await;
 
-    for (键, 值) in [
-        ("sync_dir", &config.sync_dir),
-        ("output_dir", &config.output_dir),
-    ] {
+    assert!(!config.sync_folders.is_empty(), "至少要配一个同步目录");
+    for folder in &config.sync_folders {
         assert!(
-            PathBuf::from(值).is_absolute(),
-            "{键} 必须是绝对路径（`~` 没展开?）: {值}"
+            PathBuf::from(&folder.path).is_absolute(),
+            "别名 {} 的 path 必须是绝对路径（`~` 没展开?）: {}",
+            folder.name,
+            folder.path
         );
-        assert!(!值.contains("~"), "{键} 里还留着未展开的 `~`: {值}");
+        assert!(!folder.path.contains("~"), "{} 里还留着未展开的 `~`", folder.name);
+        assert!(
+            std::path::Path::new(&folder.path).is_dir(),
+            "别名 {} 的同步目录不存在: {}",
+            folder.name,
+            folder.path
+        );
     }
-    assert!(
-        std::path::Path::new(&config.sync_dir).is_dir(),
-        "sync_dir 不存在: {}",
-        config.sync_dir
-    );
+    // 产物目录共用一个，别名是区分它的唯一手段
+    assert!(PathBuf::from(&config.output_dir).is_absolute());
+    assert!(!config.output_dir.contains("~"));
     assert!(!config.mineru_url.is_empty(), "mineru_url 不能为空");
     assert!(!config.lightrag_url.is_empty(), "lightrag_url 不能为空");
 
@@ -135,21 +139,25 @@ fn mineru_would_reject(path: &std::path::Path) -> bool {
         || MINERU_ENGINE_BROKEN.contains(&lower.as_str())
 }
 
-/// 真实 sync_dir 里体积最小、且真实 MinerU 收得下的文件。跳过 MinerU 拒收的类型：
+/// 所有同步目录里体积最小、且真实 MinerU 收得下的文件。跳过 MinerU 拒收的类型：
 /// `mineru_tackle(...)?` 一失败就整轮中止，探针撞上必然红，而红的原因与服务无关。
-async fn smallest_parsable_file(sync_dir: &str) -> Option<PathBuf> {
+async fn smallest_parsable_file(
+    folders: &[SyncFolder],
+) -> Option<PathBuf> {
     let mut best: Option<(u64, PathBuf)> = None;
-    for entry in WalkDir::new(sync_dir).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_dir()
-            || !is_supported_file(entry.path()).await
-            || mineru_would_reject(entry.path())
-        {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        let size = meta.len();
-        if best.as_ref().is_none_or(|(b, _)| size < *b) {
-            best = Some((size, entry.path().to_path_buf()));
+    for folder in folders {
+        for entry in WalkDir::new(&folder.path).into_iter().filter_map(|e| e.ok()) {
+            if entry.file_type().is_dir()
+                || !is_supported_file(entry.path()).await
+                || mineru_would_reject(entry.path())
+            {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let size = meta.len();
+            if best.as_ref().is_none_or(|(b, _)| size < *b) {
+                best = Some((size, entry.path().to_path_buf()));
+            }
         }
     }
     best.map(|(_, p)| p)
@@ -163,15 +171,17 @@ async fn mineru_contract_gaps_would_abort_the_full_run() {
     let real = real_config().await;
     let mut by_ext: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
-    for entry in WalkDir::new(&real.sync_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_dir() || !is_supported_file(entry.path()).await {
-            continue;
-        }
-        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-            *by_ext.entry(ext.to_ascii_lowercase()).or_insert(0usize) += 1;
+    for folder in &real.sync_folders {
+        for entry in WalkDir::new(&folder.path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_dir() || !is_supported_file(entry.path()).await {
+                continue;
+            }
+            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+                *by_ext.entry(ext.to_ascii_lowercase()).or_insert(0usize) += 1;
+            }
         }
     }
 
@@ -270,19 +280,16 @@ async fn lightrag_accepts_mineru_markdown_output() {
     let root = tempfile::tempdir().unwrap();
     let src = root.path().join(format!("rag_sync_extprobe_{}.docx", std::process::id()));
     std::fs::write(&src, "占位").unwrap();
-    let name = rag_sync::sync_folder::output_relative_path(root.path().to_str().unwrap(), &src)
+    let name = rag_sync::sync_folder::output_relative_path(root.path().to_str().unwrap(), "probe", &src)
         .await
         .unwrap();
     assert!(name.ends_with(".md"), "产物名必须以 .md 收尾，实际 {name}");
     let path = root.path().join(&name);
     std::fs::write(&path, "# 标题\n\n正文段落。\n".repeat(20)).unwrap();
-    let name = PathBuf::from(&name)
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    // 上传名带别名前缀，与生产链路一致
+    let name = rag_sync::sync_folder::upload_name("probe", &name);
 
-    let result = rag.upload_file(path.to_str().unwrap()).await;
+    let result = rag.upload_file_as(path.to_str().unwrap(), &name).await;
 
     match result {
         Ok(_) => {}
@@ -325,11 +332,11 @@ async fn lightrag_accepts_mineru_markdown_output() {
 #[ignore = "需要真实 MinerU"]
 async fn mineru_job_round_trip_against_real_service() {
     let real = real_config().await;
-    let probe = match smallest_parsable_file(&real.sync_dir).await {
+    let probe = match smallest_parsable_file(&real.sync_folders).await {
         Some(path) => path,
         None => panic!(
             "{} 下没有 MinerU 收得下的受支持文件，没法探针",
-            real.sync_dir
+            real.alias_list()
         ),
     };
     println!(
@@ -347,6 +354,7 @@ async fn mineru_job_round_trip_against_real_service() {
         sha256,
         rag_id: None,
         run_id: 1,
+        output_rel_path: None,
     };
 
     let client = http_util::client().unwrap();
@@ -362,16 +370,16 @@ async fn mineru_job_round_trip_against_real_service() {
 }
 
 /// 单文件全链路：真 MinerU 转换 -> 写产物 -> 真 LightRAG 入库 -> 落库，结束即删。
-/// 只把 sync_dir / output_dir 换成临时的：真服务、真凭据、真文档，知识库里不留痕。
+/// 只把同步目录 / output_dir 换成临时的：真服务、真凭据、真文档，知识库里不留痕。
 #[tokio::test]
 #[ignore = "会往真实知识库写一份文档再删掉"]
 async fn probe_round_trip_against_real_services() {
     let real = real_config().await;
-    let probe = match smallest_parsable_file(&real.sync_dir).await {
+    let probe = match smallest_parsable_file(&real.sync_folders).await {
         Some(path) => path,
         None => panic!(
             "{} 下没有 MinerU 收得下的受支持文件，没法探针",
-            real.sync_dir
+            real.alias_list()
         ),
     };
     let size = std::fs::metadata(&probe).unwrap().len();
@@ -386,7 +394,10 @@ async fn probe_round_trip_against_real_services() {
     std::fs::copy(&probe, &src).unwrap();
 
     let config = SyncConfig {
-        sync_dir: sync_dir.to_string_lossy().into_owned(),
+        sync_folders: vec![SyncFolder {
+            name: "probe".into(),
+            path: sync_dir.to_string_lossy().into_owned(),
+        }],
         output_dir: output_dir.to_string_lossy().into_owned(),
         mineru_url: real.mineru_url.clone(),
         lightrag_url: real.lightrag_url.clone(),
@@ -398,16 +409,15 @@ async fn probe_round_trip_against_real_services() {
     let mut db = common::test_db().await;
     let files = get_files(&config, &mut db.conn).await.unwrap();
     assert_eq!(files.len(), 1, "探针目录里就该只有一个文件");
-    let out_name = PathBuf::from(
-        rag_sync::sync_folder::output_relative_path(&config.sync_dir, &src)
-            .await
-            .unwrap(),
+    let out_rel = rag_sync::sync_folder::output_relative_path(
+        &config.sync_folders[0].path,
+        &config.sync_folders[0].name,
+        &src,
     )
-    .file_name()
-    .unwrap()
-    .to_string_lossy()
-    .into_owned();
-    println!("产物名应为 {out_name}");
+    .await
+    .unwrap();
+    let out_name = rag_sync::sync_folder::upload_name(&config.sync_folders[0].name, &out_rel);
+    println!("产物名应为 {out_rel}，上传名应为 {out_name}");
 
     let outcome = create_output_files(&config, &files, &mut db.conn).await;
 

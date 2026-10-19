@@ -10,7 +10,7 @@ use rag_sync::database::DBfunc;
 use rag_sync::db_model::File;
 
 async fn insert_one_file(conn: &mut rag_sync::database::Conn) -> File {
-    DBfunc::insert_file(conn, "/sync/a.pdf", "sha-a", 1, Some("doc-1"))
+    DBfunc::insert_file(conn, "/sync/a.pdf", "sha-a", 1, Some("doc-1"), "probe/a.pdf.md")
         .await
         .unwrap();
     DBfunc::get_file(conn, "/sync/a.pdf").await.unwrap().unwrap()

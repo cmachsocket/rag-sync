@@ -9,12 +9,16 @@ use std::path::{Path, PathBuf};
 
 use diesel_async::SimpleAsyncConnection;
 use rag_sync::database::DBfunc;
-use rag_sync::sync_config::SyncConfig;
+use rag_sync::sync_config::{SyncConfig, SyncFolder};
 
 // ---------------------------------------------------------------- 临时目录 / 库
 
 /// 用真实的 migration 建表：避免「测试里写死一份 DDL、线上 schema 已经变了」的假绿。
-pub const MIGRATION_UP: &str = include_str!("../../migrations/2026-10-16-181726-0000_init/up.sql");
+/// 按版本号顺序执行，和 diesel 自己跑的顺序一致。
+pub const MIGRATIONS_UP: &[&str] = &[
+    include_str!("../../migrations/2026-10-16-181726-0000_init/up.sql"),
+    include_str!("../../migrations/2026-10-17-000000-0001_add_output_rel_path/up.sql"),
+];
 
 pub struct TestDb {
     pub conn: rag_sync::database::Conn,
@@ -26,11 +30,28 @@ pub struct TestDb {
 impl TestDb {
     /// 绕过 diesel 直接塞一条 files 记录，用来摆前置状态。
     /// 参数都是 SQL 字面量，测试自己控制，不构成注入面。
+    /// `output_rel_path` 传 None 就是「加列之前写入的行」。
     pub async fn insert_file_row(&mut self, id: i32, path: &str, sha256: &str, run_id: i32, rag_id: Option<&str>) {
+        self.insert_file_row_full(id, path, sha256, run_id, rag_id, None).await;
+    }
+
+    pub async fn insert_file_row_full(
+        &mut self,
+        id: i32,
+        path: &str,
+        sha256: &str,
+        run_id: i32,
+        rag_id: Option<&str>,
+        output_rel_path: Option<&str>,
+    ) {
         let rag = rag_id.map(|r| format!("'{r}'")).unwrap_or_else(|| "NULL".into());
+        let rel = output_rel_path
+            .map(|r| format!("'{r}'"))
+            .unwrap_or_else(|| "NULL".into());
         self.conn
             .batch_execute(&format!(
-                "INSERT INTO files (id, path, sha256, rag_id, run_id) VALUES ({id}, '{path}', '{sha256}', {rag}, {run_id});"
+                "INSERT INTO files (id, path, sha256, rag_id, run_id, output_rel_path) \
+                 VALUES ({id}, '{path}', '{sha256}', {rag}, {run_id}, {rel});"
             ))
             .await
             .unwrap();
@@ -64,7 +85,9 @@ pub async fn test_db() -> TestDb {
         .await
         .unwrap();
     let mut conn = conn;
-    conn.batch_execute(MIGRATION_UP).await.unwrap();
+    for up in MIGRATIONS_UP {
+        conn.batch_execute(up).await.unwrap();
+    }
     TestDb {
         conn,
         path,
@@ -75,10 +98,15 @@ pub async fn test_db() -> TestDb {
 // ---------------------------------------------------------------- 配置
 
 /// 指向临时目录的配置，URL 由 MockServer 填。
+///
+/// 默认带一个别名 `sync` 的同步目录，产物落在 `out/sync/`。
+/// `add_folder` 再加别名，用例里 `output_path` 仍按「别名 + rel」解析，
+/// 免得每个断言都手写前缀。
 pub struct Env {
     pub root: tempfile::TempDir,
     pub sync_dir: String,
     pub output_dir: String,
+    pub folders: Vec<SyncFolder>,
     pub mineru_url: String,
     pub lightrag_url: String,
 }
@@ -92,15 +120,36 @@ impl Env {
         Self {
             sync_dir: sync_dir.to_string_lossy().into_owned(),
             output_dir: output_dir.to_string_lossy().into_owned(),
+            folders: vec![SyncFolder {
+                name: "sync".into(),
+                path: sync_dir.to_string_lossy().into_owned(),
+            }],
             mineru_url: String::new(),
             lightrag_url: String::new(),
             root,
         }
     }
 
+    /// 再加一个别名目录，返回它的绝对路径。目录之间不重叠，够用了。
+    pub fn add_folder(&mut self, name: &str) -> String {
+        let path = self.root.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        self.folders.push(SyncFolder {
+            name: name.into(),
+            path: path.clone(),
+        });
+        path
+    }
+
+    /// 第一个（默认 `sync`）别名的目录名 —— `output_path` 用它解析相对路径。
+    pub fn primary_alias(&self) -> &str {
+        &self.folders[0].name
+    }
+
     pub fn config(&self, run_id: i32) -> SyncConfig {
         SyncConfig {
-            sync_dir: self.sync_dir.clone(),
+            sync_folders: self.folders.clone(),
             output_dir: self.output_dir.clone(),
             mineru_url: self.mineru_url.clone(),
             run_id,
@@ -110,16 +159,32 @@ impl Env {
         }
     }
 
-    /// 在 sync 目录下写文件，自动建父目录。返回绝对路径字符串。
+    /// 在主同步目录下写文件，自动建父目录。返回绝对路径字符串。
     pub fn write_source(&self, rel: &str, content: &str) -> String {
-        let p = Path::new(&self.sync_dir).join(rel);
+        self.write_source_in(self.primary_alias(), rel, content)
+    }
+
+    /// 在指定别名目录下写文件。返回绝对路径字符串。
+    pub fn write_source_in(&self, alias: &str, rel: &str, content: &str) -> String {
+        let folder = self
+            .folders
+            .iter()
+            .find(|f| f.name == alias)
+            .unwrap_or_else(|| panic!("没有别名为 {alias} 的同步目录"));
+        let p = Path::new(&folder.path).join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, content).unwrap();
         p.to_string_lossy().into_owned()
     }
 
+    /// 产物路径。`rel` 不含别名目录名，按主别名解析。
     pub fn output_path(&self, rel: &str) -> PathBuf {
-        Path::new(&self.output_dir).join(rel)
+        self.output_path_in(self.primary_alias(), rel)
+    }
+
+    /// 指定别名下的产物路径。
+    pub fn output_path_in(&self, alias: &str, rel: &str) -> PathBuf {
+        Path::new(&self.output_dir).join(alias).join(rel)
     }
 
     pub fn output_dir(&self) -> &Path {
@@ -128,6 +193,20 @@ impl Env {
 
     pub fn output_text(&self, rel: &str) -> String {
         std::fs::read_to_string(self.output_path(rel)).unwrap()
+    }
+
+    /// 直接写一个产物文件（模拟上一轮留下的）。父目录一并建出来 ——
+    /// 产物现在在 `<别名>/` 子目录下，忘了建父目录会让用例挂在「文件不存在」上。
+    pub fn write_artifact(&self, rel: &str, content: &str) -> PathBuf {
+        let p = self.output_path(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// 指定别名下的产物内容。
+    pub fn output_text_in(&self, alias: &str, rel: &str) -> String {
+        std::fs::read_to_string(self.output_path_in(alias, rel)).unwrap()
     }
 }
 

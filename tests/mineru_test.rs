@@ -18,7 +18,8 @@ fn sample_file(dir: &tempfile::TempDir, id: i32, name: &str, content: &str) -> F
         path: p.to_string_lossy().into_owned(),
         sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
         rag_id: None,
-        run_id: 1,
+        output_rel_path: None,
+    run_id: 1,
     }
 }
 
@@ -28,7 +29,10 @@ async fn setup(
 ) -> (MockServer, rag_sync::sync_config::SyncConfig) {
     let server = MockServer::start(routes).await;
     let cfg = rag_sync::sync_config::SyncConfig {
-        sync_dir: dir.path().to_string_lossy().into_owned(),
+        sync_folders: vec![rag_sync::sync_config::SyncFolder {
+            name: "probe".into(),
+            path: dir.path().to_string_lossy().into_owned(),
+        }],
         output_dir: dir.path().join("out").to_string_lossy().into_owned(),
         mineru_url: server.base_url.clone(),
         lightrag_url: String::new(),
@@ -41,7 +45,7 @@ async fn setup(
 
 /// 上传三步：created -> PUT 内容 -> completed，MinerU 的 file_id 是 f-1。
 fn upload_routes() -> Vec<Route> {
-    vec![
+    return vec![
         Route::post("/v1/uploads")
             .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
         Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
@@ -49,13 +53,13 @@ fn upload_routes() -> Vec<Route> {
             200,
             r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#,
         )),
-    ]
+    ];
 }
 
 /// 建任务（202 queued）-> 轮询到 completed -> 取 markdown 产物。
 /// 产物 id 恒为 out-1，正文由 `md` 给。
 fn job_routes(md: &str) -> Vec<Route> {
-    vec![
+    return vec![
         Route::post("/v1/parse/jobs").and(R::json(
             202,
             r#"{"job_id":"j-1","status":"queued","files":[]}"#,

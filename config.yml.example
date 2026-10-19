@@ -1,5 +1,13 @@
-sync_dir: "~/Documents"
-output_dir: "~/MinerU"
+# 要同步的目录。每个目录配一个唯一的别名：产物落在 output_dir/<别名>/ 下，
+# 上传给 LightRAG 的文件名前缀也是它（<别名>__<文件名>）。
+# 别名不能含 / \ 空格或 __，目录之间不能重叠 —— 这两类问题启动时就会报错。
+sync_folders:
+  - name: "work"          # 别名
+    path: "~/Documents/work"
+  - name: "personal"
+    path: "~/Documents/personal"
+
+output_dir: "~/MinerU"    # 所有别名共用一个产物目录
 mineru_url: "http://127.0.0.1:9777"
 lightrag_url: "http://127.0.0.1:9778"
 lightrag_username: "admin"

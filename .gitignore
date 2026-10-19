@@ -7,3 +7,4 @@ config.yml
 # MinerU 的上传缓存。它把 cwd 当基准目录，从仓库里启动时会落在这里。
 /blobs
 .mineru-service.lock
+*.bak*

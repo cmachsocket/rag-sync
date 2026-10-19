@@ -1,6 +1,6 @@
 use crate::database::DBfunc;
-use crate::http_util;
 use crate::file_mime::SUFFIX_MIME;
+use crate::http_util;
 use crate::mineru_requests::mineru_tackle;
 use crate::sync_config;
 use crate::{database, db_model, lightrag_requests::RAGRequest};
@@ -23,7 +23,9 @@ pub const NOT_IN_DB: i32 = 0;
 const PASSTHROUGH_EXTS: [&str; 3] = ["txt", "md", "markdown"];
 
 /// 该文件走透传就返回原文，否则返回 None。
-async fn passthrough_content(file_path: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
+async fn passthrough_content(
+    file_path: &Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let is_text = file_path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -79,20 +81,14 @@ pub async fn get_relative_path(
     Ok(relative_path.to_string_lossy().into_owned())
 }
 
-/// 产物在 output_dir 里的相对路径：以 `.md` 收尾，原扩展名留在中间段。
+/// 产物的命名规则：`X.ext.md`（源文件本身是 `.md` 的不加中间段）。
+/// 入参是相对路径，父目录原样保留。
 ///
 /// - 必须 `.md`：LightRAG 按扩展名选解析器，`.docx` 里装 markdown 会被拒。
 /// - 必须带原扩展名：同名的 `竞选.pdf` 与 `竞选.pptx` 都改成 `竞选.md` 会互相覆盖，
-///   409 自愈还会把先传成功的那份从知识库里删掉。源文件本身是 `.md` 的不加中间段。
-///
-/// 只依赖源路径，不依赖同批次的其他文件 —— `cleanup_one_old_file` 手上只有一条 DB 记录，
-/// 也必须算出同一个产物路径。
-pub async fn output_relative_path(
-    root_dir: &str,
-    file_path: &Path,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let rel = get_relative_path(root_dir, file_path).await?;
-    let rel_path = Path::new(&rel);
+///   409 自愈还会把先传成功的那份从知识库里删掉。
+fn markdown_name(rel_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let rel = rel_path.to_string_lossy().into_owned();
     let stem = rel_path
         .file_stem()
         .ok_or_else(|| format!("无法从 {rel} 取到文件名主干（隐藏文件?）"))?
@@ -116,15 +112,113 @@ pub async fn output_relative_path(
         .into_owned())
 }
 
-async fn create_output_dir(
+/// 产物在 output_dir 里的相对路径：`<别名>/<源目录内的相对路径>`。
+///
+/// 别名是多个同步目录共用一个 output_dir 时唯一的区分手段，没有它就分不清
+/// 哪份产物属于谁。
+///
+/// 只依赖源路径与别名，不依赖同批次的其他文件 —— `cleanup_one_old_file` 手上只有
+/// 一条 DB 记录，也必须算出同一个产物路径。
+pub async fn output_relative_path(
+    root_dir: &str,
+    alias: &str,
+    file_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let rel = get_relative_path(root_dir, file_path).await?;
+    Ok(Path::new(&alias)
+        .join(markdown_name(Path::new(&rel))?)
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// 加列之前那套产物相对路径：目录结构照搬源目录，**不带别名那一层**。
+///
+/// `root_dir` 必须是源目录本身：直接拿绝对路径会得到 `join` 之后整个替换掉
+/// output_dir 的绝对产物路径（`Path::join` 见到绝对路径就丢掉前面的部分），
+/// 那会去删源目录那边的文件。
+pub async fn legacy_output_relative_path(
+    root_dir: &str,
+    file_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let rel = get_relative_path(root_dir, file_path).await?;
+    Ok(markdown_name(Path::new(&rel))?)
+}
+
+/// 上传给 LightRAG 的文件名：`<别名>__<产物名>`，例如 `work__报告.pdf.md`。
+///
+/// LightRAG 以文件名为文档唯一键，而它只拿本地路径的 basename —— 单靠产物所在的
+/// 子目录区分不开，两个目录下的同名文件会互相 409 并自愈删除。
+/// 别名 + 文件名就够唯一：同一别名内的重名由用户保证不会出现。
+pub fn upload_name(alias: &str, output_rel: &str) -> String {
+    let name = Path::new(output_rel)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| output_rel.to_string());
+    return format!("{alias}__{name}");
+}
+
+/// 某个源文件的产物相对路径。文件不在任何已配置目录下时返回 `None`：
+/// 只可能发生在清理阶段（配置里换过目录），报错由调用方按上下文给。
+async fn output_rel_of(
     config: &sync_config::SyncConfig,
     file_path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rel = output_relative_path(&config.sync_dir, file_path).await?;
-    let output_file_path = Path::new(&config.output_dir).join(rel);
-    let parent = output_file_path.parent().ok_or_else(|| {
-        format!("无法获取输出文件的父目录: {}", output_file_path.display())
-    })?;
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(folder) = config.folder_of(file_path) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        output_relative_path(&folder.path, &folder.name, file_path).await?,
+    ))
+}
+
+/// 清理旧文件时要删的产物相对路径。最多两个候选，删掉其中存在的那个：
+///
+/// 1. DB 里记的 `output_rel_path` —— 唯一与「当时实际怎么写的」对齐的一级。
+///    改了别名、挪了目录，产物也不会被找丢。命中这一级就**只有**它，
+///    按当前配置现算出来的路径已经是另一个东西了。
+/// 2. 加列之前入库的行（这一列是 NULL）：不知道当时写到了哪里，两个候选都试一遍 ——
+///    按当前别名算的新路径，以及按旧规则（无别名目录）算的旧路径。
+///    这一行的产物很可能就躺在旧位置，少试一个它就永远失去关联。
+async fn artifact_candidates(
+    config: &sync_config::SyncConfig,
+    file: &db_model::File,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if let Some(rel) = file.output_rel_path.as_deref() {
+        return Ok(vec![rel.to_string()]);
+    }
+    let file_path = Path::new(&file.path);
+    let Some(folder) = config.folder_of(file_path) else {
+        return Err(format!(
+            "{} 的产物路径没记录过，且它现在不在任何已配置的同步目录下（已配置别名: {}）。\
+             这只可能出现在「加列之前就入库、之后又改过目录配置」的文件身上：\
+             没有记录就反推不出产物位置，跳过",
+            file.path,
+            config.alias_list()
+        )
+        .into());
+    };
+
+    let mut candidates = Vec::new();
+    if let Ok(rel) = output_relative_path(&folder.path, &folder.name, file_path).await {
+        candidates.push(rel);
+    }
+    if let Ok(rel) = legacy_output_relative_path(&folder.path, file_path).await {
+        if !candidates.contains(&rel) {
+            candidates.push(rel);
+        }
+    }
+    if candidates.is_empty() {
+        return Err(format!("{} 算不出产物路径", file.path).into());
+    }
+    Ok(candidates)
+}
+
+/// 产物所在的父目录，按需创建。目录层级来自产物相对路径，因此别名目录
+/// 也会被建出来。
+async fn create_output_dir(output_file_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = output_file_path
+        .parent()
+        .ok_or_else(|| format!("无法获取输出文件的父目录: {}", output_file_path.display()))?;
     // 细节放在返回的 Err 里，不要 eprintln 一次再返回一个没原因的固定文案
     fs::create_dir_all(parent)
         .await
@@ -136,25 +230,41 @@ pub async fn get_files(
     config: &sync_config::SyncConfig,
     conn: &mut database::Conn,
 ) -> Result<Vec<db_model::File>, Box<dyn std::error::Error>> {
-    let root_dir = &config.sync_dir;
     let mut files: Vec<db_model::File> = Vec::new();
+    for folder in &config.sync_folders {
+        scan_folder(folder, config, conn, &mut files).await?;
+    }
+    // 排序后处理顺序可复现，否则同一批文件在不同机器上会以不同顺序打服务端。
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// 扫一个同步目录。目录之间不重叠、不重名由配置加载时的校验保证，
+/// 这里不必再判归属。
+async fn scan_folder(
+    folder: &sync_config::SyncFolder,
+    config: &sync_config::SyncConfig,
+    conn: &mut database::Conn,
+    files: &mut Vec<db_model::File>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root_dir = &folder.path;
 
     for entry in WalkDir::new(root_dir) {
         match entry {
             Ok(e) => {
                 if e.file_type().is_dir() {
-                    println!("[目录] {}", e.path().display());
+                    println!("[目录][{}] {}", folder.name, e.path().display());
                 } else if is_supported_file(e.path()).await {
                     let file_path = e.path();
-                    println!("[文件] {}", file_path.display());
+                    println!("[文件][{}] {}", folder.name, file_path.display());
 
-                    let path_str = file_path.to_str().ok_or_else(|| {
-                        format!("路径不是合法 UTF-8: {}", file_path.display())
-                    })?;
+                    let path_str = file_path
+                        .to_str()
+                        .ok_or_else(|| format!("路径不是合法 UTF-8: {}", file_path.display()))?;
                     // sha256 一律现算：库里的值只说明「上次同步时是什么样」，文件改了也看不见。
-                    let sha256 = sha256_file(path_str).await.map_err(|e| {
-                        format!("计算 {} 的 sha256 失败: {e}", file_path.display())
-                    })?;
+                    let sha256 = sha256_file(path_str)
+                        .await
+                        .map_err(|e| format!("计算 {} 的 sha256 失败: {e}", file_path.display()))?;
 
                     let file = match DBfunc::get_file(conn, path_str).await? {
                         Some(mut file) => {
@@ -168,6 +278,8 @@ pub async fn get_files(
                             sha256,
                             run_id: config.run_id,
                             rag_id: None,
+                            // 还没处理过，产物路径不存在；等上传成功落库时再写
+                            output_rel_path: None,
                         },
                     };
                     files.push(file);
@@ -176,21 +288,28 @@ pub async fn get_files(
             Err(e) => {
                 // 任何一处读不出来都要中止：「没扫到」在 delete_old_files 眼里
                 // 等于「用户删了」，一个权限错误就会清掉这一支的产物与知识库文档。
+                // 多目录下这条更要紧：漏扫一个别名就等于删掉它全部的知识库文档。
                 let at = e
                     .path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| root_dir.clone());
-                return Err(format!("扫描 {at} 失败: {e}，本轮中止（跳过会把它们当成已删除）").into());
+                return Err(format!(
+                    "扫描别名 {}({root_dir}) 下的 {at} 失败: {e}，本轮中止（跳过会把它们当成已删除）",
+                    folder.name
+                )
+                .into());
             }
         }
     }
-    // 排序后处理顺序可复现，否则同一批文件在不同机器上会以不同顺序打服务端。
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
+    Ok(())
 }
 
 /// 挑出本轮要处理的文件；没变化的也要把 run_id 刷成本轮 ——「本轮扫到过」
 /// 只能靠 run_id 表达，不刷新的话下一轮会被当成用户已删除。
+///
+/// 「没变化」有两个条件：内容（sha256）没变，**产物路径也没变**。
+/// 别名改了目录、目录挪了位置时 sha256 一样，但产物落在别处、知识库里的
+/// 文档也还是旧名字 —— 那必须重跑一遍，光刷 run_id 会留下一份永远对不上的产物。
 async fn select_pending<'a>(
     config: &sync_config::SyncConfig,
     files: &'a [db_model::File],
@@ -201,6 +320,30 @@ async fn select_pending<'a>(
         if file.id == NOT_IN_DB {
             todo.push(file);
             continue;
+        }
+        // 库里没记产物路径（加列之前写入的行）时不算「变了」：那一列要等这文件
+        // 真的重新处理时才会被填上，拿它判跳过会把加列前的每一行都重跑一遍。
+        if let Some(old_rel) = file.output_rel_path.as_deref() {
+            let current_rel = output_rel_of(config, Path::new(&file.path))
+                .await?
+                .ok_or_else(|| {
+                    format!(
+                        "{} 曾经入库过（run_id={}），现在却不在任何已配置的同步目录下\
+                         （已配置别名: {}）。是配置漏了这个目录？本轮中止，避免把它的产物与\
+                         知识库文档当成「用户删了」清掉",
+                        file.path,
+                        file.run_id,
+                        config.alias_list()
+                    )
+                })?;
+            if old_rel != current_rel {
+                println!(
+                    "文件 {} 的产物路径已变（{old_rel} -> {current_rel}），重新处理",
+                    file.path
+                );
+                todo.push(file);
+                continue;
+            }
         }
         let old_sha = DBfunc::get_sha256(conn, &file.path).await?;
         if old_sha.as_deref() == Some(file.sha256.as_str()) {
@@ -334,7 +477,18 @@ async fn process_one_file(
     file: &db_model::File,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let file_path = Path::new(&file.path);
-    create_output_dir(config, file_path).await?;
+    // 归属先定下来：产物的子目录名与上传名都从它来，别名找不到就没法落盘
+    let folder = config.folder_of(file_path).ok_or_else(|| {
+        format!(
+            "{} 不在任何已配置的同步目录下（已配置别名: {}）",
+            file_path.display(),
+            config.alias_list()
+        )
+    })?;
+    let rel = output_relative_path(&folder.path, &folder.name, file_path).await?;
+    let output_file_path = Path::new(&config.output_dir).join(&rel);
+    create_output_dir(&output_file_path).await?;
+
     let markdown = match passthrough_content(file_path).await? {
         Some(content) => {
             println!("[透传] {} 已跳过 MinerU", file_path.display());
@@ -343,11 +497,9 @@ async fn process_one_file(
         None => mineru_tackle(client, file, config).await?,
     };
 
-    let rel = output_relative_path(&config.sync_dir, file_path).await?;
-    let output_file_path = Path::new(&config.output_dir).join(rel);
-    fs::write(&output_file_path, &markdown).await.map_err(|e| {
-        format!("写入输出文件 {} 失败: {e}", output_file_path.display())
-    })?;
+    fs::write(&output_file_path, &markdown)
+        .await
+        .map_err(|e| format!("写入输出文件 {} 失败: {e}", output_file_path.display()))?;
     println!("已生成输出文件: {}", output_file_path.display());
     let path_str = output_file_path.to_str().ok_or_else(|| {
         format!(
@@ -356,16 +508,27 @@ async fn process_one_file(
         )
     })?;
 
-    let rag_id = rag_request.upload_file(path_str).await?;
+    // 上传名带别名前缀：LightRAG 的唯一键是文件名，目录前缀它看不见
+    let rag_id = rag_request
+        .upload_file_as(path_str, &upload_name(&folder.name, &rel))
+        .await?;
     println!("RAG 上传结果: {}", rag_id);
     // 记录必须在上传成功之后写：LightRAG 没收到就不能算这文件已同步
     if file.id != NOT_IN_DB {
         DBfunc::update_rag_id(conn, &file.path, Some(&rag_id)).await?;
+        DBfunc::update_output_rel_path(conn, &file.path, &rel).await?;
         DBfunc::update_file_run_id(conn, &file.path, config.run_id).await?;
         DBfunc::update_sha256(conn, &file.path, &file.sha256).await?;
     } else {
-        DBfunc::insert_file(conn, &file.path, &file.sha256, config.run_id, Some(&rag_id))
-            .await?;
+        DBfunc::insert_file(
+            conn,
+            &file.path,
+            &file.sha256,
+            config.run_id,
+            Some(&rag_id),
+            &rel,
+        )
+        .await?;
     }
     Ok(output_file_path)
 }
@@ -425,27 +588,34 @@ async fn cleanup_one_old_file(
         println!("已删除知识库文档: {rag_id}");
     }
 
-    // 定位不到输出目录（通常改过 sync_dir）：跳过产物清理，知识库与 DB 行照清，
-    // 否则这一行会把清理步骤永久卡死。
-    match output_relative_path(&config.sync_dir, Path::new(&file.path)).await {
-        Ok(rel) => {
-            let output_file_path = Path::new(&config.output_dir).join(rel);
-            match tokio::fs::remove_file(&output_file_path).await {
-                Ok(()) => println!("已删除输出文件: {}", output_file_path.display()),
-                // 已经不在了正是预期结果（用户自己删过产物）
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                // 权限不足之类不能当成「不存在」：那样会删掉 DB 行，产物永远失去关联。
-                Err(e) => {
-                    return Err(format!(
-                        "删除输出文件 {} 失败: {e}",
-                        output_file_path.display()
-                    )
-                    .into())
+    // 产物一定要去删：删不掉就保留 DB 行下轮重试（见下面的失败分支）。
+    // 「算不出路径」曾经被当成「跳过」，那会让产物永远失去关联 ——
+    // 宁可删不到，也不能让这一行把清理步骤永久卡死。
+    match artifact_candidates(config, file).await {
+        Ok(rels) => {
+            for rel in rels {
+                let output_file_path = Path::new(&config.output_dir).join(&rel);
+                match tokio::fs::remove_file(&output_file_path).await {
+                    Ok(()) => println!("已删除输出文件: {}", output_file_path.display()),
+                    // 已经不在了正是预期结果（用户自己删过产物）
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    // 权限不足之类不能当成「不存在」：那样会删掉 DB 行，产物永远失去关联。
+                    Err(e) => {
+                        return Err(format!(
+                            "删除输出文件 {} 失败: {e}",
+                            output_file_path.display()
+                        )
+                        .into());
+                    }
                 }
             }
         }
-        Err(e) => eprintln!("警告: {} 无法定位到输出目录，跳过产物清理: {e}", file.path),
-    }
+        // 连文件名主干都取不出来（路径没有文件名、没有扩展名）。这一行没法自己
+        // 恢复，留着只会每轮重来一次，所以仍然删 DB 行，只把产物留下。
+        Err(e) => {
+            eprintln!("警告: {} 无法定位到输出目录，跳过产物清理: {e}", file.path);
+        }
+    };
 
     DBfunc::delete_file(conn, &file.path).await?;
     println!("已删除数据库记录: {}", file.path);

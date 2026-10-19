@@ -13,7 +13,9 @@ async fn run() -> Result<()> {
     sync_folder::delete_old_files(&config, &mut conn).await?;
 
     DBfunc::update_run_counter(&mut conn, config.run_id).await?;
-    println!("Sync directory: {}", &config.sync_dir);
+    for folder in &config.sync_folders {
+        println!("Sync directory [{}]: {}", folder.name, folder.path);
+    }
     println!("Output directory: {}", &config.output_dir);
     Ok(())
 }

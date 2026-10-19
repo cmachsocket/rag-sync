@@ -12,8 +12,10 @@ use rag_sync::sync_folder::{create_output_files, delete_old_files, get_files};
 fn rag_routes(doc_id: &str) -> Vec<Route> {
     return vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
-        Route::post("/documents/upload")
-            .and(R::json(200, r#"{"status":"success","message":"ok","track_id":"tr-1"}"#)),
+        Route::post("/documents/upload").and(R::json(
+            200,
+            r#"{"status":"success","message":"ok","track_id":"tr-1"}"#,
+        )),
         Route::get("/documents/track_status/tr-1").and(R::json(
             200,
             format!(
@@ -21,16 +23,20 @@ fn rag_routes(doc_id: &str) -> Vec<Route> {
                      "documents":[{{"id":"{doc_id}","status":"processed","file_path":"a.md"}}]}}"#
             ),
         )),
-    ]
+    ];
 }
 
 fn mineru_routes(md: &str) -> Vec<Route> {
     return vec![
-        Route::post("/v1/uploads")
-            .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
+        Route::post("/v1/uploads").and(R::json(
+            201,
+            r#"{"id":"up-1","status":"created","file":null}"#,
+        )),
         Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-        Route::post("/v1/uploads/up-1/complete")
-            .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#)),
+        Route::post("/v1/uploads/up-1/complete").and(R::json(
+            200,
+            r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#,
+        )),
         // 任务接口：建任务恒 202 queued，正文只在产物里，要再取一次
         Route::post("/v1/parse/jobs").and(R::json(
             202,
@@ -43,7 +49,7 @@ fn mineru_routes(md: &str) -> Vec<Route> {
                   "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
         )),
         Route::get("/v1/files/out-1/content").and(R::text(200, md)),
-    ]
+    ];
 }
 
 async fn env_with_services(md: &str) -> (Env, MockServer) {
@@ -76,11 +82,21 @@ async fn sync_once(
 async fn insert_writes_run_id_and_autoincrements_id() {
     let mut db = common::test_db().await;
 
-    DBfunc::insert_file(&mut db.conn, "/sync/a.pdf", "sha-a", 7, Some("doc-1"))
-        .await
-        .unwrap();
+    DBfunc::insert_file(
+        &mut db.conn,
+        "/sync/a.pdf",
+        "sha-a",
+        7,
+        Some("doc-1"),
+        "probe/a.pdf.md",
+    )
+    .await
+    .unwrap();
 
-    let row = DBfunc::get_file(&mut db.conn, "/sync/a.pdf").await.unwrap().unwrap();
+    let row = DBfunc::get_file(&mut db.conn, "/sync/a.pdf")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.run_id, 7, "轮次号必须落在 run_id 列");
     assert_eq!(row.id, 1, "id 交给 AUTOINCREMENT，不该由调用方指定");
 }
@@ -89,8 +105,14 @@ async fn insert_writes_run_id_and_autoincrements_id() {
 async fn multiple_files_insert_in_same_run() {
     let mut db = common::test_db().await;
     // 曾经两个文件都用 run_id 当 id，第二个直接 UNIQUE 主键冲突
-    for (path, sha) in [("/sync/a.pdf", "s1"), ("/sync/b.pdf", "s2"), ("/sync/c.pdf", "s3")] {
-        DBfunc::insert_file(&mut db.conn, path, sha, 9, Some("doc")).await.unwrap();
+    for (path, sha) in [
+        ("/sync/a.pdf", "s1"),
+        ("/sync/b.pdf", "s2"),
+        ("/sync/c.pdf", "s3"),
+    ] {
+        DBfunc::insert_file(&mut db.conn, path, sha, 9, Some("doc"), "probe/a.pdf.md")
+            .await
+            .unwrap();
     }
     let ids = db.row_ids().await;
     assert_eq!(ids, vec![1, 2, 3], "三个文件都要有各自的主键");
@@ -103,12 +125,24 @@ async fn delete_file_touches_only_target_row() {
     db.insert_file_row(1, "/sync/a.pdf", "s1", 1, None).await;
     db.insert_file_row(2, "/sync/b.pdf", "s2", 1, None).await;
 
-    DBfunc::delete_file(&mut db.conn, "/sync/a.pdf").await.unwrap();
+    DBfunc::delete_file(&mut db.conn, "/sync/a.pdf")
+        .await
+        .unwrap();
 
-    assert!(!DBfunc::file_exists(&mut db.conn, "/sync/a.pdf").await.unwrap());
-    assert!(DBfunc::file_exists(&mut db.conn, "/sync/b.pdf").await.unwrap());
+    assert!(
+        !DBfunc::file_exists(&mut db.conn, "/sync/a.pdf")
+            .await
+            .unwrap()
+    );
+    assert!(
+        DBfunc::file_exists(&mut db.conn, "/sync/b.pdf")
+            .await
+            .unwrap()
+    );
     // 删不存在的行不算失败
-    DBfunc::delete_file(&mut db.conn, "/sync/没有.pdf").await.unwrap();
+    DBfunc::delete_file(&mut db.conn, "/sync/没有.pdf")
+        .await
+        .unwrap();
 }
 
 // ================================================================ 2
@@ -123,7 +157,9 @@ async fn source_documents_survive_a_run() {
     sync_once(&env, &mut db, 1).await;
     assert_eq!(db.run_id_of(&src).await, 1, "本轮处理过的必须标成当前轮次");
 
-    delete_old_files(&env.config(1), &mut db.conn).await.unwrap();
+    delete_old_files(&env.config(1), &mut db.conn)
+        .await
+        .unwrap();
 
     assert!(
         std::path::Path::new(&src).exists(),
@@ -152,7 +188,11 @@ async fn changed_content_is_reprocessed() {
         2,
         "内容变了必须重跑 MinerU"
     );
-    assert_eq!(server.count_to("POST", "/documents/upload"), 2, "产物变了要重传");
+    assert_eq!(
+        server.count_to("POST", "/documents/upload"),
+        2,
+        "产物变了要重传"
+    );
     assert_eq!(
         DBfunc::get_sha256(&mut db.conn, &src).await.unwrap(),
         Some(rag_sync::sync_folder::sha256_file(&src).await.unwrap()),
@@ -170,7 +210,11 @@ async fn unchanged_content_only_refreshes_run_id() {
     sync_once(&env, &mut db, 1).await;
     sync_once(&env, &mut db, 2).await;
 
-    assert_eq!(server.count_to("POST", "/v1/parse/jobs"), 1, "没变就不该重跑");
+    assert_eq!(
+        server.count_to("POST", "/v1/parse/jobs"),
+        1,
+        "没变就不该重跑"
+    );
     assert_eq!(
         db.run_id_of(&src).await,
         2,
@@ -207,13 +251,13 @@ async fn cleanup_only_removes_generated_artifacts() {
     env.lightrag_url = server.base_url.clone();
 
     let src = env.write_source("gone.md", "用户的原始文档");
-    let out = env.output_path("gone.md");
-    std::fs::create_dir_all(env.output_dir()).unwrap();
-    std::fs::write(&out, "# 过期产物").unwrap();
+    let out = env.write_artifact("gone.md", "# 过期产物");
     db.insert_file_row(1, &src, "sha", 1, Some("doc-old")).await;
 
     // 本轮 run_id=2，没扫到它 -> 属于上一轮遗留
-    delete_old_files(&env.config(2), &mut db.conn).await.unwrap();
+    delete_old_files(&env.config(2), &mut db.conn)
+        .await
+        .unwrap();
 
     assert!(
         std::path::Path::new(&src).exists(),
@@ -240,7 +284,9 @@ async fn cleanup_skips_service_when_nothing_is_old() {
 
     let before = server.count_to("POST", "/login");
     // 同一轮收尾：本轮扫到的文件 run_id 就是 1，没有「旧文件」
-    delete_old_files(&env.config(1), &mut db.conn).await.unwrap();
+    delete_old_files(&env.config(1), &mut db.conn)
+        .await
+        .unwrap();
 
     assert_eq!(
         server.count_to("POST", "/login"),
@@ -263,7 +309,9 @@ async fn current_run_files_are_never_cleaned() {
     env.write_source("a.pdf", "内容");
     sync_once(&env, &mut db, 5).await;
 
-    delete_old_files(&env.config(5), &mut db.conn).await.unwrap();
+    delete_old_files(&env.config(5), &mut db.conn)
+        .await
+        .unwrap();
 
     assert!(env.output_path("a.pdf.md").exists());
     assert_eq!(server.count_to("DELETE", "/documents/delete_document"), 0);
@@ -336,7 +384,9 @@ async fn two_rounds_cleanup_deleted_keep_rest() {
     create_output_files(&env.config(2), &files, &mut db.conn)
         .await
         .unwrap();
-    delete_old_files(&env.config(2), &mut db.conn).await.unwrap();
+    delete_old_files(&env.config(2), &mut db.conn)
+        .await
+        .unwrap();
 
     assert!(
         std::path::Path::new(&keep).exists(),
@@ -371,10 +421,14 @@ async fn reprocess_uses_real_mineru_file_id() {
         path: path.to_string_lossy().into_owned(),
         sha256: "abc".into(),
         rag_id: Some("doc-x".into()),
+        output_rel_path: None,
         run_id: 2,
     };
     let cfg = rag_sync::sync_config::SyncConfig {
-        sync_dir: d.path().to_string_lossy().into_owned(),
+        sync_folders: vec![rag_sync::sync_config::SyncFolder {
+            name: "probe".into(),
+            path: d.path().to_string_lossy().into_owned(),
+        }],
         output_dir: d.path().to_string_lossy().into_owned(),
         mineru_url: server.base_url.clone(),
         lightrag_url: String::new(),
@@ -413,7 +467,11 @@ fn parser_hint_normalises_to_same_key() {
         assert_eq!(canonical_basename(&format!("a{hint}.md")), "a");
     }
     assert_eq!(canonical_basename("report.[native].docx"), "report");
-    assert_eq!(canonical_basename("a.[native].[legacy].md"), "a", "叠着的也要剥干净");
+    assert_eq!(
+        canonical_basename("a.[native].[legacy].md"),
+        "a",
+        "叠着的也要剥干净"
+    );
     // 大小写与扩展名差异不影响归一
     assert_eq!(canonical_basename("A.MD"), canonical_basename("a.md"));
     // 没见过的 hint 不能乱剥
@@ -476,7 +534,8 @@ async fn tilde_in_config_is_expanded() {
     let p = d.path().join("config.yml");
     std::fs::write(
         &p,
-        "sync_dir: \"~/Documents\"\noutput_dir: \"~\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n",
+        "sync_folders:\n  - name: \"work\"\n    path: \"~/Documents\"\n\
+         output_dir: \"~\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n",
     )
     .unwrap();
 
@@ -486,8 +545,10 @@ async fn tilde_in_config_is_expanded() {
 
     let home = std::env::var("HOME").expect("本测试环境应有 HOME");
     assert_eq!(
-        c.sync_dir,
-        std::path::Path::new(&home).join("Documents").to_string_lossy(),
+        c.sync_folders[0].path,
+        std::path::Path::new(&home)
+            .join("Documents")
+            .to_string_lossy(),
         "~ 会被当成普通字符，工作目录下根本没有这个相对路径"
     );
     assert_eq!(c.output_dir, home);
@@ -500,7 +561,8 @@ async fn tilde_inside_path_is_left_alone() {
     let p = d.path().join("config.yml");
     std::fs::write(
         &p,
-        "sync_dir: \"/data/~backup\"\noutput_dir: \"/data/a~b\"\n\
+        "sync_folders:\n  - name: \"work\"\n    path: \"/data/~backup\"\n\
+         output_dir: \"/data/a~b\"\n\
          mineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n",
     )
     .unwrap();
@@ -508,8 +570,43 @@ async fn tilde_inside_path_is_left_alone() {
     let c = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, p.to_str().unwrap())
         .await
         .unwrap();
-    assert_eq!(c.sync_dir, "/data/~backup");
+    assert_eq!(c.sync_folders[0].path, "/data/~backup");
     assert_eq!(c.output_dir, "/data/a~b");
+}
+
+/// 每个同步目录都要展开。漏一个的话该目录扫不到，
+/// 它上轮的文件会被当成「用户删了」清掉产物与知识库文档。
+#[tokio::test]
+async fn tilde_is_expanded_in_every_folder() {
+    let mut db = common::test_db().await;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("config.yml");
+    std::fs::write(
+        &p,
+        "sync_folders:\n  - name: \"work\"\n    path: \"~/work\"\n\
+         \x20 - name: \"personal\"\n    path: \"~/personal\"\n\
+         output_dir: \"~/out\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n",
+    )
+    .unwrap();
+
+    let c = rag_sync::sync_config::SyncConfig::from_file(&mut db.conn, p.to_str().unwrap())
+        .await
+        .unwrap();
+    let home = std::env::var("HOME").expect("本测试环境应有 HOME");
+    assert_eq!(c.sync_folders.len(), 2);
+    for (folder, tail) in c.sync_folders.iter().zip(["work", "personal"]) {
+        assert_eq!(
+            folder.path,
+            std::path::Path::new(&home).join(tail).to_string_lossy(),
+            "{} 目录里的 ~ 没展开",
+            folder.name
+        );
+        assert!(!folder.path.contains('~'));
+    }
+    assert_eq!(
+        c.output_dir,
+        std::path::Path::new(&home).join("out").to_string_lossy()
+    );
 }
 
 // ================================================================ 8
@@ -520,7 +617,7 @@ async fn missing_sync_dir_is_an_error() {
     let mut db = common::test_db().await;
     let env = Env::new();
     let mut cfg = env.config(1);
-    cfg.sync_dir = "/no/such/dir".into();
+    cfg.sync_folders[0].path = "/no/such/dir".into();
 
     let err = get_files(&cfg, &mut db.conn).await.unwrap_err().to_string();
     assert!(

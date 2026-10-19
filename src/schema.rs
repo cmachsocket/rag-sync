@@ -7,6 +7,7 @@ diesel::table! {
         sha256 -> Text,
         rag_id -> Nullable<Text>,
         run_id -> Integer,
+        output_rel_path -> Nullable<Text>,
     }
 }
 

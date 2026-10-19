@@ -8,7 +8,7 @@ use common::{test_db, Env};
 use rag_sync::database::DBfunc;
 use rag_sync::http_util;
 use rag_sync::sync_folder::{
-    delete_old_files, get_files, get_relative_path, output_relative_path, sha256_file,
+    delete_old_files, get_files, get_relative_path, output_relative_path, sha256_file, upload_name,
 };
 use std::path::Path;
 
@@ -191,6 +191,83 @@ async fn scan_returns_sorted_paths() {
     assert_eq!(names, sorted, "处理顺序要可复现，不能跟着文件系统顺序走");
 }
 
+// ================================================================ 多文件夹扫描
+
+/// 每个别名都要被扫到：只扫第一个目录的话，另一个目录的文件会一路走到
+/// delete_old_files，被当成「用户删了」而清掉产物与知识库文档。
+#[tokio::test]
+async fn scan_covers_every_alias() {
+    let mut db = test_db().await;
+    let mut env = Env::new();
+    env.write_source("工作/a.pdf", "x");
+    let personal = env.add_folder("personal");
+    let b = env.write_source_in("personal", "b.pdf", "y");
+
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert!(paths.iter().any(|p| p.starts_with(&env.sync_dir)), "{paths:?}");
+    assert!(paths.iter().any(|p| p.starts_with(&personal)), "{paths:?}");
+    assert!(paths.contains(&b.as_str()), "{paths:?}");
+}
+
+/// 处理顺序要跨别名整体可复现，不能一个目录一段。
+#[tokio::test]
+async fn scan_sorts_across_aliases() {
+    let mut db = test_db().await;
+    let mut env = Env::new();
+    env.write_source("z.pdf", "z");
+    env.add_folder("personal");
+    env.write_source_in("personal", "a.pdf", "a");
+
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted);
+}
+
+/// 漏扫任何一个别名都会误判成「用户删了」，所以中途失败必须整轮中止，
+/// 报错还要指出是哪个别名下的哪个目录。
+#[tokio::test]
+async fn unreadable_folder_aborts_the_whole_run() {
+    let mut db = test_db().await;
+    let mut env = Env::new();
+    env.write_source("能读/a.pdf", "x");
+    let personal = env.add_folder("personal");
+    let locked = Path::new(&personal).join("锁住");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("b.pdf"), "x").unwrap();
+    let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o000);
+    }
+    std::fs::set_permissions(&locked, perms).unwrap();
+
+    let files = get_files(&env.config(1), &mut db.conn).await;
+
+    #[cfg(unix)]
+    {
+        // root 无视权限位，那样就造不出这个错误，跳过而不是假装通过
+        if std::fs::read_dir(&locked).is_ok() {
+            eprintln!("以 root 运行，权限位无效，跳过本用例");
+            let _ = std::fs::remove_dir_all(&locked);
+            return;
+        }
+        let err = files.unwrap_err().to_string();
+        assert!(err.contains("personal"), "要指出是哪个别名扫不了: {err}");
+        assert!(err.contains("锁住"), "要指出是哪个目录读不了: {err}");
+        assert!(err.contains("中止"), "跳过的别名会被当成已删除: {err}");
+        let _ = std::fs::remove_dir_all(&locked);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = files;
+    }
+}
+
 #[tokio::test]
 async fn unreadable_subdirectory_aborts_the_run() {
     let mut db = test_db().await;
@@ -272,35 +349,51 @@ async fn http_client_times_out_on_silent_server() {
 // ================================================================ 产物命名
 // 产物必须以 .md 收尾（LightRAG 按扩展名选解析器），但直接改成 X.md 会让同目录
 // 同名主干的文件互相覆盖，保留原扩展名作中间段才是无损映射。
+// 多个同步目录共用一个 output_dir，第一段是别名。
 
 #[tokio::test]
 async fn output_relative_path_switches_to_markdown() {
     assert_eq!(
-        output_relative_path("/root", Path::new("/root/a.pdf"))
+        output_relative_path("/root", "work", Path::new("/root/a.pdf"))
             .await
             .unwrap(),
-        "a.pdf.md"
+        "work/a.pdf.md"
     );
 }
 
 #[tokio::test]
 async fn output_relative_path_keeps_nested_dirs() {
     assert_eq!(
-        output_relative_path("/root", Path::new("/root/2024/一季度/a.docx"))
+        output_relative_path("/root", "work", Path::new("/root/2024/一季度/a.docx"))
             .await
             .unwrap(),
-        "2024/一季度/a.docx.md"
+        "work/2024/一季度/a.docx.md"
     );
+}
+
+/// 别名就是跨目录区分产物的手段：目录结构相同、文件名相同的两个源文件，
+/// 产物必须落在不同的子目录下。
+#[tokio::test]
+async fn output_relative_path_separates_aliases() {
+    let a = output_relative_path("/a", "work", Path::new("/a/2024/报告.pdf"))
+        .await
+        .unwrap();
+    let b = output_relative_path("/b", "personal", Path::new("/b/2024/报告.pdf"))
+        .await
+        .unwrap();
+    assert_ne!(a, b, "两个别名的同名文件不能产出同一个路径");
+    assert_eq!(a, "work/2024/报告.pdf.md");
+    assert_eq!(b, "personal/2024/报告.pdf.md");
 }
 
 /// 同名主干（`竞选.pdf` / `竞选.pptx`）不能映射到同一个产物名，否则后写的
 /// 覆盖先写的，上传时还会 409 自愈把先传成功的那份从知识库里删掉。
 #[tokio::test]
 async fn output_relative_path_avoids_stem_collisions() {
-    let from_pdf = output_relative_path("/root", Path::new("/root/竞选/竞选.pdf"))
+    let from_pdf = output_relative_path("/root", "work", Path::new("/root/竞选/竞选.pdf"))
         .await
         .unwrap();
-    let from_pptx = output_relative_path("/root", Path::new("/root/竞选/竞选.pptx"))
+    let from_pptx = output_relative_path("/root", "work", Path::new("/root/竞选/竞选.pptx"))
         .await
         .unwrap();
     assert_ne!(from_pdf, from_pptx, "同名主干必须映射到不同产物名");
@@ -311,10 +404,10 @@ async fn output_relative_path_avoids_stem_collisions() {
 #[tokio::test]
 async fn output_relative_path_does_not_double_markdown_suffix() {
     assert_eq!(
-        output_relative_path("/root", Path::new("/root/发言稿.md"))
+        output_relative_path("/root", "work", Path::new("/root/发言稿.md"))
             .await
             .unwrap(),
-        "发言稿.md"
+        "work/发言稿.md"
     );
 }
 
@@ -322,13 +415,36 @@ async fn output_relative_path_does_not_double_markdown_suffix() {
 /// 也得算出同一个产物名，否则删产物永远找不到文件。
 #[tokio::test]
 async fn output_relative_path_is_stable_across_calls() {
-    let first = output_relative_path("/root", Path::new("/root/x/a.docx"))
+    let first = output_relative_path("/root", "work", Path::new("/root/x/a.docx"))
         .await
         .unwrap();
-    let second = output_relative_path("/root", Path::new("/root/x/a.docx"))
+    let second = output_relative_path("/root", "work", Path::new("/root/x/a.docx"))
         .await
         .unwrap();
     assert_eq!(first, second);
+}
+
+// ================================================================ 上传名
+// LightRAG 的文档唯一键是文件名，它只看本地路径的 basename ——
+// 产物所在的子目录它完全看不见。别名前缀是唯一能防住跨目录同名互删的东西。
+
+#[test]
+fn upload_name_carries_the_alias() {
+    assert_eq!(upload_name("work", "work/2024/报告.pdf.md"), "work__报告.pdf.md");
+}
+
+#[test]
+fn upload_name_distinguishes_same_name_in_two_aliases() {
+    let work = upload_name("work", "work/报告.pdf.md");
+    let personal = upload_name("personal", "personal/报告.pdf.md");
+    assert_ne!(work, personal, "上传名撞了就会 409 自愈，先传的那份被删");
+}
+
+/// 别名之外的字符一律原样保留：上传名要能让人认出是哪个文件。
+#[test]
+fn upload_name_keeps_the_whole_artifact_name() {
+    assert_eq!(upload_name("work", "work/2024/一季度/a.docx.md"), "work__a.docx.md");
+    assert_eq!(upload_name("work", "work/发言稿.md"), "work__发言稿.md");
 }
 
 // ================================================================ 清理
@@ -431,11 +547,186 @@ async fn one_cleanup_failure_does_not_block_others() {
     );
 }
 
+/// 产物路径按 DB 记录删，不按配置现算。改了别名之后旧产物仍在原来的位置，
+/// 现算会指向一个从来没写过的路径 —— 删不到，旧文件就永远留在 output_dir 里。
+#[tokio::test]
+async fn cleanup_uses_the_recorded_artifact_path() {
+    let mut db = test_db().await;
+    let env = Env::new();
+    let src = env.write_source("a.pdf", "x");
+    // 产物路径直接落在 output_dir 下（库里记的就是这个），不经过 output_path ——
+    // 后者会拼上当前别名，反而把产物写到测试要断言的位置之外。
+    let artifact = Path::new(&env.output_dir).join("work/a.pdf.md");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, "# 旧别名下的产物").unwrap();
+    db.insert_file_row_full(1, &src, "s1", 1, None, Some("work/a.pdf.md"))
+        .await;
+
+    let server = common::MockServer::start(vec![
+        common::Route::post("/login")
+            .and(common::CannedResponse::json(200, r#"{"access_token":"t"}"#)),
+    ])
+    .await;
+    let mut cfg = env.config(2);
+    cfg.lightrag_url = server.base_url.clone();
+
+    delete_old_files(&cfg, &mut db.conn).await.unwrap();
+
+    assert!(
+        !artifact.exists(),
+        "库里记的是 work/a.pdf.md，现在算出来的是 sync/a.pdf.md —— 认错位置就删不掉"
+    );
+}
+
+/// 加列之前入库的行没有 output_rel_path：两个候选都试，
+/// 真正的那个（旧规则、不带别名目录）要能删掉。
+/// 「算不出带别名的路径」不能被当成「找不到」—— 那会让这些产物永远失去关联。
+#[tokio::test]
+async fn cleanup_falls_back_to_the_legacy_artifact_path() {
+    let mut db = test_db().await;
+    let env = Env::new();
+    let src = env.write_source("旧报告.pdf", "x");
+    // 旧布局：产物直接躺在 output_dir 下，没有别名那一层。
+    // 现算出来的候选是 sync/旧报告.pdf.md，这里两个都试才删得到
+    let artifact = Path::new(&env.output_dir).join("旧报告.pdf.md");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, "# 旧布局产物").unwrap();
+    db.insert_file_row_full(1, &src, "s1", 1, None, None).await;
+
+    let server = common::MockServer::start(vec![
+        common::Route::post("/login")
+            .and(common::CannedResponse::json(200, r#"{"access_token":"t"}"#)),
+    ])
+    .await;
+    let mut cfg = env.config(2);
+    cfg.lightrag_url = server.base_url.clone();
+
+    delete_old_files(&cfg, &mut db.conn).await.unwrap();
+
+    assert!(
+        !artifact.exists(),
+        "旧布局的产物也要删得到，否则它永远失去关联"
+    );
+    assert!(!DBfunc::file_exists(&mut db.conn, &src).await.unwrap());
+}
+
+/// 加列前入库、源文件又已经移出配置目录的行：反推不出产物位置，
+/// 但 DB 行必须清掉，否则它会每一轮都重来一遍并卡住清理。
+#[tokio::test]
+async fn cleanup_removes_row_even_when_artifact_is_unfindable() {
+    let mut db = test_db().await;
+    let env = Env::new();
+    let old_src = "/home/old/Documents/旧报告.pdf";
+    db.insert_file_row_full(1, old_src, "s1", 1, None, None).await;
+
+    let server = common::MockServer::start(vec![
+        common::Route::post("/login")
+            .and(common::CannedResponse::json(200, r#"{"access_token":"t"}"#)),
+    ])
+    .await;
+    let mut cfg = env.config(2);
+    cfg.lightrag_url = server.base_url.clone();
+
+    delete_old_files(&cfg, &mut db.conn).await.unwrap();
+
+    assert!(
+        !DBfunc::file_exists(&mut db.conn, old_src).await.unwrap(),
+        "定位不到产物不能让这一行把清理永久卡住"
+    );
+}
+
+/// 产物路径记错了也要真去删那一行，不能当成「不在了」就把 DB 行删掉。
+#[tokio::test]
+async fn cleanup_prefers_recorded_path_even_if_file_is_gone() {
+    let mut db = test_db().await;
+    let env = Env::new();
+    let src = env.write_source("a.pdf", "x");
+    // 记了一个不存在的路径：模拟产物被人手工挪走
+    db.insert_file_row_full(1, &src, "s1", 1, None, Some("work/别处/a.pdf.md"))
+        .await;
+
+    let server = common::MockServer::start(vec![
+        common::Route::post("/login")
+            .and(common::CannedResponse::json(200, r#"{"access_token":"t"}"#)),
+    ])
+    .await;
+    let mut cfg = env.config(2);
+    cfg.lightrag_url = server.base_url.clone();
+
+    // 文件不在了正是预期结果，不该报错
+    delete_old_files(&cfg, &mut db.conn).await.unwrap();
+    assert!(!DBfunc::file_exists(&mut db.conn, &src).await.unwrap());
+}
+
 #[tokio::test]
 async fn scan_empty_dir_returns_empty() {
     let mut db = test_db().await;
     let env = Env::new();
     assert!(get_files(&env.config(1), &mut db.conn).await.unwrap().is_empty());
+}
+
+/// 清理时要按别名子目录去找产物：算错一层就删不到文件，
+/// 而产物失去关联后会一直躺在 output_dir 里。
+#[tokio::test]
+async fn cleanup_deletes_artifact_of_the_right_alias() {
+    let mut db = test_db().await;
+    let mut env = Env::new();
+    let personal = env.add_folder("personal");
+    let src = env.write_source_in("personal", "报告.pdf", "x");
+    let artifact = env.output_path_in("personal", "报告.pdf.md");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, "# 过期").unwrap();
+    db.insert_file_row(1, &src, "s1", 1, None).await;
+
+    let server = common::MockServer::start(vec![
+        common::Route::post("/login")
+            .and(common::CannedResponse::json(200, r#"{"access_token":"t"}"#)),
+    ])
+    .await;
+    let mut cfg = env.config(2);
+    cfg.lightrag_url = server.base_url.clone();
+
+    delete_old_files(&cfg, &mut db.conn).await.unwrap();
+
+    assert!(!artifact.exists(), "产物应按 <别名>/ 删掉");
+    assert!(!DBfunc::file_exists(&mut db.conn, &src).await.unwrap());
+    assert!(Path::new(&personal).is_dir(), "只删产物，不碰同步目录本身");
+    assert!(Path::new(&src).exists(), "原件始终不能动");
+}
+
+/// 别名从配置里删掉后，产物照样删得到 —— 靠的是库里记的路径，不是配置。
+/// 这正是加这一列的全部意义：配置会变，产物的位置只有一条记录能说清楚。
+#[tokio::test]
+async fn cleanup_finds_artifact_even_after_alias_is_removed() {
+    let mut db = test_db().await;
+    let env = Env::new();
+    let src = env.write_source("a.pdf", "x");
+    // 产物位置按库里记的来，所以直接写在 output_dir 根下，不拼别名
+    let artifact = Path::new(&env.output_dir).join("a.pdf.md");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, "# 过期").unwrap();
+    db.insert_file_row_full(1, &src, "s1", 1, None, Some("a.pdf.md")).await;
+
+    let server = common::MockServer::start(vec![
+        common::Route::post("/login")
+            .and(common::CannedResponse::json(200, r#"{"access_token":"t"}"#)),
+    ])
+    .await;
+    let mut cfg = env.config(2);
+    cfg.lightrag_url = server.base_url.clone();
+    // 换一个不包含该文件的目录，等价于用户改了配置
+    cfg.sync_folders = vec![rag_sync::sync_config::SyncFolder {
+        name: "elsewhere".into(),
+        path: env.root.path().join("elsewhere").to_string_lossy().into_owned(),
+    }];
+
+    delete_old_files(&cfg, &mut db.conn).await.unwrap();
+
+    assert!(
+        !artifact.exists(),
+        "别名没了但库里记着路径，产物必须删掉，否则它永远留在 output_dir 里"
+    );
+    assert!(!DBfunc::file_exists(&mut db.conn, &src).await.unwrap());
 }
 
 // ---------------------------------------------------------------- delete_old_files

@@ -25,6 +25,7 @@ pub trait DBfunc {
         sha256: &str,
         run_id: i32,
         file_rag_id: Option<&str>,
+        output_rel_path: &str,
     ) -> Result<(), Box<dyn std::error::Error>>;
     async fn delete_file(&mut self, file_path: &str) -> Result<(), Box<dyn std::error::Error>>;
     async fn get_run_counter(
@@ -52,6 +53,13 @@ pub trait DBfunc {
         file_path: &str,
         new_rag_id: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> ;
+    /// 记下产物相对路径。跟着 rag_id 一起写：两者描述的是同一份产物的同一个状态，
+    /// 分开写就会出现「知识库里已经是新的，记录还指着旧的产物」。
+    async fn update_output_rel_path(
+        &mut self,
+        file_path: &str,
+        new_output_rel_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>>;
     async fn found_file_less_than_run_id(
         &mut self,
         file_run_id: i32,
@@ -134,8 +142,10 @@ impl DBfunc for Conn {
         sha256_value: &str,
         run_id: i32,
         file_rag_id: Option<&str>,
+        rel_path: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::schema::files::dsl::{files, path, rag_id, run_id as file_run_id, sha256};
+        // 参数名不能叫 output_rel_path：会盖掉同名的列，`.eq()` 就套到 &str 上了
+        use crate::schema::files::dsl::{files, output_rel_path, path, rag_id, run_id as file_run_id, sha256};
         // 不写 id：让它走 AUTOINCREMENT
         diesel::insert_into(files)
             .values((
@@ -143,6 +153,7 @@ impl DBfunc for Conn {
                 sha256.eq(sha256_value),
                 file_run_id.eq(run_id),
                 rag_id.eq(file_rag_id),
+                output_rel_path.eq(rel_path),
             ))
             .execute(self)
             .await?;
@@ -202,6 +213,18 @@ impl DBfunc for Conn {
         use crate::schema::files::dsl::*;
         diesel::update(files.filter(path.eq(file_path)))
             .set(rag_id.eq(new_rag_id))
+            .execute(self)
+            .await?;
+        Ok(())
+    }
+    async fn update_output_rel_path(
+        &mut self,
+        file_path: &str,
+        new_output_rel_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::schema::files::dsl::*;
+        diesel::update(files.filter(path.eq(file_path)))
+            .set(output_rel_path.eq(new_output_rel_path))
             .execute(self)
             .await?;
         Ok(())

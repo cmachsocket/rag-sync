@@ -97,10 +97,11 @@ async fn new_file_end_to_end() {
     // 上传给 LightRAG 的就是刚写出来的产物文件，文件名以 .md 收尾：
     // LightRAG 按扩展名选解析器，产物里装的是 markdown，带 .docx 会判成
     // "File is not a valid DOCX document"。
+    // 名字还带别名前缀：服务端以文件名为唯一键，目录前缀它看不见。
     let upload = server.requests_to("POST", "/documents/upload");
     assert_eq!(upload.len(), 1);
     assert!(
-        upload[0].body_str().contains(r#"filename="a.pdf.md""#),
+        upload[0].body_str().contains(r#"filename="sync__a.pdf.md""#),
         "{}",
         upload[0].body_str()
     );
@@ -127,6 +128,102 @@ async fn nested_layout_preserved_in_output() {
         .unwrap();
 
     assert!(env.output_path("2024/一季度/a.pdf.md").exists());
+}
+
+/// 两个别名下的**同名**文件共用一个 output_dir：产物各落各的子目录，
+/// 上传名也必须不同 —— 否则第二个会 409，自愈流程把第一个从知识库里删掉。
+#[tokio::test]
+async fn same_name_in_two_aliases_stays_separate() {
+    let mut db = common::test_db().await;
+    let (mut env, server) = env_with_services("# 标题").await;
+    env.write_source("2024/报告.pdf", "工作版");
+    env.add_folder("personal");
+    env.write_source_in("personal", "2024/报告.pdf", "私人版");
+
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    assert_eq!(files.len(), 2);
+    create_output_files(&env.config(1), &files, &mut db.conn)
+        .await
+        .unwrap();
+
+    assert_eq!(env.output_text("2024/报告.pdf.md"), "# 标题");
+    assert_eq!(
+        env.output_text_in("personal", "2024/报告.pdf.md"),
+        "# 标题",
+        "两个别名下的产物要各自存在，不能互相覆盖"
+    );
+
+    let uploaded: Vec<String> = server
+        .requests_to("POST", "/documents/upload")
+        .iter()
+        .map(|r| {
+            let b = r.body_str();
+            let s = b.find("filename=\"").unwrap() + "filename=\"".len();
+            b[s..b[s..].find('"').unwrap() + s].to_string()
+        })
+        .collect();
+    assert_eq!(uploaded.len(), 2, "{uploaded:?}");
+    assert!(uploaded.contains(&"sync__报告.pdf.md".to_string()), "{uploaded:?}");
+    assert!(uploaded.contains(&"personal__报告.pdf.md".to_string()), "{uploaded:?}");
+    // 上传名相同的话，第二个会 409，而 409 自愈要走去删文档的接口
+    assert_eq!(
+        server.count_to("DELETE", "/documents/delete_document"),
+        0,
+        "两个同名文件不该触发 409 自愈"
+    );
+}
+
+/// 别名改了、目录也还在同一份 DB 里，但产物会落到另一个子目录 —— 这时必须
+/// 重新处理：sha256 一样，光刷 run_id 会留下一份永远对不上的产物，
+/// 知识库里也会一直是旧名字的文档。
+#[tokio::test]
+async fn changed_artifact_path_forces_reprocessing() {
+    let mut db = common::test_db().await;
+    let (env, server) = env_with_services("# 标题").await;
+    let src = env.write_source("a.pdf", "pdf 内容");
+    let sha = rag_sync::sync_folder::sha256_file(&src).await.unwrap();
+
+    // 上一轮跑完了，产物路径记的是别的别名
+    db.insert_file_row_full(1, &src, &sha, 1, Some("doc-old"), Some("work/a.pdf.md"))
+        .await;
+
+    let files = get_files(&env.config(2), &mut db.conn).await.unwrap();
+    create_output_files(&env.config(2), &files, &mut db.conn)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.count_to("POST", "/documents/upload"),
+        1,
+        "产物路径变了却跳过，重新上传的文档永远对不上产物"
+    );
+    assert_eq!(env.output_text("a.pdf.md"), "# 标题");
+    let row = DBfunc::get_file(&mut db.conn, &src).await.unwrap().unwrap();
+    assert_eq!(
+        row.output_rel_path.as_deref(),
+        Some("sync/a.pdf.md"),
+        "产物路径要跟着更新，否则下一轮还会当成变了"
+    );
+}
+
+/// 产物路径在第一次落库时就要写进去。清理阶段全靠它定位产物，
+/// 写晚了等于那一轮的产物失去了关联。
+#[tokio::test]
+async fn artifact_path_is_recorded_on_first_insert() {
+    let mut db = common::test_db().await;
+    let (env, _s) = env_with_services("md").await;
+    let src = env.write_source("2024/一季度/a.pdf", "x");
+
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    create_output_files(&env.config(1), &files, &mut db.conn)
+        .await
+        .unwrap();
+
+    let row = DBfunc::get_file(&mut db.conn, &src).await.unwrap().unwrap();
+    assert_eq!(
+        row.output_rel_path.as_deref(),
+        Some("sync/2024/一季度/a.pdf.md")
+    );
 }
 
 #[tokio::test]
@@ -173,9 +270,9 @@ async fn txt_md_and_markdown_are_passed_through() {
             b[s..b[s..].find('"').unwrap() + s].to_string()
         })
         .collect();
-    assert!(uploaded.contains(&"a.md".to_string()), "{uploaded:?}");
-    assert!(uploaded.contains(&"b.txt.md".to_string()), "{uploaded:?}");
-    assert!(uploaded.contains(&"c.markdown.md".to_string()), "{uploaded:?}");
+    assert!(uploaded.contains(&"sync__a.md".to_string()), "{uploaded:?}");
+    assert!(uploaded.contains(&"sync__b.txt.md".to_string()), "{uploaded:?}");
+    assert!(uploaded.contains(&"sync__c.markdown.md".to_string()), "{uploaded:?}");
 
     // 透传的文件也照常落库
     let src = env.write_source("a.md", md);
