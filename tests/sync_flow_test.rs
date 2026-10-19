@@ -6,7 +6,20 @@ mod common;
 
 use common::{CannedResponse as R, Env, MockServer, Route};
 use rag_sync::database::DBfunc;
-use rag_sync::sync_folder::{create_output_files, get_files};
+use rag_sync::sync_folder::{
+    RetryPolicy, create_output_files, create_output_files_with_retry, get_files,
+};
+use std::time::Duration;
+
+/// 5 次尝试、不退避。失败用例看的是「失败冒泡 / 重试到成功」这些语义，
+/// 而不是节奏 —— 用默认的 2s/4s/6s/8s 会让每个失败用例白等 20 秒。
+/// 节奏本身由 `default_retry_policy_is_five_attempts_with_growing_backoff` 钉住。
+fn no_backoff() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 5,
+        base_delay: Duration::ZERO,
+    }
+}
 
 fn rag_login_ok() -> Route {
     Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#))
@@ -219,12 +232,19 @@ async fn mineru_failure_writes_nothing() {
     let src = env.write_source("a.pdf", "pdf 内容");
 
     let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
-    let err = create_output_files(&env.config(1), &files, &mut db.conn)
+    let err = create_output_files_with_retry(&env.config(1), &files, &mut db.conn, no_backoff())
         .await
         .unwrap_err()
         .to_string();
 
     assert!(err.contains("a.pdf"), "{err}");
+    assert!(err.contains("尝试 5 次"), "耗尽次数要把次数说清楚: {err}");
+    // 5 次不多不少：少于 5 次是没重试够，多于 5 次是失控重试
+    assert_eq!(
+        server.count_to("POST", "/v1/uploads"),
+        5,
+        "每个文件失败要试满 5 次"
+    );
     assert!(
         !env.output_path("a.pdf.md").exists(),
         "失败时不该留下空产物"
@@ -251,11 +271,16 @@ async fn rag_upload_failure_records_nothing() {
     let src = env.write_source("a.pdf", "pdf 内容");
 
     let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
-    let err = create_output_files(&env.config(1), &files, &mut db.conn)
+    let err = create_output_files_with_retry(&env.config(1), &files, &mut db.conn, no_backoff())
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("知识库不可写"), "{err}");
+    assert_eq!(
+        server.count_to("POST", "/documents/upload"),
+        5,
+        "每次重试都要重跑整条链路（转换 -> 写产物 -> 上传）"
+    );
     assert!(
         !DBfunc::file_exists(&mut db.conn, &src).await.unwrap(),
         "LightRAG 没成功就不能记成已完成"
@@ -318,7 +343,104 @@ async fn one_failure_is_not_swallowed() {
     env.write_source("a.pdf", "x");
 
     let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
-    let res = create_output_files(&env.config(1), &files, &mut db.conn).await;
+    let res =
+        create_output_files_with_retry(&env.config(1), &files, &mut db.conn, no_backoff()).await;
 
     assert!(res.is_err(), "单个文件失败必须冒泡，不能当成功收尾");
+    assert_eq!(
+        server.count_to("POST", "/v1/file_parse"),
+        5,
+        "冒泡之前要先把 5 次机会用完"
+    );
+}
+
+/// 服务端抖两下就自愈：第 3 次成功后必须当成正常完成 —— 落盘、入库、
+/// 记 run_id，一个都不许少。
+#[tokio::test]
+async fn transient_failure_is_retried_until_success() {
+    let mut db = common::test_db().await;
+    let mut env = Env::new();
+    let mut routes = mineru_routes("# 标题");
+    // 队列按顺序消费：500 -> 500 -> 201，正好对上前两次失败、第三次成功
+    routes[0] = Route::post("/v1/uploads")
+        .and(R::json(500, r#"{"detail":"解析器抖动"}"#))
+        .and(R::json(500, r#"{"detail":"解析器抖动"}"#))
+        .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#));
+    routes.push(rag_login_ok());
+    routes.push(upload_ok());
+    routes.push(track_terminal("doc-1"));
+    let server = MockServer::start(routes).await;
+    env.mineru_url = server.base_url.clone();
+    env.lightrag_url = server.base_url.clone();
+    let src = env.write_source("a.pdf", "pdf 内容");
+
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    let out = create_output_files_with_retry(&env.config(1), &files, &mut db.conn, no_backoff())
+        .await
+        .unwrap();
+
+    assert_eq!(out.len(), 1, "重试成功也算成功");
+    assert_eq!(env.output_text("a.pdf.md"), "# 标题");
+    assert_eq!(
+        server.count_to("POST", "/v1/uploads"),
+        3,
+        "两次失败 + 一次成功"
+    );
+    let row = DBfunc::get_file(&mut db.conn, &src).await.unwrap().unwrap();
+    assert_eq!(row.rag_id.as_deref(), Some("doc-1"), "成功那次的 doc_id 要落库");
+}
+
+/// 耗尽 5 次立刻中止整轮：同批后面排着的文件本轮不许开始，
+/// 否则「中止」就只是把失败摊得更开。
+#[tokio::test]
+async fn retries_exhausted_aborts_the_run_and_skips_remaining_files() {
+    let mut db = common::test_db().await;
+    let mut env = Env::new();
+    let server = MockServer::start(vec![
+        Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
+        Route::post("/v1/uploads").and(R::json(500, r#"{"detail":"解析器不可用"}"#)),
+    ])
+    .await;
+    env.mineru_url = server.base_url.clone();
+    env.lightrag_url = server.base_url.clone();
+    // a.pdf 排在 b.pdf 前面（get_files 按路径排序），失败的是 a
+    env.write_source("a.pdf", "x");
+    env.write_source("b.pdf", "y");
+
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    assert_eq!(files.len(), 2);
+    let err = create_output_files_with_retry(&env.config(1), &files, &mut db.conn, no_backoff())
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("a.pdf"), "{err}");
+    assert_eq!(
+        server.count_to("POST", "/v1/uploads"),
+        5,
+        "只有 a.pdf 的 5 次，b.pdf 一次都不许发"
+    );
+    assert!(
+        !env.output_path("a.pdf.md").exists() && !env.output_path("b.pdf.md").exists(),
+        "中止时不许留下任何产物"
+    );
+}
+
+/// 生产节奏钉在这里：5 次尝试、2s/4s/6s/8s 递增退避。
+/// 这些是「要成立的行为」，改常量必须先改这个用例。
+#[test]
+fn default_retry_policy_is_five_attempts_with_growing_backoff() {
+    let policy = RetryPolicy::default();
+    assert_eq!(policy.max_attempts, 5, "每个文件 5 次尝试");
+
+    let mut wait = Duration::ZERO;
+    for attempt in 1..policy.max_attempts {
+        wait += policy.base_delay * attempt;
+    }
+    assert_eq!(policy.base_delay, Duration::from_secs(2), "退避基数 2 秒");
+    assert_eq!(
+        wait,
+        Duration::from_secs(2 + 4 + 6 + 8),
+        "四次等待合计 20 秒"
+    );
 }

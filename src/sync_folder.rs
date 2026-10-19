@@ -9,6 +9,7 @@ use std::io::{self};
 use std::{
     eprintln,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use tokio;
 use tokio::fs;
@@ -212,10 +213,48 @@ async fn select_pending<'a>(
     Ok(todo)
 }
 
+/// 单个文件失败后的重试节奏。默认 5 次尝试、间隔 2s/4s/6s/8s 递增：
+/// MinerU / LightRAG 的抖动（限流、pipeline 忙）多半几秒内自愈，
+/// 太密的重试只是把一次故障放大成一串请求。
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// 总尝试次数（不是「重试次数」）。至少为 1。
+    pub max_attempts: u32,
+    /// 第 n 次失败后的等待 = `base_delay * n`。
+    pub base_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            base_delay: Duration::from_secs(2),
+        }
+    }
+}
+
+/// 逐个把待同步文件转成产物并写进知识库，返回产物路径。
+///
+/// 单个文件按 [`RetryPolicy::default`] 重试 5 次；**耗尽后立刻中止整轮**，
+/// 后面的文件本轮不再开始。中止会带着文件路径与原因上抛 -> `main` 非零退出、
+/// run_counter 不推进，下一轮同一个 run_id 断点续跑（已完成的按 sha256 跳过）。
 pub async fn create_output_files(
     config: &sync_config::SyncConfig,
     files: &[db_model::File],
     conn: &mut database::Conn,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    create_output_files_with_retry(config, files, conn, RetryPolicy::default()).await
+}
+
+/// 同 [`create_output_files`]，但重试节奏由调用方指定。
+///
+/// 拆出来是为了让测试能把退避调成 0：节奏本身只是个常量，
+/// 没必要让失败用例干等 20 秒才断言「失败冒泡」。
+pub async fn create_output_files_with_retry(
+    config: &sync_config::SyncConfig,
+    files: &[db_model::File],
+    conn: &mut database::Conn,
+    retry: RetryPolicy,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let todo = select_pending(config, files, conn).await?;
     let mut output_files: Vec<PathBuf> = Vec::new();
@@ -233,43 +272,102 @@ pub async fn create_output_files(
     )
     .await?;
     for file in todo {
-        let file_path = Path::new(&file.path);
-        create_output_dir(config, file_path).await?;
-        let markdown = match passthrough_content(file_path).await? {
-            Some(content) => {
-                println!("[透传] {} 已跳过 MinerU", file_path.display());
-                content
-            }
-            None => mineru_tackle(&client, file, config).await?,
-        };
-
-        let rel = output_relative_path(&config.sync_dir, file_path).await?;
-        let output_file_path = Path::new(&config.output_dir).join(rel);
-        fs::write(&output_file_path, &markdown).await.map_err(|e| {
-            format!("写入输出文件 {} 失败: {e}", output_file_path.display())
-        })?;
-        println!("已生成输出文件: {}", output_file_path.display());
-        output_files.push(output_file_path.clone());
-        let path_str = output_file_path.to_str().ok_or_else(|| {
-            format!(
-                "无法将输出文件路径转换为字符串: {}",
-                output_file_path.display()
-            )
-        })?;
-
-        let rag_id = rag_request.upload_file(path_str).await?;
-        println!("RAG 上传结果: {}", rag_id);
-        // 记录必须在上传成功之后写：LightRAG 没收到就不能算这文件已同步
-        if file.id != NOT_IN_DB {
-            DBfunc::update_rag_id(conn, &file.path, Some(&rag_id)).await?;
-            DBfunc::update_file_run_id(conn, &file.path, config.run_id).await?;
-            DBfunc::update_sha256(conn, &file.path, &file.sha256).await?;
-        } else {
-            DBfunc::insert_file(conn, &file.path, &file.sha256, config.run_id, Some(&rag_id))
-                .await?;
-        }
+        output_files.push(
+            process_one_file_with_retry(&client, &rag_request, config, conn, file, retry).await?,
+        );
     }
     Ok(output_files)
+}
+
+/// 单个文件的重试循环：每次都从头跑完整链路（建目录 -> 转换 -> 写产物 ->
+/// 上传 -> 落库），失败按 `base_delay * n` 退避后重来。
+///
+/// 重跑是安全的：MinerU 按 sha256 幂等，LightRAG 同名 409 会自愈，
+/// DB 的三条更新本身幂等。
+async fn process_one_file_with_retry(
+    client: &reqwest::Client,
+    rag_request: &RAGRequest<'_>,
+    config: &sync_config::SyncConfig,
+    conn: &mut database::Conn,
+    file: &db_model::File,
+    retry: RetryPolicy,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // 0 次会让第一次抖动就直接失败，压成 1 次
+    let max_attempts = retry.max_attempts.max(1);
+    let mut attempt = 1;
+    loop {
+        match process_one_file(client, rag_request, config, conn, file).await {
+            Ok(output_file_path) => return Ok(output_file_path),
+            Err(e) if attempt >= max_attempts => {
+                // 路径与原因都留着：CLI 与测试都靠它定位是哪个文件
+                return Err(format!(
+                    "{} 处理失败（尝试 {attempt} 次后放弃，本轮中止）: {e}",
+                    file.path
+                )
+                .into());
+            }
+            Err(e) => {
+                let delay = retry.base_delay * attempt;
+                println!(
+                    "[重试] {} 第 {attempt}/{max_attempts} 次失败，{} 秒后重试: {e}",
+                    file.path,
+                    delay.as_secs()
+                );
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// 单个文件的一次完整处理，成功返回产物路径。
+///
+/// 落库是最后一步：LightRAG 没收到就不能记成已同步，否则会留下
+/// 「库里有行、知识库没文档」的假完成状态。
+async fn process_one_file(
+    client: &reqwest::Client,
+    rag_request: &RAGRequest<'_>,
+    config: &sync_config::SyncConfig,
+    conn: &mut database::Conn,
+    file: &db_model::File,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let file_path = Path::new(&file.path);
+    create_output_dir(config, file_path).await?;
+    let markdown = match passthrough_content(file_path).await? {
+        Some(content) => {
+            println!("[透传] {} 已跳过 MinerU", file_path.display());
+            content
+        }
+        None => mineru_tackle(client, file, config).await?,
+    };
+
+    let rel = output_relative_path(&config.sync_dir, file_path).await?;
+    let output_file_path = Path::new(&config.output_dir).join(rel);
+    fs::write(&output_file_path, &markdown).await.map_err(|e| {
+        format!("写入输出文件 {} 失败: {e}", output_file_path.display())
+    })?;
+    println!("已生成输出文件: {}", output_file_path.display());
+    let path_str = output_file_path.to_str().ok_or_else(|| {
+        format!(
+            "无法将输出文件路径转换为字符串: {}",
+            output_file_path.display()
+        )
+    })?;
+
+    let rag_id = rag_request.upload_file(path_str).await?;
+    println!("RAG 上传结果: {}", rag_id);
+    // 记录必须在上传成功之后写：LightRAG 没收到就不能算这文件已同步
+    if file.id != NOT_IN_DB {
+        DBfunc::update_rag_id(conn, &file.path, Some(&rag_id)).await?;
+        DBfunc::update_file_run_id(conn, &file.path, config.run_id).await?;
+        DBfunc::update_sha256(conn, &file.path, &file.sha256).await?;
+    } else {
+        DBfunc::insert_file(conn, &file.path, &file.sha256, config.run_id, Some(&rag_id))
+            .await?;
+    }
+    Ok(output_file_path)
 }
 
 /// 清理「上轮见过、这轮没扫到」的文件。只清理我们自己造出来的东西，
