@@ -8,10 +8,9 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 单次读操作的上限。流式上传时是每个 chunk 各自计时，不会截断大文件。
 pub const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// 建一个带超时的 HTTP 客户端。
-///
-/// reqwest 默认不限制连接与读取时间，而轮询里的上限只在请求返回之后才检查得到，
-/// 挡不住不回包的服务端。不设整体 `timeout()`：`put_content` 是流式上传大文件。
+/// 建一个带超时的 HTTP 客户端。reqwest 默认不限制连接与读取时间，
+/// 轮询里的超时又只在请求返回之后才检查得到，挡不住不回包的服务端。
+/// 不设整体 `timeout()`：`put_content` 是流式上传大文件。
 pub fn client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -20,8 +19,7 @@ pub fn client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
     Ok(client)
 }
 
-/// 读响应体，**只用于错误信息**。空 body 与读取失败必须标成不同文案，
-/// 否则排查时会照着一个并不存在的空 body 去猜原因。
+/// 读响应体，**只用于错误信息**。空 body 与读取失败必须标成不同文案。
 pub async fn error_body(resp: reqwest::Response) -> String {
     match resp.text().await {
         Ok(body) if body.trim().is_empty() => "<空响应>".into(),

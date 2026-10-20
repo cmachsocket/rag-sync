@@ -1,7 +1,5 @@
 //! DBfunc 的行为测试，跑的是真 SQLite + 真 migration。
-//!
 //! 固定的是同步流程依赖的两个字段：sha256 判变化、run_id 判「本轮还在不在」。
-//! 写错方向的症状是「用户文档被删」而不是报错。
 
 mod common;
 
@@ -10,13 +8,24 @@ use rag_sync::database::DBfunc;
 use rag_sync::db_model::File;
 
 async fn insert_one_file(conn: &mut rag_sync::database::Conn) -> File {
-    DBfunc::insert_file(conn, "/sync/a.pdf", "sha-a", 1, Some("doc-1"), "probe/a.pdf.md")
+    DBfunc::insert_file(
+        conn,
+        "/sync/a.pdf",
+        "sha-a",
+        1,
+        Some("doc-1"),
+        "probe/a.pdf.md",
+        "uploaded-sha",
+    )
+    .await
+    .unwrap();
+    DBfunc::get_file(conn, "/sync/a.pdf")
         .await
-        .unwrap();
-    DBfunc::get_file(conn, "/sync/a.pdf").await.unwrap().unwrap()
+        .unwrap()
+        .unwrap()
 }
 
-// ---------------------------------------------------------------- 增删查
+// 增删查
 
 #[tokio::test]
 async fn inserted_row_round_trips() {
@@ -30,21 +39,42 @@ async fn inserted_row_round_trips() {
 #[tokio::test]
 async fn file_exists_is_false_for_missing() {
     let mut db = test_db().await;
-    assert!(!DBfunc::file_exists(&mut db.conn, "/sync/a.pdf").await.unwrap());
+    assert!(
+        !DBfunc::file_exists(&mut db.conn, "/sync/a.pdf")
+            .await
+            .unwrap()
+    );
     insert_one_file(&mut db.conn).await;
-    assert!(DBfunc::file_exists(&mut db.conn, "/sync/a.pdf").await.unwrap());
+    assert!(
+        DBfunc::file_exists(&mut db.conn, "/sync/a.pdf")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
 async fn get_missing_row_returns_none() {
     let mut db = test_db().await;
-    assert_eq!(DBfunc::get_sha256(&mut db.conn, "/nope").await.unwrap(), None);
-    assert_eq!(DBfunc::get_file_run_id(&mut db.conn, "/nope").await.unwrap(), None);
-    assert!(DBfunc::get_file(&mut db.conn, "/nope").await.unwrap().is_none());
+    assert_eq!(
+        DBfunc::get_sha256(&mut db.conn, "/nope").await.unwrap(),
+        None
+    );
+    assert_eq!(
+        DBfunc::get_file_run_id(&mut db.conn, "/nope")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        DBfunc::get_file(&mut db.conn, "/nope")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(!DBfunc::file_exists(&mut db.conn, "/nope").await.unwrap());
 }
 
-// ---------------------------------------------------------------- 更新
+// 更新
 
 #[tokio::test]
 async fn update_sha256_touches_only_target_row() {
@@ -57,12 +87,16 @@ async fn update_sha256_touches_only_target_row() {
         .unwrap();
 
     assert_eq!(
-        DBfunc::get_sha256(&mut db.conn, "/sync/a.pdf").await.unwrap(),
+        DBfunc::get_sha256(&mut db.conn, "/sync/a.pdf")
+            .await
+            .unwrap(),
         Some("sha-a2".to_string())
     );
     // 兄弟行不能被带偏
     assert_eq!(
-        DBfunc::get_sha256(&mut db.conn, "/sync/b.pdf").await.unwrap(),
+        DBfunc::get_sha256(&mut db.conn, "/sync/b.pdf")
+            .await
+            .unwrap(),
         Some("sha-b".to_string())
     );
 }
@@ -75,13 +109,19 @@ async fn update_rag_id_can_write_back_none() {
     DBfunc::update_rag_id(&mut db.conn, "/sync/a.pdf", None)
         .await
         .unwrap();
-    let f = DBfunc::get_file(&mut db.conn, "/sync/a.pdf").await.unwrap().unwrap();
+    let f = DBfunc::get_file(&mut db.conn, "/sync/a.pdf")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(f.rag_id, None);
 
     DBfunc::update_rag_id(&mut db.conn, "/sync/a.pdf", Some("doc-2"))
         .await
         .unwrap();
-    let f = DBfunc::get_file(&mut db.conn, "/sync/a.pdf").await.unwrap().unwrap();
+    let f = DBfunc::get_file(&mut db.conn, "/sync/a.pdf")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(f.rag_id.as_deref(), Some("doc-2"));
 }
 
@@ -96,16 +136,20 @@ async fn update_run_id_touches_only_target_row() {
         .unwrap();
 
     assert_eq!(
-        DBfunc::get_file_run_id(&mut db.conn, "/sync/a.pdf").await.unwrap(),
+        DBfunc::get_file_run_id(&mut db.conn, "/sync/a.pdf")
+            .await
+            .unwrap(),
         Some(99)
     );
     assert_eq!(
-        DBfunc::get_file_run_id(&mut db.conn, "/sync/b.pdf").await.unwrap(),
+        DBfunc::get_file_run_id(&mut db.conn, "/sync/b.pdf")
+            .await
+            .unwrap(),
         Some(7)
     );
 }
 
-// ---------------------------------------------------------------- run_counter
+// run_counter
 
 #[tokio::test]
 async fn migration_seeds_single_counter_row() {
@@ -118,12 +162,15 @@ async fn migration_seeds_single_counter_row() {
 async fn run_counter_updates_single_row() {
     let mut db = test_db().await;
     DBfunc::update_run_counter(&mut db.conn, 42).await.unwrap();
-    let c = DBfunc::get_run_counter(&mut db.conn).await.unwrap().unwrap();
+    let c = DBfunc::get_run_counter(&mut db.conn)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(c.current_run_id, 42);
     assert_eq!(c.id, 1, "表结构限定 id 恒为 1");
 }
 
-// ---------------------------------------------------------------- run_id 范围查询
+// run_id 范围查询
 
 #[tokio::test]
 async fn found_older_than_is_strict_and_ordered() {
@@ -170,10 +217,12 @@ async fn found_older_than_spares_current_run() {
     let mut db = test_db().await;
     db.insert_file_row(1, "/sync/a.pdf", "s1", 4, None).await;
     // 本轮 run_id == 4，严格小于的查询必须放过它
-    assert!(DBfunc::found_file_less_than_run_id(&mut db.conn, 4)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        DBfunc::found_file_less_than_run_id(&mut db.conn, 4)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     // 但下一轮（run_id 5）它就成了旧文件
     assert_eq!(
         DBfunc::found_file_less_than_run_id(&mut db.conn, 5)

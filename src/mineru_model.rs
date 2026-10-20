@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// POST /v1/uploads 请求体。契约为 additionalProperties: false，字段名必须严格一致。
-// sha256sum 可选，但传了服务端才能幂等去重，本地算好的 sha256 直接复用。
+// POST /v1/uploads 请求体，契约为 additionalProperties: false，字段名必须严格一致；
+// sha256sum 服务端据此幂等去重。
 #[derive(Serialize)]
 pub struct FileUploadRequest<'a> {
     /// 只取文件名，不含目录。服务端据此决定解析器与产物命名。
@@ -12,8 +12,8 @@ pub struct FileUploadRequest<'a> {
     pub sha256sum: &'a str,
 }
 
-// POST /v1/uploads 与 GET /v1/uploads/{id} 共用的响应。
-// 按 sha256 幂等命中时 upload_url / upload_method / file 均为 null，故全部为 Option。
+// POST /v1/uploads 与 GET /v1/uploads/{id} 共用的响应；
+// 按 sha256 幂等命中时 file 为 null，故为 Option。
 #[derive(Deserialize)]
 pub struct UploadObject {
     pub id: String,
@@ -62,8 +62,7 @@ impl FileSource {
     }
 }
 
-// POST /v1/parse/jobs 的请求体。契约同为 additionalProperties: false，
-// 顶层只有 files 一个必填字段，多塞字段直接 422。
+// POST /v1/parse/jobs 的请求体，同为 additionalProperties: false，多塞字段直接 422。
 #[derive(Serialize)]
 pub struct CreateJobRequest {
     pub files: Vec<JobFileEntry>,
@@ -75,14 +74,12 @@ pub struct JobFileEntry {
     pub source: FileSource,
 }
 
-/// POST /v1/parse/jobs（恒 202）与 GET /v1/parse/jobs/{job_id} 返回同构，
-/// 故复用同一结构体。tier / links 等字段与取 markdown 无关，不建模，
-/// serde 解析时会忽略。
+/// POST /v1/parse/jobs（恒 202）与 GET /v1/parse/jobs/{job_id} 返回同构，故复用。
+/// tier / links 等无关字段不建模，serde 解析时忽略。
 #[derive(Deserialize)]
 pub struct JobResponse {
     pub job_id: String,
-    /// queued / running / completed / partial / failed / canceled。
-    /// 注意取消是 canceled（一个 l），与 /v1/tasks 的 cancelled 不同。
+    /// queued / running / completed / partial / failed / canceled（一个 l，与 /v1/tasks 的 cancelled 不同）。
     pub status: String,
     #[serde(default)]
     pub progress: Option<Progress>,
@@ -90,8 +87,7 @@ pub struct JobResponse {
     pub files: Vec<JobFileResult>,
 }
 
-/// 单个文件的结果。**没有内联 content**（/v1/file_parse 才有），
-/// markdown 只能拿 output_files.markdown.file_id 去 Files API 取。
+/// 单个文件的结果：没有内联 content，markdown 要拿 output_files.markdown.file_id 去 Files API 取。
 #[derive(Deserialize)]
 pub struct JobFileResult {
     pub name: String,
@@ -99,8 +95,7 @@ pub struct JobFileResult {
     pub status: String,
     #[serde(default)]
     pub output_files: Option<HashMap<String, Option<OutputFileRef>>>,
-    /// ErrorDetail（type/code/message/param），留成 Value：错误正文是排查时
-    /// 唯一的线索，解析失败反而会把整份响应带崩。
+    /// ErrorDetail 留成 Value：错误正文是排查时唯一的线索，解析失败别带崩整份响应。
     #[serde(default)]
     pub error: Option<serde_json::Value>,
 }

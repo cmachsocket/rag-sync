@@ -2,10 +2,9 @@ use diesel::prelude::{ExpressionMethods, OptionalExtension, QueryDsl, Selectable
 use diesel::{self, SqliteConnection};
 use diesel_async::{AsyncConnection, RunQueryDsl, sync_connection_wrapper::SyncConnectionWrapper};
 
-
 pub type Conn = SyncConnectionWrapper<SqliteConnection>;
 
-/// 方法都直接给 `Conn` 实现，trait 只是为了按职责分组。代价是拿不到 `Send` 边界。
+/// 方法直接给 `Conn` 实现，trait 只用来按职责分组（代价是拿不到 `Send` 边界）。
 #[allow(async_fn_in_trait)]
 pub trait DBfunc {
     async fn file_exists(&mut self, file_path: &str) -> Result<bool, Box<dyn std::error::Error>>;
@@ -26,6 +25,7 @@ pub trait DBfunc {
         run_id: i32,
         file_rag_id: Option<&str>,
         output_rel_path: &str,
+        uploaded_sha256: &str,
     ) -> Result<(), Box<dyn std::error::Error>>;
     async fn delete_file(&mut self, file_path: &str) -> Result<(), Box<dyn std::error::Error>>;
     async fn get_run_counter(
@@ -52,13 +52,18 @@ pub trait DBfunc {
         &mut self,
         file_path: &str,
         new_rag_id: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error>> ;
-    /// 记下产物相对路径。跟着 rag_id 一起写：两者描述的是同一份产物的同一个状态，
-    /// 分开写就会出现「知识库里已经是新的，记录还指着旧的产物」。
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    /// 记下产物相对路径，跟着 rag_id 一起写：分开写会出现记录指着旧产物的状态。
     async fn update_output_rel_path(
         &mut self,
         file_path: &str,
         new_output_rel_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    /// 记下 rag_id 那份文档的内容指纹，跟着 rag_id 一起写，对不上会跳过本该做的重传。
+    async fn update_uploaded_sha256(
+        &mut self,
+        file_path: &str,
+        new_uploaded_sha256: &str,
     ) -> Result<(), Box<dyn std::error::Error>>;
     async fn found_file_less_than_run_id(
         &mut self,
@@ -73,7 +78,9 @@ pub async fn establish_db_connection() -> Result<Conn, Box<dyn std::error::Error
 }
 
 /// 与 `establish_db_connection` 相同，但库路径可指定（测试要用临时库）。
-pub async fn establish_db_connection_at(database_url: &str) -> Result<Conn, Box<dyn std::error::Error>> {
+pub async fn establish_db_connection_at(
+    database_url: &str,
+) -> Result<Conn, Box<dyn std::error::Error>> {
     let connection = Conn::establish(database_url).await?;
     Ok(connection)
 }
@@ -143,9 +150,13 @@ impl DBfunc for Conn {
         run_id: i32,
         file_rag_id: Option<&str>,
         rel_path: &str,
+        uploaded_sha256: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // 参数名不能叫 output_rel_path：会盖掉同名的列，`.eq()` 就套到 &str 上了
-        use crate::schema::files::dsl::{files, output_rel_path, path, rag_id, run_id as file_run_id, sha256};
+        use crate::schema::files::dsl::{
+            files, output_rel_path, path, rag_id, run_id as file_run_id, sha256,
+            uploaded_sha256 as uploaded_sha256_col,
+        };
         // 不写 id：让它走 AUTOINCREMENT
         diesel::insert_into(files)
             .values((
@@ -154,6 +165,7 @@ impl DBfunc for Conn {
                 file_run_id.eq(run_id),
                 rag_id.eq(file_rag_id),
                 output_rel_path.eq(rel_path),
+                uploaded_sha256_col.eq(uploaded_sha256),
             ))
             .execute(self)
             .await?;
@@ -229,11 +241,22 @@ impl DBfunc for Conn {
             .await?;
         Ok(())
     }
+    async fn update_uploaded_sha256(
+        &mut self,
+        file_path: &str,
+        new_uploaded_sha256: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::schema::files::dsl::*;
+        diesel::update(files.filter(path.eq(file_path)))
+            .set(uploaded_sha256.eq(new_uploaded_sha256))
+            .execute(self)
+            .await?;
+        Ok(())
+    }
     async fn found_file_less_than_run_id(
         &mut self,
         file_run_id: i32,
-    ) -> Result<Vec<crate::db_model::File>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<Vec<crate::db_model::File>, Box<dyn std::error::Error>> {
         use crate::db_model::File;
         use crate::schema::files::dsl::*;
         let results = files

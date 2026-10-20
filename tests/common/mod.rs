@@ -1,8 +1,6 @@
-//! 集成测试的公共脚手架：
-//!   1. `test_db` —— 临时 SQLite 库 + 真实 migration，不碰仓库里的 rag-sync.db。
-//!   2. `MockServer` —— 手写的最小 HTTP/1.1 服务端，替 MinerU / LightRAG
-//!      （离线环境拿不到 wiremock / httpmock，只依赖已有的 tokio）。
-//!   3. `Env` —— 临时 sync/out 目录与配置构造。
+//! 集成测试的公共脚手架：`test_db`（临时 SQLite 库 + 真实 migration，不碰仓库里的
+//! rag-sync.db）、`MockServer`（手写最小 HTTP/1.1 服务端，离线环境拿不到 wiremock）、
+//! `Env`（临时 sync/out 目录与配置构造）。
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -11,13 +9,14 @@ use diesel_async::SimpleAsyncConnection;
 use rag_sync::database::DBfunc;
 use rag_sync::sync_config::{SyncConfig, SyncFolder};
 
-// ---------------------------------------------------------------- 临时目录 / 库
+// 临时目录 / 库
 
-/// 用真实的 migration 建表：避免「测试里写死一份 DDL、线上 schema 已经变了」的假绿。
+/// 用真实的 migration 建表，避免测试里写死 DDL 而线上 schema 已经变了。
 /// 按版本号顺序执行，和 diesel 自己跑的顺序一致。
 pub const MIGRATIONS_UP: &[&str] = &[
     include_str!("../../migrations/2026-10-16-181726-0000_init/up.sql"),
     include_str!("../../migrations/2026-10-17-000000-0001_add_output_rel_path/up.sql"),
+    include_str!("../../migrations/2026-10-20-000000-0002_add_uploaded_sha256/up.sql"),
 ];
 
 pub struct TestDb {
@@ -28,11 +27,18 @@ pub struct TestDb {
 }
 
 impl TestDb {
-    /// 绕过 diesel 直接塞一条 files 记录，用来摆前置状态。
-    /// 参数都是 SQL 字面量，测试自己控制，不构成注入面。
+    /// 绕过 diesel 直塞一条 files 记录，用来摆前置状态；参数都是 SQL 字面量。
     /// `output_rel_path` 传 None 就是「加列之前写入的行」。
-    pub async fn insert_file_row(&mut self, id: i32, path: &str, sha256: &str, run_id: i32, rag_id: Option<&str>) {
-        self.insert_file_row_full(id, path, sha256, run_id, rag_id, None).await;
+    pub async fn insert_file_row(
+        &mut self,
+        id: i32,
+        path: &str,
+        sha256: &str,
+        run_id: i32,
+        rag_id: Option<&str>,
+    ) {
+        self.insert_file_row_full(id, path, sha256, run_id, rag_id, None)
+            .await;
     }
 
     pub async fn insert_file_row_full(
@@ -44,7 +50,9 @@ impl TestDb {
         rag_id: Option<&str>,
         output_rel_path: Option<&str>,
     ) {
-        let rag = rag_id.map(|r| format!("'{r}'")).unwrap_or_else(|| "NULL".into());
+        let rag = rag_id
+            .map(|r| format!("'{r}'"))
+            .unwrap_or_else(|| "NULL".into());
         let rel = output_rel_path
             .map(|r| format!("'{r}'"))
             .unwrap_or_else(|| "NULL".into());
@@ -63,6 +71,16 @@ impl TestDb {
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("files 里没有 {path} 这行"))
+    }
+
+    /// 补上「知识库里这份内容的指纹」。模拟「这一份已经传过了」。
+    pub async fn set_uploaded_sha256(&mut self, path: &str, sha256: &str) {
+        self.conn
+            .batch_execute(&format!(
+                "UPDATE files SET uploaded_sha256 = '{sha256}' WHERE path = '{path}';"
+            ))
+            .await
+            .unwrap();
     }
 
     /// 库里所有行，用 `found_file_less_than_run_id(i32::MAX)` 一次捞干净。
@@ -95,13 +113,10 @@ pub async fn test_db() -> TestDb {
     }
 }
 
-// ---------------------------------------------------------------- 配置
+// 配置
 
-/// 指向临时目录的配置，URL 由 MockServer 填。
-///
-/// 默认带一个别名 `sync` 的同步目录，产物落在 `out/sync/`。
-/// `add_folder` 再加别名，用例里 `output_path` 仍按「别名 + rel」解析，
-/// 免得每个断言都手写前缀。
+/// 指向临时目录的配置，URL 由 MockServer 填。默认带一个别名 `sync` 的同步目录，
+/// 产物落在 `out/sync/`。
 pub struct Env {
     pub root: tempfile::TempDir,
     pub sync_dir: String,
@@ -109,6 +124,9 @@ pub struct Env {
     pub folders: Vec<SyncFolder>,
     pub mineru_url: String,
     pub lightrag_url: String,
+    /// 同时解析几个（MinerU）、同时上传几个（LightRAG）。默认都是 1。
+    pub mineru_concurrency: usize,
+    pub lightrag_concurrency: usize,
 }
 
 impl Env {
@@ -126,6 +144,8 @@ impl Env {
             }],
             mineru_url: String::new(),
             lightrag_url: String::new(),
+            mineru_concurrency: 1,
+            lightrag_concurrency: 1,
             root,
         }
     }
@@ -156,7 +176,16 @@ impl Env {
             lightrag_password: "pass".into(),
             lightrag_url: self.lightrag_url.clone(),
             lightrag_username: "user".into(),
+            mineru_concurrency: self.mineru_concurrency,
+            lightrag_concurrency: self.lightrag_concurrency,
         }
+    }
+
+    /// 允许同时解析/上传几份。默认 1 —— 流水线本身的重叠不靠这个。
+    pub fn with_concurrency(&mut self, mineru: usize, lightrag: usize) -> &mut Self {
+        self.mineru_concurrency = mineru;
+        self.lightrag_concurrency = lightrag;
+        self
     }
 
     /// 在主同步目录下写文件，自动建父目录。返回绝对路径字符串。
@@ -195,8 +224,7 @@ impl Env {
         std::fs::read_to_string(self.output_path(rel)).unwrap()
     }
 
-    /// 直接写一个产物文件（模拟上一轮留下的）。父目录一并建出来 ——
-    /// 产物现在在 `<别名>/` 子目录下，忘了建父目录会让用例挂在「文件不存在」上。
+    /// 直接写一个产物文件（模拟上一轮留下的），父目录一并建出来。
     pub fn write_artifact(&self, rel: &str, content: &str) -> PathBuf {
         let p = self.output_path(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -210,7 +238,7 @@ impl Env {
     }
 }
 
-// ---------------------------------------------------------------- mock HTTP 服务端
+// mock HTTP 服务端
 
 #[derive(Debug, Clone)]
 pub struct CapturedRequest {
@@ -247,6 +275,8 @@ pub struct CannedResponse {
     pub status: u16,
     pub content_type: &'static str,
     pub body: String,
+    /// 放行闸门：有它的话，响应要等闸门开了才发出去。
+    pub gate: Option<Gate>,
 }
 
 impl CannedResponse {
@@ -255,6 +285,7 @@ impl CannedResponse {
             status,
             content_type: "application/json",
             body: body.into(),
+            gate: None,
         }
     }
 
@@ -263,7 +294,56 @@ impl CannedResponse {
             status,
             content_type: "text/plain; charset=utf-8",
             body: body.into(),
+            gate: None,
         }
+    }
+
+    /// 响应卡在服务端，直到闸门被放行。用来把「请求已到达」和「客户端拿到响应」
+    /// 分开：测流水线是否真的重叠时，让某一步卡住不放，再看另一步有没有在动。
+    pub fn gated(mut self, gate: Gate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+}
+
+/// 放行闸门：一个信号量，开了就放行一个等待中的响应。
+#[derive(Clone)]
+pub struct Gate {
+    inner: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl std::fmt::Debug for Gate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Gate")
+    }
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Gate {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    /// 放行所有等待中的响应，以及之后的所有响应（开了就一直开着）。
+    pub fn open(&self) {
+        self.inner.add_permits(1024);
+    }
+
+    async fn wait(&self) {
+        let permit = self
+            .inner
+            .acquire()
+            .await
+            .expect("信号量不会关闭：闸门只加许可，不关闸门");
+        // 吃掉这个许可：放行一次就该少一个，不能攒着变成「以后都放行」
+        permit.forget();
     }
 }
 
@@ -345,10 +425,9 @@ pub struct MockServer {
 }
 
 impl MockServer {
-    /// mock 只监听回环地址，请求**必须**直连。
-    ///
-    /// reqwest 默认读 HTTP_PROXY / HTTPS_PROXY，于是打向 127.0.0.1 的请求
-    /// 可能被塞给环境里那个代理：表现为时好时坏的 502，且和被测代码毫无关系。
+    /// mock 只监听回环地址，请求**必须**直连。reqwest 默认读 HTTP_PROXY /
+    /// HTTPS_PROXY，打向 127.0.0.1 的请求可能被塞给环境里的代理，表现为
+    /// 时好时坏的 502，且和被测代码毫无关系。
     pub fn client() -> reqwest::Client {
         reqwest::Client::builder()
             .no_proxy()
@@ -403,6 +482,28 @@ impl MockServer {
         }
     }
 
+    /// 等到某个接口被请求到指定次数为止（超时也没等到就返回实际次数）。
+    /// 流水线类断言要靠它：只能等，不能立刻查 —— 立刻查会查到还没发生的将来。
+    pub async fn wait_for_count(
+        &self,
+        method: &str,
+        target: &str,
+        want: usize,
+        timeout: std::time::Duration,
+    ) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let n = self.count_to(method, target);
+            if n >= want {
+                return n;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return n;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     pub fn requests(&self) -> Vec<CapturedRequest> {
         self.requests.lock().unwrap().clone()
     }
@@ -435,7 +536,10 @@ impl Drop for MockServer {
     }
 }
 
-fn pick(routes: &std::sync::Arc<std::sync::Mutex<Vec<RouteState>>>, req: &CapturedRequest) -> CannedResponse {
+fn pick(
+    routes: &std::sync::Arc<std::sync::Mutex<Vec<RouteState>>>,
+    req: &CapturedRequest,
+) -> CannedResponse {
     let mut routes = routes.lock().unwrap();
     for r in routes.iter_mut() {
         if r.method.eq_ignore_ascii_case(&req.method) && r.target == req.target {
@@ -444,14 +548,18 @@ fn pick(routes: &std::sync::Arc<std::sync::Mutex<Vec<RouteState>>>, req: &Captur
             }
         }
     }
-    CannedResponse::json(
-        404,
-        format!("no route for {} {}", req.method, req.target),
-    )
+    CannedResponse::json(404, format!("no route for {} {}", req.method, req.target))
 }
 
-async fn write_response(stream: &mut tokio::net::TcpStream, resp: &CannedResponse) -> std::io::Result<()> {
+async fn write_response(
+    stream: &mut tokio::net::TcpStream,
+    resp: &CannedResponse,
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
+    // 闸门没开就先把响应扣住：客户端这时候正等着，读不到东西
+    if let Some(gate) = &resp.gate {
+        gate.wait().await;
+    }
     let head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         resp.status,
@@ -481,7 +589,7 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-// ------------------------------------------------- 最小 HTTP/1.1 请求解析（含 chunked）
+// 最小 HTTP/1.1 请求解析（含 chunked）
 
 struct ByteReader<'a> {
     stream: &'a mut tokio::net::TcpStream,
@@ -498,8 +606,7 @@ impl<'a> ByteReader<'a> {
         }
     }
 
-    /// 往 buf 末尾追加一次真正的读。EOF / 出错返回 false。
-    /// 不会丢弃已读但没消费的字节 —— `read_n` 依赖这点。
+    /// 往 buf 末尾追加一次真正的读。EOF / 出错返回 false；不丢弃未消费的字节。
     async fn read_more(&mut self) -> bool {
         use tokio::io::AsyncReadExt;
         if self.pos == self.buf.len() {
@@ -556,9 +663,7 @@ impl<'a> ByteReader<'a> {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<CapturedRequest> {
@@ -593,7 +698,9 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<CapturedRequ
     {
         let mut out = Vec::new();
         loop {
-            let Some(line) = r.read_line().await else { break };
+            let Some(line) = r.read_line().await else {
+                break;
+            };
             let hex = line.trim().split(';').next().unwrap_or("0");
             let Ok(size) = usize::from_str_radix(hex, 16) else {
                 break;

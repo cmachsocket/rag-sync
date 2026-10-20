@@ -3,7 +3,7 @@
 
 use rag_sync::lightrag_model::*;
 
-// ---------------------------------------------------------------- 登录
+// 登录
 
 #[test]
 fn login_response_full_body() {
@@ -42,7 +42,7 @@ fn login_response_without_token_is_error() {
     assert!(e.to_string().contains("access_token"), "{e}");
 }
 
-// ---------------------------------------------------------------- track_status
+// track_status
 
 fn doc(id: &str, status: &str) -> serde_json::Value {
     serde_json::json!({
@@ -53,13 +53,15 @@ fn doc(id: &str, status: &str) -> serde_json::Value {
 }
 
 fn track(docs: serde_json::Value) -> TrackResponse {
-    serde_json::from_str(&serde_json::json!({
-        "track_id": "upload_20261017_002603_f93bcf1d",
-        "documents": docs,
-        "total_count": 1,
-        "status_summary": {"processing": 1}
-    })
-    .to_string())
+    serde_json::from_str(
+        &serde_json::json!({
+            "track_id": "upload_20261017_002603_f93bcf1d",
+            "documents": docs,
+            "total_count": 1,
+            "status_summary": {"processing": 1}
+        })
+        .to_string(),
+    )
     .unwrap()
 }
 
@@ -75,7 +77,13 @@ fn track_envelope_has_no_top_level_status() {
 
 #[test]
 fn pending_is_not_finished() {
-    for st in ["pending", "parsing", "analyzing", "processing", "preprocessed"] {
+    for st in [
+        "pending",
+        "parsing",
+        "analyzing",
+        "processing",
+        "preprocessed",
+    ] {
         let t = track(serde_json::json!([doc("doc-1", st)]));
         assert!(!t.is_finished(), "{st} 被当成了终态");
     }
@@ -96,8 +104,8 @@ fn failed_is_terminal() {
 
 #[test]
 fn empty_documents_is_not_finished() {
-    // 拿到 track_id 的瞬间查列表可能返回空数组，和「文档已被删除」响应一模一样。
-    // 去掉这个判断，`all()` 在空迭代器上恒为 true，会立刻误判完成。
+    // 拿到 track_id 的瞬间查列表可能返回空数组，`all()` 在空迭代器上恒为 true，
+    // 会立刻误判完成。
     let t = track(serde_json::json!([]));
     assert!(!t.is_finished());
     assert_eq!(t.documents.len(), 0);
@@ -105,15 +113,24 @@ fn empty_documents_is_not_finished() {
 
 #[test]
 fn all_documents_must_be_terminal() {
-    let done = track(serde_json::json!([doc("a", "processed"), doc("b", "processed")]));
+    let done = track(serde_json::json!([
+        doc("a", "processed"),
+        doc("b", "processed")
+    ]));
     assert!(done.is_finished());
-    let half = track(serde_json::json!([doc("a", "processed"), doc("b", "processing")]));
+    let half = track(serde_json::json!([
+        doc("a", "processed"),
+        doc("b", "processing")
+    ]));
     assert!(!half.is_finished(), "还有一个在跑就不能算完成");
 }
 
 #[test]
 fn first_doc_id_takes_head() {
-    let t = track(serde_json::json!([doc("doc-1", "processed"), doc("doc-2", "processed")]));
+    let t = track(serde_json::json!([
+        doc("doc-1", "processed"),
+        doc("doc-2", "processed")
+    ]));
     assert_eq!(t.first_doc_id(), Some("doc-1"));
     let empty = track(serde_json::json!([]));
     assert_eq!(empty.first_doc_id(), None);
@@ -195,9 +212,7 @@ fn missing_optional_fields_default_to_none() {
 }
 
 /// 真实 LightRAG 给失败的文档 `chunks_count: -1`。写成 u64 时整个响应解析失败，
-/// 而 paginated 列表里混一条 failed 就足以让 `document_exists` / 删除 / 409 自愈
-/// 全部瘫痪 —— 曾经真的发生过：知识库里躺着一条解析失败的文档，
-/// rag-sync 就再也删不掉任何东西了。
+/// paginated 列表里混一条 failed 就足以让删除与 409 自愈全部瘫痪。
 #[test]
 fn failed_document_negative_chunks_count_parses() {
     let s = serde_json::json!({
@@ -232,21 +247,23 @@ fn paginated_page_with_failed_document_parses() {
     assert_eq!(r.documents[1].chunks_count, Some(-1i64));
 }
 
-// ---------------------------------------------------------------- 删除
+// 删除
 
 #[test]
 fn delete_response_three_states() {
-    let started: DeleteDocByIdResponse = serde_json::from_str(
-        r#"{"status":"deletion_started","message":"...","doc_id":"doc-1"}"#,
-    )
-    .unwrap();
+    let started: DeleteDocByIdResponse =
+        serde_json::from_str(r#"{"status":"deletion_started","message":"...","doc_id":"doc-1"}"#)
+            .unwrap();
     assert!(started.is_scheduled());
     assert!(!started.is_busy());
 
     let busy: DeleteDocByIdResponse =
         serde_json::from_str(r#"{"status":"busy","message":"pipeline 忙"}"#).unwrap();
     assert!(!busy.is_scheduled());
-    assert!(busy.is_busy(), "200 + busy 是「被拒且无副作用」，不能当成功");
+    assert!(
+        busy.is_busy(),
+        "200 + busy 是「被拒且无副作用」，不能当成功"
+    );
 
     let not_allowed: DeleteDocByIdResponse =
         serde_json::from_str(r#"{"status":"not_allowed","message":"无权限"}"#).unwrap();
@@ -256,7 +273,8 @@ fn delete_response_three_states() {
 
 #[test]
 fn delete_response_without_optional_fields() {
-    let r: DeleteDocByIdResponse = serde_json::from_str(r#"{"status":"deletion_started"}"#).unwrap();
+    let r: DeleteDocByIdResponse =
+        serde_json::from_str(r#"{"status":"deletion_started"}"#).unwrap();
     assert!(r.is_scheduled());
     assert_eq!(r.message, "");
     assert_eq!(r.doc_id, "");
@@ -275,7 +293,7 @@ fn delete_request_body_flags() {
     );
 }
 
-// ---------------------------------------------------------------- 分页
+// 分页
 
 #[test]
 fn first_page_uses_max_page_size() {
@@ -297,10 +315,8 @@ fn missing_pagination_means_no_next_page() {
 
 #[test]
 fn upload_response_non_success_status() {
-    let r: UploadResponse = serde_json::from_str(
-        r#"{"status":"failure","message":"bad file","track_id":""}"#,
-    )
-    .unwrap();
+    let r: UploadResponse =
+        serde_json::from_str(r#"{"status":"failure","message":"bad file","track_id":""}"#).unwrap();
     assert_eq!(r.status, "failure");
     assert_eq!(r.message, "bad file");
 }

@@ -8,6 +8,7 @@ diesel::table! {
         rag_id -> Nullable<Text>,
         run_id -> Integer,
         output_rel_path -> Nullable<Text>,
+        uploaded_sha256 -> Nullable<Text>,
     }
 }
 

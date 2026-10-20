@@ -1,7 +1,6 @@
 //! MinerU 的上传 -> 解析 -> 取产物链路。三个坑：契约是 `additionalProperties: false`
-//! （字段名写错直接 422）、sha256 幂等命中时 upload_url 为 null、再 PUT 会 409，
-//! 以及任务接口 `/v1/parse/jobs` **不内联正文**，只能拿 `output_files` 的
-//! file_id 二次取（同步的 `/v1/file_parse` 才内联，两条路别搞混）。
+//! （字段名写错直接 422）；sha256 幂等命中时 upload_url 为 null、再 PUT 会 409；
+//! 任务接口 `/v1/parse/jobs` 不内联正文，只能拿 `output_files` 的 file_id 二次取。
 
 mod common;
 
@@ -19,7 +18,8 @@ fn sample_file(dir: &tempfile::TempDir, id: i32, name: &str, content: &str) -> F
         sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
         rag_id: None,
         output_rel_path: None,
-    run_id: 1,
+        uploaded_sha256: None,
+        run_id: 1,
     }
 }
 
@@ -39,6 +39,8 @@ async fn setup(
         lightrag_username: "u".into(),
         lightrag_password: "p".into(),
         run_id: 1,
+        mineru_concurrency: 1,
+        lightrag_concurrency: 1,
     };
     (server, cfg)
 }
@@ -46,8 +48,10 @@ async fn setup(
 /// 上传三步：created -> PUT 内容 -> completed，MinerU 的 file_id 是 f-1。
 fn upload_routes() -> Vec<Route> {
     return vec![
-        Route::post("/v1/uploads")
-            .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
+        Route::post("/v1/uploads").and(R::json(
+            201,
+            r#"{"id":"up-1","status":"created","file":null}"#,
+        )),
         Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
         Route::post("/v1/uploads/up-1/complete").and(R::json(
             200,
@@ -72,7 +76,7 @@ fn job_routes(md: &str) -> Vec<Route> {
                           "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
         )),
         Route::get("/v1/files/out-1/content").and(R::text(200, md)),
-    ]
+    ];
 }
 
 fn concat(routes: Vec<Route>, more: Vec<Route>) -> Vec<Route> {
@@ -81,7 +85,7 @@ fn concat(routes: Vec<Route>, more: Vec<Route>) -> Vec<Route> {
     all
 }
 
-// ---------------------------------------------------------------- 请求体形状
+// 请求体形状
 
 #[test]
 fn source_serialises_only_its_own_field() {
@@ -109,8 +113,7 @@ fn upload_request_body_matches_contract() {
 
 #[test]
 fn create_job_body_matches_contract() {
-    // 同为 additionalProperties: false：顶层只有 files，项内只有 source，
-    // 多一个自造字段就是 422
+    // 同为 additionalProperties: false：顶层只有 files、项内只有 source，多一个自造字段就是 422
     let req = rag_sync::mineru_model::CreateJobRequest {
         files: vec![rag_sync::mineru_model::JobFileEntry {
             source: rag_sync::mineru_model::FileSource::from_file_id("f-1".into()),
@@ -133,14 +136,13 @@ fn upload_response_file_may_be_null() {
     assert_eq!(u.status, "completed");
     assert_eq!(u.file.unwrap().id, "f-9");
 
-    let u: rag_sync::mineru_model::UploadObject = serde_json::from_str(
-        r#"{"id":"up-2","status":"completed","file":null,"upload_url":null}"#,
-    )
-    .unwrap();
+    let u: rag_sync::mineru_model::UploadObject =
+        serde_json::from_str(r#"{"id":"up-2","status":"completed","file":null,"upload_url":null}"#)
+            .unwrap();
     assert!(u.file.is_none(), "命中但还没解析出 file 时就是 null");
 }
 
-// ---------------------------------------------------------------- 完整上传流程
+// 完整上传流程
 
 #[tokio::test]
 async fn new_file_uploads_content_then_completes() {
@@ -174,7 +176,11 @@ async fn new_file_uploads_content_then_completes() {
     // 完成后拿 file_id 去建任务，再轮询到终态、按产物 id 取正文
     let job = &server.requests_to("POST", "/v1/parse/jobs")[0];
     assert_eq!(job.json()["files"][0]["source"]["file_id"], "f-1");
-    assert_eq!(server.count_to("GET", "/v1/parse/jobs/j-1"), 1, "202 queued 必须轮询");
+    assert_eq!(
+        server.count_to("GET", "/v1/parse/jobs/j-1"),
+        1,
+        "202 queued 必须轮询"
+    );
     assert_eq!(server.count_to("GET", "/v1/files/out-1/content"), 1);
 }
 
@@ -194,7 +200,9 @@ async fn terminal_on_create_skips_polling() {
     let (server, cfg) = setup(&d, routes).await;
 
     assert_eq!(
-        mineru_tackle(&MockServer::client(), &file, &cfg).await.unwrap(),
+        mineru_tackle(&MockServer::client(), &file, &cfg)
+            .await
+            .unwrap(),
         "md"
     );
     assert_eq!(server.count_to("GET", "/v1/parse/jobs/j-1"), 0);
@@ -206,8 +214,10 @@ async fn idempotent_hit_skips_content_upload() {
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
     let mut routes = vec![
-        Route::post("/v1/uploads")
-            .and(R::json(200, r#"{"id":"up-1","status":"completed","file":{"id":"f-7"}}"#)),
+        Route::post("/v1/uploads").and(R::json(
+            200,
+            r#"{"id":"up-1","status":"completed","file":{"id":"f-7"}}"#,
+        )),
         Route::put("/v1/uploads/up-1/content").once(),
     ];
     routes.extend(job_routes("md"));
@@ -254,11 +264,7 @@ async fn missing_sha256_rejected_before_upload() {
     let d = tempfile::tempdir().unwrap();
     let mut file = sample_file(&d, 0, "a.pdf", "hello");
     file.sha256 = String::new();
-    let (server, cfg) = setup(
-        &d,
-        vec![Route::post("/v1/uploads").once()],
-    )
-    .await;
+    let (server, cfg) = setup(&d, vec![Route::post("/v1/uploads").once()]).await;
 
     let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
@@ -273,11 +279,7 @@ async fn vanished_file_reports_path() {
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
     std::fs::remove_file(&file.path).unwrap();
-    let (server, cfg) = setup(
-        &d,
-        vec![Route::post("/v1/uploads").once()],
-    )
-    .await;
+    let (server, cfg) = setup(&d, vec![Route::post("/v1/uploads").once()]).await;
 
     let err = mineru_tackle(&MockServer::client(), &file, &cfg)
         .await
@@ -315,8 +317,7 @@ async fn upload_rejected_surfaces_status_and_body() {
 
 #[tokio::test]
 async fn empty_error_body_is_labelled() {
-    // 「读不出来」和「服务端就是返回空」要能区分开，否则排查时会照着
-    // 一个并不存在的空 body 去猜原因
+    // 「读不出来」和「服务端就是返回空」要能区分开
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
     let (_server, cfg) = setup(
@@ -339,11 +340,15 @@ async fn complete_non_terminal_is_error() {
     let (_server, cfg) = setup(
         &d,
         vec![
-            Route::post("/v1/uploads")
-                .and(R::json(201, r#"{"id":"up-1","status":"created","file":null}"#)),
+            Route::post("/v1/uploads").and(R::json(
+                201,
+                r#"{"id":"up-1","status":"created","file":null}"#,
+            )),
             Route::put("/v1/uploads/up-1/content").and(R::json(200, "{}")),
-            Route::post("/v1/uploads/up-1/complete")
-                .and(R::json(200, r#"{"id":"up-1","status":"hashing","file":null}"#)),
+            Route::post("/v1/uploads/up-1/complete").and(R::json(
+                200,
+                r#"{"id":"up-1","status":"hashing","file":null}"#,
+            )),
         ],
     )
     .await;
@@ -355,7 +360,7 @@ async fn complete_non_terminal_is_error() {
     assert!(err.contains("hashing"), "{err}");
 }
 
-// ---------------------------------------------------------------- 解析
+// 解析
 
 #[tokio::test]
 async fn queued_job_polls_until_terminal_then_fetches_artifact() {
@@ -366,9 +371,8 @@ async fn queued_job_polls_until_terminal_then_fetches_artifact() {
         202,
         r#"{"job_id":"j-1","status":"queued","files":[]}"#,
     )));
-    // 第一次轮询还没跑完，第二次才是终态；终态的正文恒为空，
-    // 必须拿 output_files 的 file_id 二次取。同一个路径的两份响应
-    // 必须挂在同一条路由上（响应队列按顺序消费）。
+    // 第一次轮询还没跑完，第二次才是终态；终态正文恒为空，必须拿 output_files
+    // 的 file_id 二次取。同一个路径的两份响应必须挂在同一条路由上。
     routes.push(
         Route::get("/v1/parse/jobs/j-1")
             .and(R::json(
@@ -424,8 +428,7 @@ async fn job_failed_surfaces_file_error() {
 
 #[tokio::test]
 async fn job_canceled_is_failure() {
-    // 任务接口的取消拼写是 canceled（一个 l），与 /v1/tasks 的 cancelled 不同；
-    // 少一个终态判断，这类任务就会被当成「还在跑」轮到超时
+    // 任务接口的取消拼写是 canceled（一个 l），与 /v1/tasks 的 cancelled 不同
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
     let mut routes = upload_routes();
@@ -474,8 +477,7 @@ async fn partial_job_is_failure() {
 
 #[tokio::test]
 async fn completed_job_without_artifact_is_error() {
-    // 任务接口不内联正文，没有产物 id 就等于没有结果 —— 得报错，
-    // 不能默默写出一个空文件
+    // 任务接口不内联正文，没有产物 id 就等于没有结果，得报错而不是默默写出空文件
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
     let mut routes = upload_routes();
@@ -540,8 +542,7 @@ async fn create_job_rejected_surfaces_status_and_body() {
 
 #[tokio::test]
 async fn artifact_content_is_plain_text() {
-    // GET /v1/files/{id}/content 直接返回 markdown 原文，
-    // 按 JSON 解会得到一个空串再写进输出文件
+    // GET /v1/files/{id}/content 直接返回 markdown 原文，按 JSON 解会得到空串
     let d = tempfile::tempdir().unwrap();
     let file = sample_file(&d, 0, "a.pdf", "hello");
     let mut routes = upload_routes();
@@ -559,7 +560,9 @@ async fn artifact_content_is_plain_text() {
     let (_server, cfg) = setup(&d, routes).await;
 
     assert_eq!(
-        mineru_tackle(&MockServer::client(), &file, &cfg).await.unwrap(),
+        mineru_tackle(&MockServer::client(), &file, &cfg)
+            .await
+            .unwrap(),
         "标题\n\n正文 **加粗**"
     );
 }
@@ -578,5 +581,8 @@ async fn large_file_uploads_with_declared_length() {
     let put = &server.requests_to("PUT", "/v1/uploads/up-1/content")[0];
     assert_eq!(put.header("content-length"), Some("300000"));
     assert_eq!(put.body.len(), 300_000);
-    assert_eq!(server.requests_to("POST", "/v1/uploads")[0].json()["bytes"], 300_000);
+    assert_eq!(
+        server.requests_to("POST", "/v1/uploads")[0].json()["bytes"],
+        300_000
+    );
 }

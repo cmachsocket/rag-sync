@@ -12,3 +12,9 @@ mineru_url: "http://127.0.0.1:9777"
 lightrag_url: "http://127.0.0.1:9778"
 lightrag_username: "admin"
 lightrag_password: "admin"
+
+# 转换（透传 / MinerU 解析）与上传（LightRAG）是两步，两步本来就并行：
+# 上传一个文件时，下一个文件已经在解析了。下面两个是「每一步内部」再并发几份。
+# 默认都是 1 —— 调高之前先看 readme 里那两条代价。
+mineru_concurrency: 1     # 同时解析几个文件
+lightrag_concurrency: 1   # 同时上传几个文件

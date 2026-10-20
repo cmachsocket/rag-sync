@@ -1,0 +1,1 @@
+ALTER TABLE files ADD COLUMN uploaded_sha256 TEXT;

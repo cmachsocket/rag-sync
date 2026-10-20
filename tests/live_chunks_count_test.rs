@@ -1,9 +1,7 @@
 //! 库里有 failed 文档时，删除与反查还能不能工作。
-//!
-//! `chunks_count` 曾经是 `Option<u64>`，而真实 LightRAG 对失败的文档给 `-1` ——
-//! 不是「这个字段读不出来」，而是整个响应解析失败：paginated 里混着一条 failed
-//! 文档，`document_exists` / `find_doc_ids_by_filename` / `delete_document` 就全瘫，
-//! 409 自愈也失效。
+//! `chunks_count` 曾是 `Option<u64>`，真实 LightRAG 对失败的文档给 `-1`，于是整个响应
+//! 解析失败：paginated 里混一条 failed 文档，`document_exists` / `delete_document` /
+//! 409 自愈就全瘫。
 //!
 //! ```sh
 //! cargo test --test live_chunks_count_test -- --ignored --nocapture
@@ -38,8 +36,8 @@ async fn deletion_works_while_a_failed_document_exists() -> Result<(), Box<dyn s
     // failed：正文是 markdown，名字却是 .docx
     let failed_path = root.path().join(&failed_name);
     std::fs::write(&failed_path, "# 标题\n\n".repeat(50))?;
-    // good：名实相符。内容必须每次都不同 —— 服务端按**内容**去重，正文撞上
-    // 已有文档会以 "Identical content already exists" 失败，那测的是另一回事。
+    // good：名实相符。内容必须每次都不同 —— 服务端按内容去重，撞上已有文档会
+    // 以 "Identical content already exists" 失败，那测的是另一回事。
     let good_path = root.path().join(&good_name);
     std::fs::write(
         &good_path,
@@ -48,7 +46,7 @@ async fn deletion_works_while_a_failed_document_exists() -> Result<(), Box<dyn s
 
     let mut cleanup: Vec<String> = Vec::new();
 
-    // 上传两条。failed 那条走 409/失败路径，good 那条应当 processed。
+    // 上传两条：failed 那条走 409/失败路径，good 那条应当 processed
     let good_rag_id = match rag.upload_file(good_path.to_str().unwrap()).await {
         Ok(id) => id,
         Err(e) => {

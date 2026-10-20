@@ -20,7 +20,7 @@ const MAX_PAGES: u32 = 1000;
 
 /// 上传失败的原因。只有同名冲突能自愈，其余原样上抛。
 enum UploadError {
-    /// 409：文件名是服务端的唯一文档键，detail 里要求先删掉已有记录。
+    /// 409 同名冲突，detail 是服务端给的处理提示。
     Conflict(String),
     Fatal(String),
 }
@@ -44,7 +44,7 @@ impl UploadError {
     }
 }
 
-/// 取 basename：上传的 filename 与服务端存的 file_path 都是它。
+/// 取路径的文件名部分。
 pub fn basename(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
@@ -52,21 +52,19 @@ pub fn basename(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// 判同名用的 canonical basename：会剥掉 parser hint，`abc.docx` 与
-/// `abc.[native].docx` 是同一条记录。只剥实测见过的两种，没见过的 hint 不猜。
+/// 判同名用的 canonical basename：剥掉 parser hint，`abc.docx` 与 `abc.[native].docx` 同键。
 pub fn canonical_basename(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     let mut stem = match lower.rfind('.') {
         Some(dot) => &lower[..dot],
         None => &lower[..],
     };
-    // 循环剥而不是剥一次：`a.[native].[legacy].md` 这种叠着的也要归到同一个键。
+    // 循环剥，叠加的 hint 也要归到同一个键。
     loop {
         let mut stripped = false;
         for hint in ["[native]", "[legacy]"] {
             if let Some(rest) = stem.strip_suffix(hint) {
-                // 连同分隔点号一起剥：`a.[native].md` 否则会归成 `a.`，
-                // 与 `a.md` 的 `a` 变成两个名字，反查永远查不到自己。
+                // 连同分隔点号一起剥，否则 `a.[native].md` 归不成 `a`
                 stem = rest.trim_end_matches('.');
                 stripped = true;
             }
@@ -75,6 +73,18 @@ pub fn canonical_basename(name: &str) -> String {
             return stem.to_string();
         }
     }
+}
+
+/// 409 同名冲突时判断「冲突的那份是不是我们上次传的那份」的依据。
+/// 内容没变就留着它，内容变了才删了重传；三个字段都拿不到（首次上传）时按老规矩删除。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConflictHint<'a> {
+    /// 上一轮的内容指纹；None = 没见过这份文件。
+    pub uploaded_sha256: Option<&'a str>,
+    /// 上一轮拿到的 doc_id；None = 上一轮没传成功。
+    pub rag_id: Option<&'a str>,
+    /// 这一轮要传的内容指纹。
+    pub content_sha256: Option<&'a str>,
 }
 
 pub struct RAGRequest<'a> {
@@ -143,8 +153,7 @@ impl<'a> RAGRequest<'a> {
             .map_err(|e| UploadError::fatal(format!("打开文件失败: {e}")))?;
         let stream = FramedRead::new(file, tokio_util::codec::BytesCodec::new());
         let body = reqwest::Body::wrap_stream(stream);
-        // file_name 必须只给文件名部分：传整条路径会让服务端的判重与落盘跑偏。
-        // 传的是什么名，就是服务端拿来判同名的键，也是 409 反查时要比对的那个。
+        // file_name 只给文件名部分：这就是服务端判同名的键。
         let part = reqwest::multipart::Part::stream(body).file_name(upload_name.to_string());
         let form = reqwest::multipart::Form::new().part("file", part);
         let resp = self
@@ -157,7 +166,6 @@ impl<'a> RAGRequest<'a> {
             .map_err(|e| UploadError::fatal(format!("上传文件请求失败: {e}")))?;
         let status = resp.status();
         if status == reqwest::StatusCode::CONFLICT {
-            // 409：同名文档已存在。detail 区分来源：文档存储里已有 / input 目录里已有。
             let body = crate::http_util::error_body(resp).await;
             return Err(UploadError::conflict(&body));
         }
@@ -183,7 +191,7 @@ impl<'a> RAGRequest<'a> {
         }
     }
 
-    /// 轮询 track_status 直到所有文档进入终态（后台抽取要 64 s ~ 728 s）。
+    /// 轮询 track_status 直到所有文档进入终态。
     async fn _track(
         &self,
         track_id: &str,
@@ -210,7 +218,7 @@ impl<'a> RAGRequest<'a> {
                 .map_err(|e| format!("解析获取文件状态响应失败: {e}"))?;
 
             if track.is_finished() {
-                // failed 也算终态，吞掉会让「处理失败」看起来像「还在跑」
+                // failed 也是终态，吞掉会把「处理失败」看成「还在跑」
                 return Ok(track);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -263,8 +271,8 @@ impl<'a> RAGRequest<'a> {
             }
         }
 
-        // deletion_started 只代表已调度：完成判定看文档列表里 doc_id 是否消失。
-        // 不用 pipeline_status —— destructive_busy 是全局共享标志，会误判。
+        // deletion_started 只代表已调度：完成判定看 doc_id 是否从文档列表消失，
+        // 不用 pipeline_status（全局共享标志会误判）。
         self.wait_document_gone(file_id).await?;
         Ok(())
     }
@@ -277,17 +285,18 @@ impl<'a> RAGRequest<'a> {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "等待 {doc_id} 从文档列表消失超时（{DELETE_TIMEOUT:?}）"
-                )
-                .into());
+                return Err(
+                    format!("等待 {doc_id} 从文档列表消失超时（{DELETE_TIMEOUT:?}）").into(),
+                );
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
     /// 翻完所有页拉回文档列表（page_size 上限 200，只看第一页会漏判）。
-    async fn fetch_all_documents(&self) -> Result<Vec<lightrag_model::DocStatusResponse>, Box<dyn std::error::Error>> {
+    async fn fetch_all_documents(
+        &self,
+    ) -> Result<Vec<lightrag_model::DocStatusResponse>, Box<dyn std::error::Error>> {
         let url = format!("{}/documents/paginated", self.url);
         let mut req = lightrag_model::DocumentsRequest::first_page();
         let mut all = Vec::new();
@@ -322,7 +331,7 @@ impl<'a> RAGRequest<'a> {
         .into())
     }
 
-    /// 文档是否还在库里。查 paginated 列表，是判定删除是否生效的唯一权威依据。
+    /// 文档是否还在库里，判定删除是否生效的依据。
     pub async fn document_exists(&self, doc_id: &str) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(self
             .fetch_all_documents()
@@ -347,13 +356,14 @@ impl<'a> RAGRequest<'a> {
     }
 
     /// 清掉占用该文件名的旧文档，让重传能过。
+    /// `found` 是已查好的同名文档，避免翻页查两遍。
     async fn remove_conflicting(
         &self,
         name: &str,
         detail: &str,
+        found: &[String],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let found = self.find_doc_ids_by_filename(name).await?;
-        match found.as_slice() {
+        match found {
             [] => Err(format!(
                 "上传 {name} 返回 409 同名冲突，但文档列表里找不到它。\
                  冲突多半来自 input 目录里的残留文件（没有对应索引记录），\
@@ -371,30 +381,34 @@ impl<'a> RAGRequest<'a> {
         }
     }
 
-    /// 上传并等待后台处理完成，返回 doc_id。上传名取本地路径的 basename。
-    ///
-    /// 409 的清理由这里做：调用方只有本地路径，判不出该删哪个 doc_id。
+    /// 上传并等待后台处理完成，返回 doc_id；上传名取本地路径的 basename。
     pub async fn upload_file(&self, file_path: &str) -> Result<String, Box<dyn std::error::Error>> {
         let name = basename(file_path);
-        self.upload_file_as(file_path, &name).await
+        self.upload_file_as(file_path, &name, None).await
     }
 
-    /// 与 [`RAGRequest::upload_file`] 相同，但用指定的名字上传。
+    /// 与 [`RAGRequest::upload_file`] 相同，但用指定的名字上传，`hint` 用于 409 冲突判定。
     ///
-    /// 多同步目录共用一个 output_dir 时必须走这里：服务端的唯一键是**文件名**，
-    /// 本地路径它只取 basename，因此产物所在的子目录区分不开两个目录下的同名文件 ——
-    /// 后传的那个会 409，然后自愈流程把先传成功的那份删掉。调用方要带上别名前缀。
+    /// 服务端的唯一键是文件名，因此多同步目录共用一个 output_dir 时必须走这里，
+    /// 调用方要带上别名前缀，否则同名文件会互相 409 并自愈删除。
     pub async fn upload_file_as(
         &self,
         file_path: &str,
         upload_name: &str,
+        hint: Option<&ConflictHint<'_>>,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let name = upload_name.to_string();
         let track_id = match self._upload(file_path, upload_name).await {
             Ok(track_id) => track_id,
             // 只重试一次：再 409 说明有别的成因，循环只是白打请求。
             Err(UploadError::Conflict(detail)) => {
-                self.remove_conflicting(&name, &detail).await?;
+                let found = self.find_doc_ids_by_filename(&name).await?;
+                // 内容没变，冲突的那份就是我们要的那份：留着它，不删不重传
+                if let Some(doc_id) = same_content_doc_id(&found, hint) {
+                    println!("[冲突] {name} 的内容与知识库中的一致（{doc_id}），不重传");
+                    return Ok(doc_id);
+                }
+                self.remove_conflicting(&name, &detail, &found).await?;
                 self._upload(file_path, upload_name)
                     .await
                     .map_err(|e| e.into_err(&format!("清理同名冲突后重传 {file_path} 仍失败")))?
@@ -411,4 +425,22 @@ impl<'a> RAGRequest<'a> {
             .map(str::to_string)
             .ok_or_else(|| format!("{track_id} 没有返回任何 doc_id").into())
     }
+}
+
+/// 冲突的那份同名文档是不是「我们上次传的那份、内容也没变」，是则不必删了重传。
+/// 三个条件缺一不可：指纹一致、上一轮的 doc_id 还在、同名文档正好是那一份。
+fn same_content_doc_id(found: &[String], hint: Option<&ConflictHint<'_>>) -> Option<String> {
+    let hint = hint?;
+    let (Some(uploaded), Some(rag_id), Some(content)) =
+        (hint.uploaded_sha256, hint.rag_id, hint.content_sha256)
+    else {
+        return None;
+    };
+    if uploaded != content {
+        return None;
+    }
+    if found.len() == 1 && found[0] == rag_id {
+        return Some(found[0].clone());
+    }
+    None
 }

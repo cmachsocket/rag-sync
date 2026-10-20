@@ -1,12 +1,11 @@
 //! RAGRequest 对着 mock 服务端跑完整链路，重点是 409 同名冲突 -> 反查 doc_id ->
-//! 删除 -> 重传 -> 轮询到终态。任何一步退化成「看起来成功」，知识库里就会留下
-//! 旧文档或半截文档，而接口全程返回 200。
+//! 删除 -> 重传 -> 轮询到终态。任何一步退化成「看起来成功」，知识库里就会留下旧文档。
 
 mod common;
 
 use common::{CannedResponse as R, MockServer, Route};
 
-use rag_sync::lightrag_requests::{basename, canonical_basename, RAGRequest};
+use rag_sync::lightrag_requests::{RAGRequest, basename, canonical_basename};
 
 fn upload_ok(track: &str) -> R {
     R::json(
@@ -48,16 +47,13 @@ fn upload_path(d: &tempfile::TempDir) -> String {
     d.path().join("a.md").to_string_lossy().into_owned()
 }
 
-async fn logged_in<'a>(
-    server: &'a MockServer,
-    client: &'a reqwest::Client,
-) -> RAGRequest<'a> {
+async fn logged_in<'a>(server: &'a MockServer, client: &'a reqwest::Client) -> RAGRequest<'a> {
     RAGRequest::new(client, &server.base_url, "u", "p")
         .await
         .unwrap()
 }
 
-// ---------------------------------------------------------------- 文件名归一
+// 文件名归一
 
 #[test]
 fn basename_takes_last_segment() {
@@ -86,7 +82,7 @@ fn canonical_basename_strips_trailing_hint() {
     assert_eq!(canonical_basename("ABC.MD"), "abc");
 }
 
-// ---------------------------------------------------------------- 登录
+// 登录
 
 #[tokio::test]
 async fn login_with_empty_token_is_rejected() {
@@ -178,7 +174,7 @@ async fn non_json_login_response_is_rejected() {
     assert!(err.contains("not json at all"), "{err}");
 }
 
-// ---------------------------------------------------------------- 上传 + 轮询
+// 上传 + 轮询
 
 #[tokio::test]
 async fn upload_returns_doc_id_after_polling() {
@@ -230,7 +226,8 @@ async fn upload_non_success_status_is_failure() {
     ])
     .await;
 
-    let err = logged_in(&server, &client).await
+    let err = logged_in(&server, &client)
+        .await
         .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
@@ -254,7 +251,8 @@ async fn upload_401_is_not_retried() {
     ])
     .await;
 
-    let err = logged_in(&server, &client).await
+    let err = logged_in(&server, &client)
+        .await
         .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
@@ -283,7 +281,8 @@ async fn background_failure_surfaces_error_msg() {
     ])
     .await;
 
-    let err = logged_in(&server, &client).await
+    let err = logged_in(&server, &client)
+        .await
         .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
@@ -294,7 +293,7 @@ async fn background_failure_surfaces_error_msg() {
 // 终态但 documents 为空数组的情况在这里没法测：is_finished() 对空数组恒为 false，
 // _track 会轮询到 TRACK_TIMEOUT（900 s）才报错。判定逻辑见 tests/lightrag_model_test.rs。
 
-// ---------------------------------------------------------------- 409 自愈
+// 409 自愈
 
 #[tokio::test]
 async fn conflict_409_deletes_then_reuploads() {
@@ -310,7 +309,10 @@ async fn conflict_409_deletes_then_reuploads() {
             .and(upload_ok("t1")),
         // 反查时旧文档还在
         Route::post("/documents/paginated")
-            .and(docs_page(r#"{"id":"doc-old","status":"processed","file_path":"a.md"}"#, false))
+            .and(docs_page(
+                r#"{"id":"doc-old","status":"processed","file_path":"a.md"}"#,
+                false,
+            ))
             // 删完再查：没了
             .and(docs_page("", false)),
         Route::delete("/documents/delete_document").and(R::json(
@@ -357,16 +359,15 @@ async fn conflict_409_without_list_entry_reports_input_dir() {
     let client = MockServer::client();
     let (server, d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
-        Route::post("/documents/upload").and(R::json(
-            409,
-            r#"{"detail":"file exists in input dir"}"#,
-        )),
+        Route::post("/documents/upload")
+            .and(R::json(409, r#"{"detail":"file exists in input dir"}"#)),
         Route::post("/documents/paginated").and(docs_page("", false)),
         Route::delete("/documents/delete_document").once(),
     ])
     .await;
 
-    let err = logged_in(&server, &client).await
+    let err = logged_in(&server, &client)
+        .await
         .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
@@ -394,7 +395,8 @@ async fn conflict_409_with_multiple_matches_refuses_to_delete() {
     ])
     .await;
 
-    let err = logged_in(&server, &client).await
+    let err = logged_in(&server, &client)
+        .await
         .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
@@ -417,7 +419,10 @@ async fn conflict_409_retries_only_once() {
             .and(R::json(409, r#"{"detail":"still conflicting"}"#))
             .and(R::json(409, r#"{"detail":"still conflicting again"}"#)),
         Route::post("/documents/paginated")
-            .and(docs_page(r#"{"id":"doc-old","status":"processed","file_path":"a.md"}"#, false))
+            .and(docs_page(
+                r#"{"id":"doc-old","status":"processed","file_path":"a.md"}"#,
+                false,
+            ))
             .and(docs_page("", false)),
         Route::delete("/documents/delete_document").and(R::json(
             200,
@@ -426,7 +431,8 @@ async fn conflict_409_retries_only_once() {
     ])
     .await;
 
-    let err = logged_in(&server, &client).await
+    let err = logged_in(&server, &client)
+        .await
         .upload_file(&upload_path(&d))
         .await
         .unwrap_err()
@@ -440,15 +446,17 @@ async fn conflict_409_retries_only_once() {
     );
 }
 
-// ---------------------------------------------------------------- 删除
+// 删除
 
 #[tokio::test]
 async fn delete_busy_fails_without_polling() {
     let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
-        Route::delete("/documents/delete_document")
-            .and(R::json(200, r#"{"status":"busy","message":"pipeline 被占用"}"#)),
+        Route::delete("/documents/delete_document").and(R::json(
+            200,
+            r#"{"status":"busy","message":"pipeline 被占用"}"#,
+        )),
         Route::post("/documents/paginated").once(),
     ])
     .await;
@@ -472,12 +480,19 @@ async fn delete_unknown_status_is_failure() {
     let client = MockServer::client();
     let (server, _d) = setup(vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
-        Route::delete("/documents/delete_document")
-            .and(R::json(200, r#"{"status":"not_allowed","message":"无权限"}"#)),
+        Route::delete("/documents/delete_document").and(R::json(
+            200,
+            r#"{"status":"not_allowed","message":"无权限"}"#,
+        )),
     ])
     .await;
 
-    let err = logged_in(&server, &client).await.delete_document("doc-1").await.unwrap_err().to_string();
+    let err = logged_in(&server, &client)
+        .await
+        .delete_document("doc-1")
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("not_allowed"), "{err}");
 }
 
@@ -491,12 +506,19 @@ async fn delete_waits_for_doc_to_disappear() {
             r#"{"status":"deletion_started","message":"ok","doc_id":"doc-1"}"#,
         )),
         Route::post("/documents/paginated")
-            .and(docs_page(r#"{"id":"doc-1","status":"processed","file_path":"a.md"}"#, false))
+            .and(docs_page(
+                r#"{"id":"doc-1","status":"processed","file_path":"a.md"}"#,
+                false,
+            ))
             .and(docs_page("", false)),
     ])
     .await;
 
-    logged_in(&server, &client).await.delete_document("doc-1").await.unwrap();
+    logged_in(&server, &client)
+        .await
+        .delete_document("doc-1")
+        .await
+        .unwrap();
     assert_eq!(
         server.count_to("POST", "/documents/paginated"),
         2,
@@ -504,7 +526,7 @@ async fn delete_waits_for_doc_to_disappear() {
     );
 }
 
-// ---------------------------------------------------------------- 分页判定
+// 分页判定
 
 #[tokio::test]
 async fn document_exists_reads_all_pages() {

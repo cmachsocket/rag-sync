@@ -8,11 +8,11 @@ mod common;
 use std::path::PathBuf;
 
 use rag_sync::database::{self, DBfunc};
+use rag_sync::db_model;
 use rag_sync::http_util;
 use rag_sync::lightrag_requests::RAGRequest;
 use rag_sync::sync_config::{SyncConfig, SyncFolder};
 use rag_sync::sync_folder::{create_output_files, delete_old_files, get_files, is_supported_file};
-use rag_sync::db_model;
 use walkdir::WalkDir;
 
 const CONFIG_PATH: &str = "config.yml";
@@ -39,10 +39,10 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
-// ---------------------------------------------------------------- 只读
+// 只读
 
-/// config.yml 真的能被生产代码解析，且 `~` 真的展开了。展开失败的话
-/// sync_dir 会变成工作目录下的相对路径 `~/Documents`，扫描结果全错。
+/// config.yml 真的能被生产代码解析，且 `~` 真的展开了。
+/// 展开失败的话 sync_dir 会变成相对路径 `~/Documents`，扫描结果全错。
 #[tokio::test]
 #[ignore = "需要仓库里的 config.yml"]
 async fn config_yml_loads_with_expanded_paths() {
@@ -56,7 +56,11 @@ async fn config_yml_loads_with_expanded_paths() {
             folder.name,
             folder.path
         );
-        assert!(!folder.path.contains("~"), "{} 里还留着未展开的 `~`", folder.name);
+        assert!(
+            !folder.path.contains("~"),
+            "{} 里还留着未展开的 `~`",
+            folder.name
+        );
         assert!(
             std::path::Path::new(&folder.path).is_dir(),
             "别名 {} 的同步目录不存在: {}",
@@ -81,7 +85,7 @@ async fn config_yml_loads_with_expanded_paths() {
 }
 
 /// 两台真服务都活着，且 config.yml 里的凭据能真的登进 LightRAG。
-/// 这是最便宜的前置检查：跑全量之前先跑它，别等几小时后才因为密码错而失败。
+/// 跑全量之前先跑它，别等几小时后才因为密码错而失败。
 #[tokio::test]
 #[ignore = "需要真实 MinerU 与 LightRAG 可达"]
 async fn real_services_are_reachable() {
@@ -118,16 +122,14 @@ async fn real_services_are_reachable() {
     );
 }
 
-// ---------------------------------------------------------------- 单文件往返
+// 单文件往返
 
-/// MinerU 4.0.12 实测明确回 `Unsupported file type` 的类型。它们在
-/// `src/file_mime.rs` 的 `SUFFIX_MIME` 里是被支持的，于是会被扫进来、
-/// 送给 MinerU，然后被拒。
+/// MinerU 4.0.12 明确回 `Unsupported file type` 的类型：`SUFFIX_MIME` 里受支持，
+/// 于是被扫进来、送给 MinerU，然后被拒。
 const MINERU_UNSUPPORTED: &[&str] = &["txt", "md"];
 
 /// 类型受支持、但本机 MinerU 的 PDF 引擎起不来（`Engine core initialization
-/// failed`）。这是服务端的问题，不是 rag-sync 的，列在这里只是为了让探针
-/// 不去撞它。
+/// failed`）：服务端的问题，列在这里只是为了让探针不去撞它。
 const MINERU_ENGINE_BROKEN: &[&str] = &["pdf"];
 
 fn mineru_would_reject(path: &std::path::Path) -> bool {
@@ -135,18 +137,18 @@ fn mineru_would_reject(path: &std::path::Path) -> bool {
         return true;
     };
     let lower = ext.to_ascii_lowercase();
-    MINERU_UNSUPPORTED.contains(&lower.as_str())
-        || MINERU_ENGINE_BROKEN.contains(&lower.as_str())
+    MINERU_UNSUPPORTED.contains(&lower.as_str()) || MINERU_ENGINE_BROKEN.contains(&lower.as_str())
 }
 
-/// 所有同步目录里体积最小、且真实 MinerU 收得下的文件。跳过 MinerU 拒收的类型：
-/// `mineru_tackle(...)?` 一失败就整轮中止，探针撞上必然红，而红的原因与服务无关。
-async fn smallest_parsable_file(
-    folders: &[SyncFolder],
-) -> Option<PathBuf> {
+/// 所有同步目录里体积最小、且真实 MinerU 收得下的文件：`mineru_tackle(...)?`
+/// 一失败就整轮中止，探针撞上必然红，而红的原因与服务无关。
+async fn smallest_parsable_file(folders: &[SyncFolder]) -> Option<PathBuf> {
     let mut best: Option<(u64, PathBuf)> = None;
     for folder in folders {
-        for entry in WalkDir::new(&folder.path).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&folder.path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if entry.file_type().is_dir()
                 || !is_supported_file(entry.path()).await
                 || mineru_would_reject(entry.path())
@@ -163,14 +165,13 @@ async fn smallest_parsable_file(
     best.map(|(_, p)| p)
 }
 
-/// `SUFFIX_MIME` 里有 MinerU 并不收的类型，全量同步会在中途整轮 abort。
-/// 这个用例把两边的差集摆出来 —— MinerU 升级后重跑一次就知道该改谁。
+/// `SUFFIX_MIME` 里有 MinerU 并不收的类型，全量同步会在中途整轮 abort；
+/// MinerU 升级后重跑一次就知道该改谁。
 #[tokio::test]
 #[ignore = "需要真实 MinerU"]
 async fn mineru_contract_gaps_would_abort_the_full_run() {
     let real = real_config().await;
-    let mut by_ext: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
+    let mut by_ext: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for folder in &real.sync_folders {
         for entry in WalkDir::new(&folder.path)
             .into_iter()
@@ -209,9 +210,8 @@ async fn mineru_contract_gaps_would_abort_the_full_run() {
     );
 }
 
-
-/// 删除并确认真的删掉了。服务端 pipeline 被别的写者占用时会回 `busy` 且
-/// **什么都没删**，重试是必要的；不确认就等于把垃圾留在知识库里。
+/// 删除并确认真的删掉了。服务端 pipeline 被占用时会回 `busy` 且什么都没删，
+/// 重试是必要的；不确认就等于把垃圾留在知识库里。
 async fn delete_and_wait(rag: &RAGRequest<'_>, doc_id: &str) -> Result<String, String> {
     let mut attempt = 1;
     loop {
@@ -229,14 +229,9 @@ async fn delete_and_wait(rag: &RAGRequest<'_>, doc_id: &str) -> Result<String, S
 
 /// 反查并删掉本次探针留下的文档。失败记录是在上传返回之后才注册的，
 /// 立刻反查多半查不到，所以先轮询一会儿再动手。
-async fn purge_probe(
-    rag: &RAGRequest<'_>,
-    name: &str,
-    cleaned: &mut Vec<String>,
-) {
+async fn purge_probe(rag: &RAGRequest<'_>, name: &str, cleaned: &mut Vec<String>) {
     for _ in 0..10 {
-        // 反查失败要打出来：吞掉会显示成「无需清理」，而文档其实还躺在库里。
-        // 已知成因见 chunks_count 的负数问题。
+        // 反查失败要打出来：吞掉会显示成「无需清理」，而文档其实还躺在库里
         let ids = match rag.find_doc_ids_by_filename(name).await {
             Ok(ids) => ids,
             Err(e) => {
@@ -261,7 +256,7 @@ async fn purge_probe(
 
 /// LightRAG 按**扩展名**选解析器，`X.docx` 里装 markdown 会回
 /// `File is not a valid DOCX document`，只有 `.md` 能过。
-/// 断言的是**应该成立**的行为，所以现在是红的：产物命名改掉之后才会转绿。
+/// 断言的是应该成立的行为，产物命名改掉之后才会转绿。
 #[tokio::test]
 #[ignore = "打真实 LightRAG，写入并删除一份文档"]
 async fn lightrag_accepts_mineru_markdown_output() {
@@ -278,18 +273,23 @@ async fn lightrag_accepts_mineru_markdown_output() {
 
     // 走真实映射：源文件是 .docx，产物应当是 `X.docx.md`。
     let root = tempfile::tempdir().unwrap();
-    let src = root.path().join(format!("rag_sync_extprobe_{}.docx", std::process::id()));
+    let src = root
+        .path()
+        .join(format!("rag_sync_extprobe_{}.docx", std::process::id()));
     std::fs::write(&src, "占位").unwrap();
-    let name = rag_sync::sync_folder::output_relative_path(root.path().to_str().unwrap(), "probe", &src)
-        .await
-        .unwrap();
+    let name =
+        rag_sync::sync_folder::output_relative_path(root.path().to_str().unwrap(), "probe", &src)
+            .await
+            .unwrap();
     assert!(name.ends_with(".md"), "产物名必须以 .md 收尾，实际 {name}");
     let path = root.path().join(&name);
     std::fs::write(&path, "# 标题\n\n正文段落。\n".repeat(20)).unwrap();
     // 上传名带别名前缀，与生产链路一致
     let name = rag_sync::sync_folder::upload_name("probe", &name);
 
-    let result = rag.upload_file_as(path.to_str().unwrap(), &name).await;
+    let result = rag
+        .upload_file_as(path.to_str().unwrap(), &name, None)
+        .await;
 
     match result {
         Ok(_) => {}
@@ -326,8 +326,7 @@ async fn lightrag_accepts_mineru_markdown_output() {
 }
 
 /// 只打真 MinerU 的最小往返：上传 -> `POST /v1/parse/jobs` -> 轮询 -> 按产物 id 取正文。
-/// 不碰 LightRAG、不写库，比 `probe_round_trip` 便宜得多：MinerU 升级后跑一次，
-/// 就知道任务接口（状态枚举、不内联正文这些坑）还对不对。
+/// 不碰 LightRAG、不写库，比 `probe_round_trip` 便宜得多。
 #[tokio::test]
 #[ignore = "需要真实 MinerU"]
 async fn mineru_job_round_trip_against_real_service() {
@@ -355,6 +354,7 @@ async fn mineru_job_round_trip_against_real_service() {
         rag_id: None,
         run_id: 1,
         output_rel_path: None,
+        uploaded_sha256: None,
     };
 
     let client = http_util::client().unwrap();
@@ -369,8 +369,8 @@ async fn mineru_job_round_trip_against_real_service() {
     println!("拿到 {} 字节 markdown", markdown.len());
 }
 
-/// 单文件全链路：真 MinerU 转换 -> 写产物 -> 真 LightRAG 入库 -> 落库，结束即删。
-/// 只把同步目录 / output_dir 换成临时的：真服务、真凭据、真文档，知识库里不留痕。
+/// 单文件全链路：真 MinerU 转换 -> 写产物 -> 真 LightRAG 入库 -> 落库，结束即删，
+/// 只把同步目录 / output_dir 换成临时的。
 #[tokio::test]
 #[ignore = "会往真实知识库写一份文档再删掉"]
 async fn probe_round_trip_against_real_services() {
@@ -404,6 +404,8 @@ async fn probe_round_trip_against_real_services() {
         lightrag_username: real.lightrag_username.clone(),
         lightrag_password: real.lightrag_password.clone(),
         run_id: 1,
+        mineru_concurrency: 1,
+        lightrag_concurrency: 1,
     };
 
     let mut db = common::test_db().await;
@@ -421,8 +423,7 @@ async fn probe_round_trip_against_real_services() {
 
     let outcome = create_output_files(&config, &files, &mut db.conn).await;
 
-    // 不管成不成败都要清理：失败往往意味着服务端已经建了记录、直接 panic
-    // 会把文档永久留在知识库里。
+    // 不管成不成败都要清理：失败往往意味着服务端已经建了记录
     let client = http_util::client().unwrap();
     let rag = RAGRequest::new(
         &client,
@@ -462,11 +463,10 @@ async fn probe_round_trip_against_real_services() {
     println!("探针通过并已清理干净");
 }
 
-// ---------------------------------------------------------------- 全量
+// 全量
 
 /// 用当前 config.yml 把 sync_dir 下全部受支持文件同步一遍 —— 生产入库本身。
-///
-/// 逐个断言：这轮要么真的产出了产物并记下 doc_id，要么明确报错；不允许静默跳过。
+/// 逐个断言：这轮要么真的产出了产物并记下 doc_id，要么明确报错，不允许静默跳过。
 #[tokio::test]
 #[ignore = "把 sync_dir 全部文件灌进真实知识库，按小时计"]
 async fn full_sync_against_real_config() {
@@ -481,8 +481,7 @@ async fn full_sync_against_real_config() {
     let total = all.len();
     println!("扫到 {total} 个文件，本轮 run_id = {}", config.run_id);
 
-    // 借切片而不是 clone：db_model::File 没有 Clone，而为了测试给生产类型
-    // 加派生是本末倒置。
+    // 借切片而不是 clone：db_model::File 没有 Clone，为了测试给生产类型加派生是本末倒置。
     let batch: &[db_model::File] = match env_limit() {
         Some(n) if n < total => {
             println!("E2E_LIMIT={n}：本轮只处理前 {n} 个，其余的不刷新 run_id");
@@ -495,20 +494,19 @@ async fn full_sync_against_real_config() {
     let produced = create_output_files(&config, batch, &mut conn)
         .await
         .expect("全量同步失败；重跑会从断点继续（按 sha256 跳过已完成的）");
-    println!("本轮产出 {} 份产物（{} 个待处理）", produced.len(), batch_len);
+    println!(
+        "本轮产出 {} 份产物（{} 个待处理）",
+        produced.len(),
+        batch_len
+    );
 
     for path in &produced {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("产物读不出来 {}: {e}", path.display()));
-        assert!(
-            !text.trim().is_empty(),
-            "产物是空文件: {}",
-            path.display()
-        );
+        assert!(!text.trim().is_empty(), "产物是空文件: {}", path.display());
     }
 
-    // 限流跑完必须把没处理到的行刷成 run_id，否则下一轮 delete_old_files
-    // 会把它们当成「用户已删除」从知识库里清掉。
+    // 限流跑完必须把没处理到的行刷成 run_id，否则下一轮会被当成「用户已删除」清掉。
     if batch_len < total {
         for f in &all {
             DBfunc::update_file_run_id(&mut conn, &f.path, config.run_id)

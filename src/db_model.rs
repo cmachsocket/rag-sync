@@ -1,27 +1,29 @@
-// src/models.rs
-use diesel::prelude::*;
 use crate::schema::files;
 use crate::schema::run_counter;
+use diesel::prelude::*;
 
-#[derive(Queryable, Selectable, Debug)]
+#[derive(Queryable, Selectable, Debug, Clone)]
 #[diesel(table_name = files)]
 pub struct File {
     pub id: i32,
     pub path: String,
+    /// 源文件的 sha256，判「文件变了没有」用。
     pub sha256: String,
     pub rag_id: Option<String>,
     pub run_id: i32,
-    /// 产物在 output_dir 里的相对路径（含别名目录）。
-    /// 由产物相对路径算出来并落库之后，清理就不再依赖配置 ——
-    /// 改名、换目录、把别名从配置里删掉，都还能定位到原来那个文件。
-    /// NULL 表示这行是加列之前写入的：它按旧规则（无别名目录）定位产物。
+    /// 产物在 output_dir 里的相对路径（含别名目录）。落库后清理不再依赖配置。
+    /// NULL 表示加列之前写入的行，按旧规则（无别名目录）定位产物。
     pub output_rel_path: Option<String>,
+    /// **上传进知识库的产物正文**的 sha256，不是源文件的。
+    /// 源文件变了不代表正文变了，靠这一列认出「知识库里已经是这份内容」，
+    /// 免去 409 自愈的先删后传。NULL 表示还没成功传过，或是加列前写入的行。
+    pub uploaded_sha256: Option<String>,
 }
 
 #[derive(Queryable, Selectable, Debug)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 #[diesel(table_name = run_counter)]
-pub struct RunCounter{
+pub struct RunCounter {
     pub id: i32,
     pub current_run_id: i32,
 }

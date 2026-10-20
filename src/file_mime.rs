@@ -1,4 +1,3 @@
-
 /// 扩展名 -> MIME，取自 MinerU 自身的 `MIME_TYPE_BY_EXTENSION`
 /// (`mineru/filetypes.py`)：标准库对 `mhtml` / `rst` / `tex` 等给的值与服务端不一致。
 use std::path::Path;

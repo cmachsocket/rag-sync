@@ -1,6 +1,5 @@
-//! 回归防护：每条对应一个曾经真实存在、且会**丢用户数据**的缺陷。
-//! 断言已翻转为正确行为，作用是挡回归 —— 哪天又红了多半是真退化，别直接改断言。
-//! 按缺陷编号排列，与修复记录一一对应。
+//! 回归防护：每条对应一个曾经真实存在、且会丢用户数据的缺陷。
+//! 断言已翻转为正确行为，哪天又红了多半是真退化，别直接改断言。按缺陷编号排列。
 
 mod common;
 
@@ -75,8 +74,7 @@ async fn sync_once(
     files
 }
 
-// ================================================================ 1
-// insert_file 曾把 run_id 写进 id 主键列
+// 缺陷 1：insert_file 曾把 run_id 写进 id 主键列
 
 #[tokio::test]
 async fn insert_writes_run_id_and_autoincrements_id() {
@@ -89,6 +87,7 @@ async fn insert_writes_run_id_and_autoincrements_id() {
         7,
         Some("doc-1"),
         "probe/a.pdf.md",
+        "uploaded-sha",
     )
     .await
     .unwrap();
@@ -110,9 +109,17 @@ async fn multiple_files_insert_in_same_run() {
         ("/sync/b.pdf", "s2"),
         ("/sync/c.pdf", "s3"),
     ] {
-        DBfunc::insert_file(&mut db.conn, path, sha, 9, Some("doc"), "probe/a.pdf.md")
-            .await
-            .unwrap();
+        DBfunc::insert_file(
+            &mut db.conn,
+            path,
+            sha,
+            9,
+            Some("doc"),
+            "probe/a.pdf.md",
+            "uploaded-sha",
+        )
+        .await
+        .unwrap();
     }
     let ids = db.row_ids().await;
     assert_eq!(ids, vec![1, 2, 3], "三个文件都要有各自的主键");
@@ -145,8 +152,7 @@ async fn delete_file_touches_only_target_row() {
         .unwrap();
 }
 
-// ================================================================ 2
-// run_id 停在 0 -> 同一轮就把刚处理完的原件当成旧文件删掉
+// 缺陷 2：run_id 停在 0 -> 同一轮就把刚处理完的原件当成旧文件删掉
 
 #[tokio::test]
 async fn source_documents_survive_a_run() {
@@ -167,8 +173,7 @@ async fn source_documents_survive_a_run() {
     );
 }
 
-// ================================================================ 3
-// 跳过判断拿 DB 的 sha 比 DB 的 sha -> 内容改了也看不见
+// 缺陷 3：跳过判断拿 DB 的 sha 比 DB 的 sha -> 内容改了也看不见
 
 #[tokio::test]
 async fn changed_content_is_reprocessed() {
@@ -222,8 +227,7 @@ async fn unchanged_content_only_refreshes_run_id() {
     );
 }
 
-// ================================================================ 4
-// delete_old_files 曾删同步目录里的用户原件
+// 缺陷 4：delete_old_files 曾删同步目录里的用户原件
 
 #[tokio::test]
 async fn cleanup_only_removes_generated_artifacts() {
@@ -405,8 +409,7 @@ async fn two_rounds_cleanup_deleted_keep_rest() {
     assert_eq!(db.run_id_of(&keep).await, 2, "还在的文件轮次要跟上");
 }
 
-// ================================================================ 5
-// ensure_file_id 曾把 DB 行号当成 MinerU 的 file_id
+// 缺陷 5：ensure_file_id 曾把 DB 行号当成 MinerU 的 file_id
 
 #[tokio::test]
 async fn reprocess_uses_real_mineru_file_id() {
@@ -422,6 +425,7 @@ async fn reprocess_uses_real_mineru_file_id() {
         sha256: "abc".into(),
         rag_id: Some("doc-x".into()),
         output_rel_path: None,
+        uploaded_sha256: None,
         run_id: 2,
     };
     let cfg = rag_sync::sync_config::SyncConfig {
@@ -435,6 +439,8 @@ async fn reprocess_uses_real_mineru_file_id() {
         lightrag_username: "u".into(),
         lightrag_password: "p".into(),
         run_id: 2,
+        mineru_concurrency: 1,
+        lightrag_concurrency: 1,
     };
 
     rag_sync::mineru_requests::mineru_tackle(&MockServer::client(), &file, &cfg)
@@ -453,8 +459,7 @@ async fn reprocess_uses_real_mineru_file_id() {
     );
 }
 
-// ================================================================ 6
-// canonical_basename 剥 hint 后残留点号
+// 缺陷 6：canonical_basename 剥 hint 后残留点号
 
 #[test]
 fn parser_hint_normalises_to_same_key() {
@@ -524,8 +529,7 @@ async fn conflict_selfheal_works_with_parser_hint() {
     );
 }
 
-// ================================================================ 7
-// 配置里的 ~ 不展开
+// 缺陷 7：配置里的 ~ 不展开
 
 #[tokio::test]
 async fn tilde_in_config_is_expanded() {
@@ -574,8 +578,8 @@ async fn tilde_inside_path_is_left_alone() {
     assert_eq!(c.output_dir, "/data/a~b");
 }
 
-/// 每个同步目录都要展开。漏一个的话该目录扫不到，
-/// 它上轮的文件会被当成「用户删了」清掉产物与知识库文档。
+/// 每个同步目录都要展开。漏一个的话该目录扫不到，它上轮的文件会被当成
+/// 「用户删了」清掉产物与知识库文档。
 #[tokio::test]
 async fn tilde_is_expanded_in_every_folder() {
     let mut db = common::test_db().await;
@@ -609,8 +613,7 @@ async fn tilde_is_expanded_in_every_folder() {
     );
 }
 
-// ================================================================ 8
-// 同步目录不存在时静默跑完一轮空同步
+// 缺陷 8：同步目录不存在时静默跑完一轮空同步
 
 #[tokio::test]
 async fn missing_sync_dir_is_an_error() {

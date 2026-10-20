@@ -10,17 +10,14 @@ use tokio_util::io::ReaderStream;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// 稳态轮询间隔。任务已经跑起来了，问得再密也不会更快。
+/// 稳态轮询间隔，任务已经跑起来了，问得再密也不会更快。
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 起步几轮用 1 秒：纯文本类文件（docx）服务端 1 秒内就出结果，
-/// 一轮固定 5 秒会让「一堆小文件」每个白等 5 秒。
+/// 起步几轮用 1 秒：小文件服务端秒出结果，固定 5 秒会白等。
 const FAST_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FAST_POLL_ROUNDS: u32 = 3;
 
-/// 轮询上限。仅防服务端任务卡死导致无限等待，与 HTTP 层无关。
-/// 实测 13 页扫描件要 83 秒（约 6.4 秒/页），914 页量级在 1.6 小时以上，
-/// 已超同步接口 wait_timeout 的 3600 s；故按 7200 轮 × 5 秒 ≈ 10 小时给足，
+/// 轮询上限，仅防服务端任务卡死。实测约 6.4 秒/页，按 7200 轮 × 5 秒 ≈ 10 小时给足，
 /// 别把大文件的正常解析掐断。
 const MAX_POLL_ROUNDS: u32 = 7200;
 
@@ -85,8 +82,7 @@ async fn upload(
         .await
         .map_err(|e| err(file, format!("解析上传响应失败: {e}")))?;
 
-    // 按 sha256 幂等：内容已存在时直接返回 completed，upload_url 为 null，
-    // 再 PUT 会得到 409 upload_already_terminal。
+    // 按 sha256 幂等：内容已存在时直接返回 completed，再 PUT 会 409。
     if upload.status == "completed" {
         if let Some(f) = upload.file {
             return Ok(f.id);
@@ -110,7 +106,6 @@ async fn put_content(
         .await
         .map_err(|e| err(file, format!("打开文件失败: {e}")))?;
 
-    // ReaderStream 要求 AsyncRead + Unpin，tokio::fs::File 两者都满足
     let stream = ReaderStream::with_capacity(f, 64 * 1024);
     let body_len = tokio::fs::metadata(&file.path)
         .await
@@ -164,11 +159,8 @@ async fn complete(
         .ok_or_else(|| err(file, "完成响应中缺少 file.id"))
 }
 
-/// 创建解析任务并轮询到终态，返回 markdown。
-///
-/// 走任务接口而不是同步的 `/v1/file_parse`：大文件逐页 OCR（实测 6.4 秒/页）在同步
-/// 接口上只能一直卡在 wait_timeout 里，服务端 3600 s 的上限根本不够；
-/// 任务接口把等待交给服务端排队，这里只是每几秒醒一次。
+/// 创建解析任务并轮询到终态，返回 markdown。走任务接口而不是同步的 `/v1/file_parse`：
+/// 后者的 wait_timeout 3600 s 撑不住大文件逐页 OCR。
 async fn parse(
     client: &reqwest::Client,
     file: &db_model::File,
@@ -200,8 +192,7 @@ async fn parse(
         job = poll(client, file, config, &job.job_id).await?;
     }
 
-    // 终态五种，只有 completed 算成功：partial 是「有文件失败」，
-    // 单文件任务里等同于失败，同样要冒泡。
+    // 只有 completed 算成功，partial（有文件失败）在单文件任务里同样要冒泡。
     if job.status != "completed" {
         let detail = job
             .files
@@ -218,12 +209,12 @@ async fn parse(
     extract_markdown(client, file, config, &job).await
 }
 
-/// queued / running 之外都是终态。没有终态就一直轮，失败任务才不会被当成「还在跑」。
+/// queued / running 之外都是终态，失败任务不会被当成「还在跑」。
 fn is_terminal(status: &str) -> bool {
     return matches!(status, "completed" | "partial" | "failed" | "canceled");
 }
 
-/// 第几轮该睡多久：起步快，小文件 1 秒内就捞到结果；稳态慢，大文件不必问密。
+/// 第几轮该睡多久：起步快，稳态慢。
 fn poll_interval(round: u32) -> Duration {
     if round <= FAST_POLL_ROUNDS {
         FAST_POLL_INTERVAL
@@ -271,7 +262,7 @@ async fn poll(
     Err(err(file, "轮询超时，任务可能仍在服务端运行"))
 }
 
-/// 取 markdown 内容。任务接口不内联正文，只能拿产物 id 二次请求。
+/// 取 markdown 内容：任务接口不内联正文，只能拿产物 id 二次请求。
 async fn extract_markdown(
     client: &reqwest::Client,
     file: &db_model::File,
@@ -306,9 +297,7 @@ async fn extract_markdown(
 }
 
 /// 单个文件的完整流程：上传 → 解析 → 返回 markdown。
-///
-/// 每轮都重新上传：`files.id` 是 DB 行号，不是 MinerU 的 file_id。重复上传不花钱
-/// 靠的是服务端按 sha256 幂等（见上面 completed 分支）。
+/// 每轮都重新上传（`files.id` 是 DB 行号，不是 MinerU 的 file_id），靠服务端按 sha256 幂等。
 pub async fn mineru_tackle(
     client: &reqwest::Client,
     file: &db_model::File,

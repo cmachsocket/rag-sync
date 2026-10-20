@@ -1,6 +1,6 @@
 //! 扩展名 -> MIME 映射。表照抄自 MinerU 服务端，抄错要到解析阶段才暴露，故固定整张表。
 
-use rag_sync::file_mime::{mime_for, SUFFIX_MIME};
+use rag_sync::file_mime::{SUFFIX_MIME, mime_for};
 use rag_sync::sync_folder::is_supported_file;
 use std::path::Path;
 
@@ -16,7 +16,11 @@ fn suffix_table_has_25_unique_entries() {
 #[test]
 fn suffixes_lowercase_and_mime_well_formed() {
     for (suffix, mime) in SUFFIX_MIME.iter() {
-        assert_eq!(*suffix, suffix.to_ascii_lowercase(), "后缀必须小写: {suffix}");
+        assert_eq!(
+            *suffix,
+            suffix.to_ascii_lowercase(),
+            "后缀必须小写: {suffix}"
+        );
         assert!(!suffix.is_empty());
         assert!(mime.contains('/'), "MIME 形状不对: {mime}");
     }
@@ -26,8 +30,14 @@ fn suffixes_lowercase_and_mime_well_formed() {
 fn common_suffixes_map_correctly() {
     let cases = [
         ("a.pdf", "application/pdf"),
-        ("a.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-        ("a.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        (
+            "a.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            "a.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
         ("a.md", "text/markdown"),
         ("a.markdown", "text/markdown"),
         ("a.txt", "text/plain"),
@@ -57,8 +67,14 @@ fn uppercase_suffix_still_matches() {
 
 #[test]
 fn only_last_suffix_counts() {
-    assert_eq!(mime_for(Path::new("归档.2024.final.pdf")), "application/pdf");
-    assert_eq!(mime_for(Path::new("/tmp/a/b/c.tar.gz")), "application/octet-stream");
+    assert_eq!(
+        mime_for(Path::new("归档.2024.final.pdf")),
+        "application/pdf"
+    );
+    assert_eq!(
+        mime_for(Path::new("/tmp/a/b/c.tar.gz")),
+        "application/octet-stream"
+    );
 }
 
 #[test]
@@ -68,12 +84,18 @@ fn unknown_suffix_falls_back_to_octet_stream() {
     assert_eq!(mime_for(Path::new("noext")), "application/octet-stream");
     assert_eq!(mime_for(Path::new("")), "application/octet-stream");
     // 隐藏文件：Path::extension 对 ".gitignore" 返回 None
-    assert_eq!(mime_for(Path::new(".gitignore")), "application/octet-stream");
+    assert_eq!(
+        mime_for(Path::new(".gitignore")),
+        "application/octet-stream"
+    );
 }
 
 #[test]
 fn unicode_and_space_in_path_do_not_matter() {
-    assert_eq!(mime_for(Path::new("/home/u/我的 文档/a.pdf")), "application/pdf");
+    assert_eq!(
+        mime_for(Path::new("/home/u/我的 文档/a.pdf")),
+        "application/pdf"
+    );
 }
 
 #[tokio::test]

@@ -6,7 +6,8 @@ mod common;
 use common::test_db;
 
 /// 一份最小可用配置：`head` 之后接上就行。
-const MINIMAL_TAIL: &str = "output_dir: \"/data/out\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n";
+const MINIMAL_TAIL: &str =
+    "output_dir: \"/data/out\"\nmineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n";
 
 fn folders_yaml(entries: &[(&str, &str)]) -> String {
     let mut s = String::from("sync_folders:\n");
@@ -68,7 +69,10 @@ async fn loads_every_folder_with_its_alias() {
         .iter()
         .map(|f| (f.name.as_str(), f.path.as_str()))
         .collect();
-    assert_eq!(got, vec![("work", "/data/work"), ("personal", "/data/personal")]);
+    assert_eq!(
+        got,
+        vec![("work", "/data/work"), ("personal", "/data/personal")]
+    );
     assert_eq!(c.alias_list(), "work / personal");
 }
 
@@ -85,6 +89,24 @@ async fn missing_keys_use_defaults() {
     assert_eq!(c.lightrag_password, "");
     // run_id 被计数器 +1 无条件覆盖，serde 上的 `default = "zero"` 实际不可达
     assert_eq!(c.run_id, 1);
+    // 并发默认 1：老配置里没有这两个键，行为不能变
+    assert_eq!(c.mineru_concurrency, 1);
+    assert_eq!(c.lightrag_concurrency, 1);
+}
+
+/// 并发数从配置里读：调了没反应等于没这个配置。
+#[tokio::test]
+async fn concurrency_is_configurable() {
+    let c = load(&format!(
+        "{}",
+        folders_yaml(&[("work", "/data/sync")])
+            + "output_dir: \"/data/out\"\nmineru_url: \"http://m:9777\"\nlightrag_url: \"http://r:9621\"\n\
+              mineru_concurrency: 2\nlightrag_concurrency: 4\n"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(c.mineru_concurrency, 2);
+    assert_eq!(c.lightrag_concurrency, 4);
 }
 
 #[tokio::test]
@@ -96,11 +118,9 @@ async fn missing_sync_folders_names_the_field() {
 /// 旧的单目录写法 `sync_dir` 不再支持，升级的人第一眼就要看到怎么改。
 #[tokio::test]
 async fn legacy_sync_dir_is_rejected_with_migration_hint() {
-    let err = load(&format!(
-        "sync_dir: \"/data/sync\"\n{MINIMAL_TAIL}"
-    ))
-    .await
-    .unwrap_err();
+    let err = load(&format!("sync_dir: \"/data/sync\"\n{MINIMAL_TAIL}"))
+        .await
+        .unwrap_err();
     assert!(err.contains("sync_folders"), "{err}");
     assert!(err.contains("sync_dir"), "要说清旧写法为什么不行了: {err}");
     assert!(err.contains("name"), "要给出新写法的样子: {err}");
@@ -116,10 +136,12 @@ async fn empty_sync_folders_list_is_missing() {
 
 #[tokio::test]
 async fn missing_output_dir_names_the_field() {
-    let err = load(&(folders_yaml(&[("work", "/data/sync")])
-        + "mineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n"))
-        .await
-        .unwrap_err();
+    let err = load(
+        &(folders_yaml(&[("work", "/data/sync")])
+            + "mineru_url: \"http://m\"\nlightrag_url: \"http://r\"\n"),
+    )
+    .await
+    .unwrap_err();
     assert!(err.contains("output_dir"), "报错要说清缺哪个字段: {err}");
 }
 
@@ -166,8 +188,7 @@ async fn alias_with_path_separator_is_rejected() {
     }
 }
 
-/// `__` 是上传名的分隔符：别名 `a__b` + `c.pdf` 会和别名 `a` + `b__c.pdf`
-/// 撞成同一个 LightRAG 键，后者会 409 自愈把前者从知识库里删掉。
+/// `__` 是上传名的分隔符：别名 `a__b` + `c.pdf` 会和别名 `a` + `b__c.pdf` 撞成同一个键。
 #[tokio::test]
 async fn alias_with_double_underscore_is_rejected() {
     let err = load(&format!(
@@ -211,11 +232,13 @@ async fn duplicate_alias_is_rejected() {
     ))
     .await
     .unwrap_err();
-    assert!(err.contains("重复"), "撞名会让产物目录与上传名都不唯一: {err}");
+    assert!(
+        err.contains("重复"),
+        "撞名会让产物目录与上传名都不唯一: {err}"
+    );
 }
 
-/// 同一目录配两个别名：同一个文件会被扫两次，两份产物互相覆盖、
-/// 上传时还会 409 互删。启动就要拦下。
+/// 同一目录配两个别名：同一个文件会被扫两次，两份产物互相覆盖、上传时 409 互删。
 #[tokio::test]
 async fn same_path_twice_is_rejected() {
     let err = load(&format!(
@@ -266,8 +289,7 @@ async fn string_prefix_is_not_overlap() {
 async fn missing_mineru_url_names_the_field() {
     let err = load(&format!(
         "{}",
-        folders_yaml(&[("work", "/a")])
-            + "output_dir: \"/b\"\nlightrag_url: \"http://r\"\n"
+        folders_yaml(&[("work", "/a")]) + "output_dir: \"/b\"\nlightrag_url: \"http://r\"\n"
     ))
     .await
     .unwrap_err();
@@ -279,8 +301,7 @@ async fn missing_mineru_url_names_the_field() {
 async fn missing_lightrag_url_names_the_field() {
     let err = load(&format!(
         "{}",
-        folders_yaml(&[("work", "/a")])
-            + "output_dir: \"/b\"\nmineru_url: \"http://m\"\n"
+        folders_yaml(&[("work", "/a")]) + "output_dir: \"/b\"\nmineru_url: \"http://m\"\n"
     ))
     .await
     .unwrap_err();
@@ -303,10 +324,10 @@ async fn syntax_error_reports_parse_failure() {
     assert!(err.contains("解析"), "报错要说明是解析失败: {err}");
 }
 
-// ---------------------------------------------------------------- 归属
+// 归属
 
 /// 清理时只有一条 DB 记录（源绝对路径），要靠它反推别名子目录。
-/// 直接构造 config：重叠目录在加载时就会被拒，这里要验的是归属规则本身。
+/// 直接构造 config：重叠目录在加载时就会被拒，这里验的是归属规则本身。
 #[test]
 fn folder_of_picks_the_most_specific_root() {
     let c = rag_sync::sync_config::SyncConfig {
@@ -326,6 +347,8 @@ fn folder_of_picks_the_most_specific_root() {
         lightrag_password: "p".into(),
         lightrag_url: "http://r".into(),
         lightrag_username: "u".into(),
+        mineru_concurrency: 1,
+        lightrag_concurrency: 1,
     };
 
     assert_eq!(
@@ -340,12 +363,18 @@ fn folder_of_picks_the_most_specific_root() {
         "更深的目录要赢，否则同一个文件会算出两个产物路径"
     );
     // 目录外不该被认领，否则清理时会算出错的产物路径
-    assert!(c.folder_of(std::path::Path::new("/data/other/a.pdf")).is_none());
+    assert!(
+        c.folder_of(std::path::Path::new("/data/other/a.pdf"))
+            .is_none()
+    );
     // 字符串前缀不算包含
-    assert!(c.folder_of(std::path::Path::new("/data/working/a.pdf")).is_none());
+    assert!(
+        c.folder_of(std::path::Path::new("/data/working/a.pdf"))
+            .is_none()
+    );
 }
 
-// ---------------------------------------------------------------- run_id
+// run_id
 
 #[tokio::test]
 async fn run_id_is_counter_plus_one() {
