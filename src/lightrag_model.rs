@@ -64,10 +64,10 @@ impl TrackResponse {
         // 空数组不算完成：第一次查询可能拿到 documents: []，`all()` 恒为 true。
         !self.documents.is_empty()
             && self.documents.iter().all(|d| {
-                return matches!(
+                matches!(
                     d.status.to_ascii_lowercase().as_str(),
                     "processed" | "failed"
-                );
+                )
             })
     }
 

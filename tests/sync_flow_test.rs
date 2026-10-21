@@ -39,7 +39,7 @@ fn track_terminal(doc_id: &str) -> Route {
 }
 
 fn mineru_routes(markdown: &str) -> Vec<Route> {
-    return vec![
+    vec![
         Route::post("/v1/uploads").and(R::json(
             201,
             r#"{"id":"up-1","status":"created","file":null}"#,
@@ -61,7 +61,7 @@ fn mineru_routes(markdown: &str) -> Vec<Route> {
                   "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
         )),
         Route::get("/v1/files/out-1/content").and(R::text(200, markdown)),
-    ];
+    ]
 }
 
 /// 起一套完整环境：临时 sync/out 目录 + MinerU + LightRAG。

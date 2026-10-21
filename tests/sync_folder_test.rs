@@ -350,7 +350,7 @@ async fn http_client_times_out_on_silent_server() {
     let result = client.get(&url).send().await;
     let waited = started.elapsed();
 
-    let err = result.err().expect("服务端不应回包，请求必须失败");
+    let err = result.expect_err("服务端不应回包，请求必须失败");
     assert!(
         err.is_timeout() || format!("{err}").contains("timed out"),
         "期望是超时错误，实际: {err}"

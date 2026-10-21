@@ -26,7 +26,7 @@ If you are unsure about whether an annotation is necessary, it is better to call
 
 No tests should be written or added to the production codebase. All tests should be written into the "tests/" folder.
 
-use `rust-analyzer diagnostics` to check for any errors or warnings in the code. If any errors or warnings are found, you must fix them before proceeding.
+use `cargo clippy` to check for any errors or warnings in the code. If any errors or warnings are found, you must fix them before proceeding.
 
 If you add new features or make changes to existing code, you must ensure that the code is properly tested. This includes writing unit tests, integration tests, and any other relevant tests to cover the new functionality.
 

@@ -58,10 +58,9 @@ async fn loads_all_fields() {
 /// 多文件夹是这个功能的主场景：别名按配置顺序原样保留，产物目录与上传名都靠它。
 #[tokio::test]
 async fn loads_every_folder_with_its_alias() {
-    let c = load(&format!(
-        "{}",
-        folders_yaml(&[("work", "/data/work"), ("personal", "/data/personal")]) + MINIMAL_TAIL
-    ))
+    let c = load(
+        &(folders_yaml(&[("work", "/data/work"), ("personal", "/data/personal")]) + MINIMAL_TAIL),
+    )
     .await
     .unwrap();
     let got: Vec<(&str, &str)> = c
@@ -78,13 +77,11 @@ async fn loads_every_folder_with_its_alias() {
 
 #[tokio::test]
 async fn missing_keys_use_defaults() {
-    let c = load(&format!(
-        "{}",
-        folders_yaml(&[("work", "/data/sync")])
-            + "output_dir: \"/data/out\"\nmineru_url: \"http://m:9777\"\nlightrag_url: \"http://r:9621\"\n"
-    ))
-    .await
-    .unwrap();
+    let c = load(
+        &(folders_yaml(&[("work", "/data/sync")])
+            + "output_dir: \"/data/out\"\nmineru_url: \"http://m:9777\"\nlightrag_url: \"http://r:9621\"\n"))
+            .await
+            .unwrap();
     assert_eq!(c.lightrag_username, "");
     assert_eq!(c.lightrag_password, "");
     // run_id 被计数器 +1 无条件覆盖，serde 上的 `default = "zero"` 实际不可达
@@ -97,12 +94,11 @@ async fn missing_keys_use_defaults() {
 /// 并发数从配置里读：调了没反应等于没这个配置。
 #[tokio::test]
 async fn concurrency_is_configurable() {
-    let c = load(&format!(
-        "{}",
-        folders_yaml(&[("work", "/data/sync")])
+    let c = load(
+        &(folders_yaml(&[("work", "/data/sync")])
             + "output_dir: \"/data/out\"\nmineru_url: \"http://m:9777\"\nlightrag_url: \"http://r:9621\"\n\
-              mineru_concurrency: 2\nlightrag_concurrency: 4\n"
-    ))
+              mineru_concurrency: 2\nlightrag_concurrency: 4\n")
+    )
     .await
     .unwrap();
     assert_eq!(c.mineru_concurrency, 2);
@@ -191,47 +187,35 @@ async fn alias_with_path_separator_is_rejected() {
 /// `__` 是上传名的分隔符：别名 `a__b` + `c.pdf` 会和别名 `a` + `b__c.pdf` 撞成同一个键。
 #[tokio::test]
 async fn alias_with_double_underscore_is_rejected() {
-    let err = load(&format!(
-        "{}",
-        folders_yaml(&[("a__b", "/data/sync")]) + MINIMAL_TAIL
-    ))
-    .await
-    .unwrap_err();
+    let err = load(&(folders_yaml(&[("a__b", "/data/sync")]) + MINIMAL_TAIL))
+        .await
+        .unwrap_err();
     assert!(err.contains("__"), "{err}");
 }
 
 #[tokio::test]
 async fn alias_with_whitespace_is_rejected() {
-    let err = load(&format!(
-        "{}",
-        folders_yaml(&[("my work", "/data/sync")]) + MINIMAL_TAIL
-    ))
-    .await
-    .unwrap_err();
+    let err = load(&(folders_yaml(&[("my work", "/data/sync")]) + MINIMAL_TAIL))
+        .await
+        .unwrap_err();
     assert!(err.contains("空白"), "{err}");
 }
 
 #[tokio::test]
 async fn dot_aliases_are_rejected() {
     for alias in [".", ".."] {
-        let err = load(&format!(
-            "{}",
-            folders_yaml(&[(alias, "/data/sync")]) + MINIMAL_TAIL
-        ))
-        .await
-        .unwrap_err();
+        let err = load(&(folders_yaml(&[(alias, "/data/sync")]) + MINIMAL_TAIL))
+            .await
+            .unwrap_err();
         assert!(err.contains("别名"), "{alias:?} 不该被放行: {err}");
     }
 }
 
 #[tokio::test]
 async fn duplicate_alias_is_rejected() {
-    let err = load(&format!(
-        "{}",
-        folders_yaml(&[("work", "/data/a"), ("work", "/data/b")]) + MINIMAL_TAIL
-    ))
-    .await
-    .unwrap_err();
+    let err = load(&(folders_yaml(&[("work", "/data/a"), ("work", "/data/b")]) + MINIMAL_TAIL))
+        .await
+        .unwrap_err();
     assert!(
         err.contains("重复"),
         "撞名会让产物目录与上传名都不唯一: {err}"
@@ -241,56 +225,44 @@ async fn duplicate_alias_is_rejected() {
 /// 同一目录配两个别名：同一个文件会被扫两次，两份产物互相覆盖、上传时 409 互删。
 #[tokio::test]
 async fn same_path_twice_is_rejected() {
-    let err = load(&format!(
-        "{}",
-        folders_yaml(&[("work", "/data/sync"), ("alias2", "/data/sync")]) + MINIMAL_TAIL
-    ))
-    .await
-    .unwrap_err();
+    let err =
+        load(&(folders_yaml(&[("work", "/data/sync"), ("alias2", "/data/sync")]) + MINIMAL_TAIL))
+            .await
+            .unwrap_err();
     assert!(err.contains("同一个目录"), "{err}");
 }
 
 #[tokio::test]
 async fn overlapping_paths_are_rejected() {
-    let err = load(&format!(
-        "{}",
-        folders_yaml(&[("all", "/data"), ("work", "/data/work")]) + MINIMAL_TAIL
-    ))
-    .await
-    .unwrap_err();
+    let err = load(&(folders_yaml(&[("all", "/data"), ("work", "/data/work")]) + MINIMAL_TAIL))
+        .await
+        .unwrap_err();
     assert!(err.contains("重叠"), "{err}");
 }
 
 /// 尾部斜杠不是新的目录：不去掉的话 `starts_with` 判不出来，重叠就漏了。
 #[tokio::test]
 async fn overlapping_paths_with_trailing_slash_are_rejected() {
-    let err = load(&format!(
-        "{}",
-        folders_yaml(&[("all", "/data/"), ("work", "/data/work")]) + MINIMAL_TAIL
-    ))
-    .await
-    .unwrap_err();
+    let err = load(&(folders_yaml(&[("all", "/data/"), ("work", "/data/work")]) + MINIMAL_TAIL))
+        .await
+        .unwrap_err();
     assert!(err.contains("重叠"), "{err}");
 }
 
 /// 字符串前缀不是目录包含关系：`/data/a` 与 `/data/ab` 互不重叠。
 #[tokio::test]
 async fn string_prefix_is_not_overlap() {
-    let c = load(&format!(
-        "{}",
-        folders_yaml(&[("a", "/data/a"), ("ab", "/data/ab")]) + MINIMAL_TAIL
-    ))
-    .await
-    .unwrap();
+    let c = load(&(folders_yaml(&[("a", "/data/a"), ("ab", "/data/ab")]) + MINIMAL_TAIL))
+        .await
+        .unwrap();
     assert_eq!(c.sync_folders.len(), 2);
 }
 
 #[tokio::test]
 async fn missing_mineru_url_names_the_field() {
-    let err = load(&format!(
-        "{}",
-        folders_yaml(&[("work", "/a")]) + "output_dir: \"/b\"\nlightrag_url: \"http://r\"\n"
-    ))
+    let err = load(
+        &(folders_yaml(&[("work", "/a")]) + "output_dir: \"/b\"\nlightrag_url: \"http://r\"\n"),
+    )
     .await
     .unwrap_err();
     // 不校验的话会拖到发请求时报 reqwest 的 "builder error"，看不出是哪个键没配
@@ -299,12 +271,10 @@ async fn missing_mineru_url_names_the_field() {
 
 #[tokio::test]
 async fn missing_lightrag_url_names_the_field() {
-    let err = load(&format!(
-        "{}",
-        folders_yaml(&[("work", "/a")]) + "output_dir: \"/b\"\nmineru_url: \"http://m\"\n"
-    ))
-    .await
-    .unwrap_err();
+    let err =
+        load(&(folders_yaml(&[("work", "/a")]) + "output_dir: \"/b\"\nmineru_url: \"http://m\"\n"))
+            .await
+            .unwrap_err();
     assert!(err.contains("lightrag_url"), "{err}");
 }
 

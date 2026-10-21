@@ -542,10 +542,11 @@ fn pick(
 ) -> CannedResponse {
     let mut routes = routes.lock().unwrap();
     for r in routes.iter_mut() {
-        if r.method.eq_ignore_ascii_case(&req.method) && r.target == req.target {
-            if let Some(resp) = r.next() {
-                return resp;
-            }
+        if r.method.eq_ignore_ascii_case(&req.method)
+            && r.target == req.target
+            && let Some(resp) = r.next()
+        {
+            return resp;
         }
     }
     CannedResponse::json(404, format!("no route for {} {}", req.method, req.target))

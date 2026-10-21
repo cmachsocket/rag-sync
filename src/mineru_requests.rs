@@ -211,7 +211,7 @@ async fn parse(
 
 /// queued / running 之外都是终态，失败任务不会被当成「还在跑」。
 fn is_terminal(status: &str) -> bool {
-    return matches!(status, "completed" | "partial" | "failed" | "canceled");
+    matches!(status, "completed" | "partial" | "failed" | "canceled")
 }
 
 /// 第几轮该睡多久：起步快，稳态慢。

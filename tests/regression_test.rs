@@ -9,7 +9,7 @@ use rag_sync::lightrag_requests::canonical_basename;
 use rag_sync::sync_folder::{create_output_files, delete_old_files, get_files};
 
 fn rag_routes(doc_id: &str) -> Vec<Route> {
-    return vec![
+    vec![
         Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
         Route::post("/documents/upload").and(R::json(
             200,
@@ -22,11 +22,11 @@ fn rag_routes(doc_id: &str) -> Vec<Route> {
                      "documents":[{{"id":"{doc_id}","status":"processed","file_path":"a.md"}}]}}"#
             ),
         )),
-    ];
+    ]
 }
 
 fn mineru_routes(md: &str) -> Vec<Route> {
-    return vec![
+    vec![
         Route::post("/v1/uploads").and(R::json(
             201,
             r#"{"id":"up-1","status":"created","file":null}"#,
@@ -48,7 +48,7 @@ fn mineru_routes(md: &str) -> Vec<Route> {
                   "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
         )),
         Route::get("/v1/files/out-1/content").and(R::text(200, md)),
-    ];
+    ]
 }
 
 async fn env_with_services(md: &str) -> (Env, MockServer) {

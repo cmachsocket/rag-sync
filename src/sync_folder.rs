@@ -143,7 +143,7 @@ pub async fn legacy_output_relative_path(
     file_path: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let rel = get_relative_path(root_dir, file_path).await?;
-    Ok(markdown_name(Path::new(&rel))?)
+    markdown_name(Path::new(&rel))
 }
 
 /// 上传给 LightRAG 的文件名：`<别名>__<产物名>`，例如 `work__报告.pdf.md`。
@@ -153,7 +153,7 @@ pub fn upload_name(alias: &str, output_rel: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| output_rel.to_string());
-    return format!("{alias}__{name}");
+    format!("{alias}__{name}")
 }
 
 /// 某个源文件的产物相对路径；不在任何已配置目录下时返回 `None`（只可能发生在清理阶段）。
@@ -194,10 +194,10 @@ async fn artifact_candidates(
     if let Ok(rel) = output_relative_path(&folder.path, &folder.name, file_path).await {
         candidates.push(rel);
     }
-    if let Ok(rel) = legacy_output_relative_path(&folder.path, file_path).await {
-        if !candidates.contains(&rel) {
-            candidates.push(rel);
-        }
+    if let Ok(rel) = legacy_output_relative_path(&folder.path, file_path).await
+        && !candidates.contains(&rel)
+    {
+        candidates.push(rel);
     }
     if candidates.is_empty() {
         return Err(format!("{} 算不出产物路径", file.path).into());

@@ -16,7 +16,7 @@ async fn run() -> Result<()> {
     for folder in &config.sync_folders {
         println!("Sync directory [{}]: {}", folder.name, folder.path);
     }
-    println!("Output directory: {}", &config.output_dir);
+    println!("Output directory: {}", config.output_dir);
     Ok(())
 }
 

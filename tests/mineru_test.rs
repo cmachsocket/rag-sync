@@ -47,7 +47,7 @@ async fn setup(
 
 /// 上传三步：created -> PUT 内容 -> completed，MinerU 的 file_id 是 f-1。
 fn upload_routes() -> Vec<Route> {
-    return vec![
+    vec![
         Route::post("/v1/uploads").and(R::json(
             201,
             r#"{"id":"up-1","status":"created","file":null}"#,
@@ -57,13 +57,13 @@ fn upload_routes() -> Vec<Route> {
             200,
             r#"{"id":"up-1","status":"completed","file":{"id":"f-1"}}"#,
         )),
-    ];
+    ]
 }
 
 /// 建任务（202 queued）-> 轮询到 completed -> 取 markdown 产物。
 /// 产物 id 恒为 out-1，正文由 `md` 给。
 fn job_routes(md: &str) -> Vec<Route> {
-    return vec![
+    vec![
         Route::post("/v1/parse/jobs").and(R::json(
             202,
             r#"{"job_id":"j-1","status":"queued","files":[]}"#,
@@ -76,7 +76,7 @@ fn job_routes(md: &str) -> Vec<Route> {
                           "output_files":{"markdown":{"file_id":"out-1","bytes":8}}}]}"#,
         )),
         Route::get("/v1/files/out-1/content").and(R::text(200, md)),
-    ];
+    ]
 }
 
 fn concat(routes: Vec<Route>, more: Vec<Route>) -> Vec<Route> {
