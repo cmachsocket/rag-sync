@@ -19,4 +19,23 @@ diesel::table! {
     }
 }
 
-diesel::allow_tables_to_appear_in_same_query!(files, run_counter,);
+diesel::table! {
+    joplin_state (id) {
+        id -> Integer,
+        cursor -> Text,
+    }
+}
+
+diesel::table! {
+    joplin_notes (id) {
+        id -> Integer,
+        item_id -> Text,
+        item_name -> Text,
+        upload_name -> Text,
+        sha256 -> Text,
+        rag_id -> Nullable<Text>,
+        updated_time -> BigInt,
+    }
+}
+
+diesel::allow_tables_to_appear_in_same_query!(files, run_counter, joplin_state, joplin_notes,);

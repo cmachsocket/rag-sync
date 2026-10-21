@@ -18,3 +18,12 @@ lightrag_password: "admin"
 # 默认都是 1 —— 调高之前先看 readme 里那两条代价。
 mineru_concurrency: 1     # 同时解析几个文件
 lightrag_concurrency: 1   # 同时上传几个文件
+
+# Joplin 笔记同步。去掉这一整段就不做 Joplin 同步。
+# 笔记取到直接进知识库，不在本地落盘；游标存在库里，下一轮只取新增的变更。
+joplin:
+  url: "http://127.0.0.1:9779"
+  email: "user@example.com"
+  password: "password"
+  alias: "joplin"        # 上传文件名的前缀：joplin__<item_name>
+  limit: 100             # delta 每页取几条变更事件

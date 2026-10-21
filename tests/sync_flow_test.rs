@@ -5,7 +5,8 @@ mod common;
 use common::{CannedResponse as R, Env, MockServer, Route};
 use rag_sync::database::DBfunc;
 use rag_sync::sync_folder::{
-    RetryPolicy, create_output_files, create_output_files_with_retry, get_files,
+    RetryPolicy, create_output_files, create_output_files_with_retry, get_files, sha256_file,
+    sha256_text,
 };
 use std::time::Duration;
 
@@ -28,14 +29,18 @@ fn upload_ok() -> Route {
     ))
 }
 
-fn track_terminal(doc_id: &str) -> Route {
-    Route::get("/documents/track_status/tr-1").and(R::json(
+fn track_body(doc_id: &str) -> R {
+    R::json(
         200,
         format!(
             r#"{{"track_id":"tr-1","total_count":1,"status_summary":{{"processed":1}},
                  "documents":[{{"id":"{doc_id}","status":"processed","file_path":"a.pdf"}}]}}"#
         ),
-    ))
+    )
+}
+
+fn track_terminal(doc_id: &str) -> Route {
+    Route::get("/documents/track_status/tr-1").and(track_body(doc_id))
 }
 
 fn mineru_routes(markdown: &str) -> Vec<Route> {
@@ -302,6 +307,7 @@ async fn passthrough_is_case_insensitive() {
     assert_eq!(server.count_to("POST", "/v1/uploads"), 0);
 }
 
+/// 没变化 = 内容（sha256）没变、知识库里那份内容的指纹也还在，两样齐了才跳过。
 #[tokio::test]
 async fn unchanged_file_is_skipped() {
     let mut db = common::test_db().await;
@@ -309,6 +315,8 @@ async fn unchanged_file_is_skipped() {
     let src = env.write_source("a.pdf", "pdf 内容");
     let sha = rag_sync::sync_folder::sha256_file(&src).await.unwrap();
     db.insert_file_row(1, &src, &sha, 1, Some("doc-old")).await;
+    db.set_uploaded_sha256(&src, &rag_sync::sync_folder::sha256_text("# 新内容"))
+        .await;
 
     let files = get_files(&env.config(2), &mut db.conn).await.unwrap();
     let out = create_output_files(&env.config(2), &files, &mut db.conn)
@@ -321,6 +329,152 @@ async fn unchanged_file_is_skipped() {
         server.count_to("POST", "/documents/upload"),
         0,
         "不该重传 LightRAG"
+    );
+}
+
+/// 只试 1 次、不退避：下面的用例要的是「这一轮就中止」，不该等满 5 次重试。
+fn one_attempt() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 1,
+        base_delay: Duration::ZERO,
+    }
+}
+
+/// 源文件改了、这一轮上传却失败：`sha256` 要记成新值，知识库里那份内容的指纹要作废 ——
+/// 不作废的话下一轮会被当成「已经同步过」直接跳过，知识库里永远停在旧内容。
+/// 下一轮复用盘上的产物补传，MinerU 不再跑第二遍。
+#[tokio::test]
+async fn content_change_with_failed_upload_repairs_on_the_next_run() {
+    let mut db = common::test_db().await;
+    let mut env = Env::new();
+    let mut routes = mineru_routes("# 解析结果");
+    routes.push(rag_login_ok());
+    // 第 1 次成功、第 2 次失败、第 3 次成功，正好对上三轮
+    routes.push(
+        Route::post("/documents/upload")
+            .and(R::json(
+                200,
+                r#"{"status":"success","message":"ok","track_id":"tr-1"}"#,
+            ))
+            .and(R::json(
+                200,
+                r#"{"status":"failure","message":"知识库不可写","track_id":""}"#,
+            ))
+            .and(R::json(
+                200,
+                r#"{"status":"success","message":"ok","track_id":"tr-1"}"#,
+            )),
+    );
+    let mut track = track_terminal("doc-1");
+    track.responses.push(track_body("doc-2"));
+    routes.push(track);
+    let server = MockServer::start(routes).await;
+    env.mineru_url = server.base_url.clone();
+    env.lightrag_url = server.base_url.clone();
+    let src = env.write_source("a.pdf", "第一版内容");
+
+    // 第一轮：解析 + 上传都成功
+    let files = get_files(&env.config(1), &mut db.conn).await.unwrap();
+    create_output_files_with_retry(&env.config(1), &files, &mut db.conn, one_attempt())
+        .await
+        .unwrap();
+    let row = DBfunc::get_file(&mut db.conn, &src).await.unwrap().unwrap();
+    assert_eq!(
+        row.uploaded_sha256.as_deref(),
+        Some(sha256_text("# 解析结果").as_str()),
+        "成功之后要记下入库内容的指纹"
+    );
+
+    // 第二轮：内容改了，上传失败
+    std::fs::write(&src, "第二版内容").unwrap();
+    let files = get_files(&env.config(2), &mut db.conn).await.unwrap();
+    let err = create_output_files_with_retry(&env.config(2), &files, &mut db.conn, one_attempt())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("知识库不可写"), "{err}");
+    let row = DBfunc::get_file(&mut db.conn, &src).await.unwrap().unwrap();
+    assert_eq!(
+        row.sha256,
+        sha256_file(&src).await.unwrap(),
+        "解析过的源文件指纹要记下来，下轮才不用重跑 MinerU"
+    );
+    assert_eq!(
+        row.uploaded_sha256, None,
+        "指纹必须作废：知识库里那份还是旧内容"
+    );
+    assert_eq!(
+        row.rag_id.as_deref(),
+        Some("doc-1"),
+        "上传没成功，doc_id 一个字都不能改"
+    );
+    assert_eq!(
+        server.count_to("POST", "/v1/parse/jobs"),
+        2,
+        "这一轮内容变了，该重解析"
+    );
+
+    // 第三轮：补上传，解析不用再来一遍
+    let files = get_files(&env.config(3), &mut db.conn).await.unwrap();
+    create_output_files_with_retry(&env.config(3), &files, &mut db.conn, one_attempt())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.count_to("POST", "/v1/parse/jobs"),
+        2,
+        "第三轮要复用盘上的产物，一次解析几十分钟，不能白跑"
+    );
+    assert_eq!(
+        server.count_to("POST", "/documents/upload"),
+        3,
+        "该补的上传一次都不能少"
+    );
+    let row = DBfunc::get_file(&mut db.conn, &src).await.unwrap().unwrap();
+    assert_eq!(
+        row.uploaded_sha256.as_deref(),
+        Some(sha256_text("# 解析结果").as_str()),
+        "补传成功后指纹要补回来"
+    );
+    assert_eq!(
+        row.rag_id.as_deref(),
+        Some("doc-2"),
+        "新内容入库了才算同步完"
+    );
+    assert_eq!(db.run_id_of(&src).await, 3);
+}
+
+/// 解析过但产物被删了：读不到产物就得重新解析，不能拿一个不存在的文件去上传。
+#[tokio::test]
+async fn missing_artifact_after_partial_run_is_reparsed() {
+    let mut db = common::test_db().await;
+    let (env, server) = env_with_services("# 标题").await;
+    let src = env.write_source("a.pdf", "pdf 内容");
+    let sha = sha256_file(&src).await.unwrap();
+    // 上一轮解析过（sha 与当前一致）但没进知识库，产物也没了
+    db.insert_file_row_full(1, &src, &sha, 1, None, Some("sync/a.pdf.md"))
+        .await;
+
+    let cfg = env.config(2);
+    let files = get_files(&cfg, &mut db.conn).await.unwrap();
+    create_output_files(&cfg, &files, &mut db.conn)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.count_to("POST", "/v1/parse/jobs"),
+        1,
+        "读不到产物就只能重新解析"
+    );
+    let row = DBfunc::get_file(&mut db.conn, &src).await.unwrap().unwrap();
+    assert_eq!(
+        row.rag_id.as_deref(),
+        Some("doc-1"),
+        "重新解析之后补上传照样成功"
+    );
+    assert_eq!(
+        row.uploaded_sha256.as_deref(),
+        Some(sha256_text("# 标题").as_str())
     );
 }
 
@@ -607,6 +761,51 @@ async fn mineru_keeps_working_while_lightrag_is_still_uploading() {
     assert!(env.output_path("b.pdf.md").exists());
 }
 
+/// 上传步卡在 LightRAG 后台抽取上时，待解析的文件要全部解析完。
+/// 中转通道一旦反压，容量 1 只让转换步领先 2~3 个文件，后面的就停在原地不解析了。
+#[tokio::test]
+async fn mineru_drains_every_file_while_lightrag_is_extracting() {
+    let mut db = common::test_db().await;
+    let mut env = Env::new();
+    let gate = common::Gate::new();
+    let mut routes = mineru_routes("# 标题");
+    routes.push(rag_login_ok());
+    // 上传的响应被闸门扣住，等于上传步一直停在等后台抽取
+    routes.push(
+        Route::post("/documents/upload").and(
+            R::json(
+                200,
+                r#"{"status":"success","message":"ok","track_id":"tr-1"}"#,
+            )
+            .gated(gate.clone()),
+        ),
+    );
+    routes.push(track_terminal("doc-1"));
+    let server = MockServer::start(routes).await;
+    env.mineru_url = server.base_url.clone();
+    env.lightrag_url = server.base_url.clone();
+    for i in 0..6 {
+        env.write_source(&format!("f{i}.pdf"), &format!("内容 {i}"));
+    }
+
+    let cfg = env.config(1);
+    let files = get_files(&cfg, &mut db.conn).await.unwrap();
+    let mut sync = Box::pin(create_output_files(&cfg, &files, &mut db.conn));
+
+    let parsed = tokio::select! {
+        r = &mut sync => panic!("同步不该在上传卡住的时候就结束: {r:?}"),
+        n = server.wait_for_count("POST", "/v1/parse/jobs", 6, Duration::from_secs(10)) => n,
+    };
+    assert_eq!(
+        parsed, 6,
+        "上传步还在等抽取，6 个文件的解析一个都不能少（反压住这里就只有前 3 个）"
+    );
+
+    gate.open();
+    let out = sync.await.unwrap();
+    assert_eq!(out.len(), 6, "6 个文件都要走完流水线");
+}
+
 /// 传完的产物路径要按待处理列表的顺序返回，不按谁先传完。
 #[tokio::test]
 async fn artifact_order_follows_the_todo_list() {
@@ -839,6 +1038,46 @@ async fn conflict_without_a_stored_hash_still_deletes_and_reuploads() {
         "没有指纹就没有「内容没变」的依据，只能按老规矩删了重传"
     );
     assert_eq!(server.count_to("POST", "/documents/upload"), 2);
+}
+
+/// 加列之前的行没有内容指纹：解析不用重跑（sha256 对得上、产物也在盘上），
+/// 但上传照样要补一次 —— 指纹是「知识库里是哪一份」的依据，没有就只能删了重传。
+/// 补完指纹，下一轮才算彻底同步过。
+#[tokio::test]
+async fn legacy_row_reuses_artifact_but_still_reuploads() {
+    let mut db = common::test_db().await;
+    let (env, server) = conflict_env("# 标题").await;
+    let src = env.write_source("a.pdf", "内容");
+    let sha = sha256_file(&src).await.unwrap();
+    // sha 与当前一致、doc_id 也有，唯独没有内容指纹
+    db.insert_file_row_full(1, &src, &sha, 1, Some("doc-1"), Some("sync/a.pdf.md"))
+        .await;
+    env.write_artifact("a.pdf.md", "# 标题");
+
+    let cfg = env.config(2);
+    let files = get_files(&cfg, &mut db.conn).await.unwrap();
+    create_output_files(&cfg, &files, &mut db.conn)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        server.count_to("POST", "/v1/parse/jobs"),
+        0,
+        "产物还在盘上，MinerU 不该再跑一遍"
+    );
+    assert_eq!(
+        server.count_to("POST", "/documents/upload"),
+        2,
+        "没有指纹就没有「内容没变」的依据，补传一次（409 后删了重传）"
+    );
+    assert_eq!(server.count_to("DELETE", "/documents/delete_document"), 1);
+    let row = DBfunc::get_file(&mut db.conn, &src).await.unwrap().unwrap();
+    assert_eq!(row.rag_id.as_deref(), Some("doc-2"), "补传拿到的新 doc_id");
+    assert_eq!(
+        row.uploaded_sha256.as_deref(),
+        Some(sha256_text("# 标题").as_str()),
+        "指纹补上，下一轮才能只跳过不重传"
+    );
 }
 
 /// 冲突自愈的环境：上传一律 409，知识库里有一份叫 sync__a.pdf.md 的文档。

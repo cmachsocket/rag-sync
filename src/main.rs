@@ -1,5 +1,5 @@
 use rag_sync::database::{self, DBfunc};
-use rag_sync::{sync_config, sync_folder};
+use rag_sync::{joplin_sync, sync_config, sync_folder};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -11,8 +11,17 @@ async fn run() -> Result<()> {
     let files = sync_folder::get_files(&config, &mut conn).await?;
     sync_folder::create_output_files(&config, &files, &mut conn).await?;
     sync_folder::delete_old_files(&config, &mut conn).await?;
-
     DBfunc::update_run_counter(&mut conn, config.run_id).await?;
+
+    // Joplin 是另一条独立的数据源：笔记不落盘，取到直接进知识库
+    if config.joplin.is_some() {
+        let summary = joplin_sync::sync_joplin(&config, &mut conn).await?;
+        println!(
+            "Joplin 同步: 新增 {} 篇，未变 {} 篇，删除 {} 篇，跳过 {} 个非笔记文件",
+            summary.uploaded, summary.unchanged, summary.deleted, summary.skipped
+        );
+    }
+
     for folder in &config.sync_folders {
         println!("Sync directory [{}]: {}", folder.name, folder.path);
     }

@@ -439,6 +439,7 @@ async fn reprocess_uses_real_mineru_file_id() {
         lightrag_username: "u".into(),
         lightrag_password: "p".into(),
         run_id: 2,
+        joplin: None,
         mineru_concurrency: 1,
         lightrag_concurrency: 1,
     };

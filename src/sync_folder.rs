@@ -21,9 +21,6 @@ use walkdir::WalkDir;
 
 pub const NOT_IN_DB: i32 = 0;
 
-/// 中转通道容量。满了就是背压，磁盘不会被产物塞满。
-const PIPELINE_BUFFER: usize = 1;
-
 /// 直接透传、不走 MinerU 的扩展名：纯文本送进解析器只会被原样吐回来。
 const PASSTHROUGH_EXTS: [&str; 3] = ["txt", "md", "markdown"];
 
@@ -291,17 +288,32 @@ async fn scan_folder(
     Ok(())
 }
 
-/// 挑出本轮要处理的文件；没变化的也要把 run_id 刷成本轮，否则下一轮会被当成已删除。
-/// 「没变化」要求内容（sha256）与产物路径都没变 —— 别名或目录挪过时必须重跑。
+/// 待处理的文件 +「上一轮已经用同样内容解析过」的标记。
+#[derive(Debug, Clone, Copy)]
+struct TodoItem<'a> {
+    /// 源文件在库里的记录。
+    file: &'a db_model::File,
+    /// 库里的 sha256 与当前一致：上一轮解析过，产物应该还在盘上，转换步可以直接用。
+    parsed_before: bool,
+}
+
+/// 挑出本轮要处理的文件。
+/// 「跳过」要求内容（sha256）没变**且**知识库里那份内容的指纹还在 ——
+/// 只有这两条同时成立，才说明上一轮把当前内容解析完又传成功了；
+/// 解析过但没传成功的会重新进队列，由转换步复用产物、只补上传。
+/// 没变化的还要把 run_id 刷成本轮，否则下一轮会被当成已删除。
 async fn select_pending<'a>(
     config: &sync_config::SyncConfig,
     files: &'a [db_model::File],
     conn: &mut database::Conn,
-) -> Result<Vec<&'a db_model::File>, Box<dyn std::error::Error>> {
+) -> Result<Vec<TodoItem<'a>>, Box<dyn std::error::Error>> {
     let mut todo = Vec::new();
     for file in files {
         if file.id == NOT_IN_DB {
-            todo.push(file);
+            todo.push(TodoItem {
+                file,
+                parsed_before: false,
+            });
             continue;
         }
         // 没记产物路径（加列前的行）时不算「变了」，否则加列前的行会被全部重跑。
@@ -323,17 +335,35 @@ async fn select_pending<'a>(
                     "文件 {} 的产物路径已变（{old_rel} -> {current_rel}），重新处理",
                     file.path
                 );
-                todo.push(file);
+                // 新位置没有产物，必须重新解析
+                todo.push(TodoItem {
+                    file,
+                    parsed_before: false,
+                });
                 continue;
             }
         }
         let old_sha = DBfunc::get_sha256(conn, &file.path).await?;
         if old_sha.as_deref() == Some(file.sha256.as_str()) {
-            println!("文件 {} 的 sha256 未变化，跳过处理", file.path);
-            DBfunc::update_file_run_id(conn, &file.path, config.run_id).await?;
+            if file.uploaded_sha256.is_some() {
+                println!("文件 {} 的 sha256 未变化，跳过处理", file.path);
+                DBfunc::update_file_run_id(conn, &file.path, config.run_id).await?;
+                continue;
+            }
+            println!(
+                "文件 {} 上一轮解析过但没进知识库，复用产物只补上传",
+                file.path
+            );
+            todo.push(TodoItem {
+                file,
+                parsed_before: true,
+            });
             continue;
         }
-        todo.push(file);
+        todo.push(TodoItem {
+            file,
+            parsed_before: false,
+        });
     }
     Ok(todo)
 }
@@ -358,6 +388,8 @@ impl Default for RetryPolicy {
 
 // 两步流水线：一次同步拆成转换（透传 / MinerU 解析）与上传（LightRAG），
 // 两段并行，失败分开算 —— 上传失败不必重跑解析，解析失败不动知识库。
+// 两段之间不设背压：上传步等 LightRAG 后台抽取能等上几分钟到几小时，
+// 卡住转换步就等于让 MinerU 在后台闲着。
 
 /// 两步之间中转的产物：转换步产出，上传步消费。
 #[derive(Debug, Clone)]
@@ -408,7 +440,7 @@ pub async fn create_output_files_with_retry(
     )
     .await?;
 
-    let (tx, rx) = mpsc::channel::<Artifact>(PIPELINE_BUFFER);
+    let (tx, rx) = mpsc::unbounded_channel::<Artifact>();
 
     let (converted, uploaded) = tokio::join!(
         convert_stage(&client, config, &todo, tx, retry, config.mineru_concurrency),
@@ -428,33 +460,34 @@ pub async fn create_output_files_with_retry(
     Ok(done.into_iter().map(|(_, path)| path).collect())
 }
 
-/// 转换步：把待处理的文件转成产物送进 channel，攒满了就等上传步取走（背压）。
+/// 转换步：把待处理的文件转成产物送进 channel，不等上传步取走 —— 送进去是同步的，
+/// 解析节奏只由 `concurrency` 决定。
 async fn convert_stage(
     client: &reqwest::Client,
     config: &sync_config::SyncConfig,
-    todo: &[&db_model::File],
-    tx: mpsc::Sender<Artifact>,
+    todo: &[TodoItem<'_>],
+    tx: mpsc::UnboundedSender<Artifact>,
     retry: RetryPolicy,
     concurrency: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let limit = concurrency.max(1);
     let mut inflight = FuturesUnordered::new();
-    for (index, file) in todo.iter().copied().enumerate() {
+    for (index, item) in todo.iter().copied().enumerate() {
         while inflight.len() >= limit {
             let artifact = inflight.next().await.unwrap()?;
             // 上传步已经放弃，本轮到此为止。
-            if tx.send(artifact).await.is_err() {
+            if tx.send(artifact).is_err() {
                 return Ok(());
             }
         }
         inflight.push(async move {
-            let mut artifact = convert_one_file_with_retry(client, config, file, retry).await?;
+            let mut artifact = convert_one_file_with_retry(client, config, item, retry).await?;
             artifact.index = index;
             Ok::<_, Box<dyn std::error::Error>>(artifact)
         });
     }
     while let Some(artifact) = inflight.next().await {
-        if tx.send(artifact?).await.is_err() {
+        if tx.send(artifact?).is_err() {
             break;
         }
     }
@@ -466,7 +499,7 @@ async fn upload_stage(
     rag_request: &RAGRequest<'_>,
     config: &sync_config::SyncConfig,
     conn: &mut database::Conn,
-    mut rx: mpsc::Receiver<Artifact>,
+    mut rx: mpsc::UnboundedReceiver<Artifact>,
     retry: RetryPolicy,
     concurrency: usize,
 ) -> Result<Vec<(usize, PathBuf)>, Box<dyn std::error::Error>> {
@@ -474,6 +507,8 @@ async fn upload_stage(
     let mut done: Vec<(usize, PathBuf)> = Vec::new();
     let mut inflight = FuturesUnordered::new();
     while let Some(artifact) = rx.recv().await {
+        // 产物已经落盘，先记下「这个内容解析过」：这轮上传失败，下轮也用不着再跑 MinerU。
+        record_parsed_state(conn, &artifact).await?;
         inflight.push(async move {
             let rag_id = upload_one_artifact_with_retry(rag_request, &artifact, retry).await?;
             Ok::<_, Box<dyn std::error::Error>>((artifact, rag_id))
@@ -494,11 +529,13 @@ async fn upload_stage(
 }
 
 /// 第一步：源文件 -> markdown 产物落盘，不碰知识库、也不写库。
+/// 「解析过」这个状态由上传步收到产物时落库 —— 这里拿不到数据库连接。
 async fn convert_one_file(
     client: &reqwest::Client,
     config: &sync_config::SyncConfig,
-    file: &db_model::File,
+    item: TodoItem<'_>,
 ) -> Result<Artifact, Box<dyn std::error::Error>> {
+    let file = item.file;
     let file_path = Path::new(&file.path);
     // 归属别名决定产物子目录与上传名，找不到就没法落盘。
     let folder = config.folder_of(file_path).ok_or_else(|| {
@@ -512,12 +549,24 @@ async fn convert_one_file(
     let output_file_path = Path::new(&config.output_dir).join(&rel);
     create_output_dir(&output_file_path).await?;
 
-    let markdown = match passthrough_content(file_path).await? {
-        Some(content) => {
-            println!("[透传] {} 已跳过 MinerU", file_path.display());
-            content
+    // 上一轮用同样的内容解析过：产物还在盘上就直接用，别把大文件再 OCR 一遍
+    let markdown = if item.parsed_before {
+        match fs::read_to_string(&output_file_path).await {
+            Ok(content) => {
+                println!("[复用] {} 上一轮已解析过，跳过 MinerU", file_path.display());
+                content
+            }
+            // 产物被删了、或者上一轮落在别的路径上：只能重新解析
+            Err(e) => {
+                println!(
+                    "[重新解析] {} 的产物读不到（{e}），重新走 MinerU",
+                    file_path.display()
+                );
+                convert_content(client, config, file).await?
+            }
         }
-        None => mineru_tackle(client, file, config).await?,
+    } else {
+        convert_content(client, config, file).await?
     };
 
     // 指纹在写盘前算，传进知识库的就是这一份内容。
@@ -537,24 +586,39 @@ async fn convert_one_file(
     })
 }
 
+/// 源文件转 markdown：txt / md 直接透传，其余交给 MinerU。
+async fn convert_content(
+    client: &reqwest::Client,
+    config: &sync_config::SyncConfig,
+    file: &db_model::File,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match passthrough_content(Path::new(&file.path)).await? {
+        Some(content) => {
+            println!("[透传] {} 已跳过 MinerU", file.path);
+            Ok(content)
+        }
+        None => mineru_tackle(client, file, config).await,
+    }
+}
+
 /// 第一步的重试循环，失败按 `base_delay * n` 退避后从头再来。
 /// 重跑是安全的：MinerU 按 sha256 幂等，产物是覆盖写。
 async fn convert_one_file_with_retry(
     client: &reqwest::Client,
     config: &sync_config::SyncConfig,
-    file: &db_model::File,
+    item: TodoItem<'_>,
     retry: RetryPolicy,
 ) -> Result<Artifact, Box<dyn std::error::Error>> {
     // 0 次会让第一次抖动就直接失败，压成 1 次
     let max_attempts = retry.max_attempts.max(1);
     let mut attempt = 1;
     loop {
-        match convert_one_file(client, config, file).await {
+        match convert_one_file(client, config, item).await {
             Ok(artifact) => return Ok(artifact),
             Err(e) if attempt >= max_attempts => {
                 return Err(format!(
                     "{} 转换失败（尝试 {attempt} 次后放弃，本轮中止）: {e}",
-                    file.path
+                    item.file.path
                 )
                 .into());
             }
@@ -562,7 +626,7 @@ async fn convert_one_file_with_retry(
                 let delay = retry.base_delay * attempt;
                 println!(
                     "[重试] {} 第 {attempt}/{max_attempts} 次失败，{} 秒后重试: {e}",
-                    file.path,
+                    item.file.path,
                     delay.as_secs()
                 );
                 if !delay.is_zero() {
@@ -639,6 +703,24 @@ async fn upload_one_artifact_with_retry(
     }
 }
 
+/// 第一步的落库，由上传步在拿到产物时执行（转换步拿不到数据库连接）：
+/// 记下「源文件这个内容解析过」，上传失败下轮就不用再跑一遍 MinerU。
+/// 同时把 `uploaded_sha256` 作废 —— 解析出新内容之后，知识库里那份已经是旧的，
+/// 上传成功之前不能再当成「已入库」，否则下一轮会被直接跳过。
+/// 新文件还没有行，等上传成功后由 [`record_artifact`] 一次写全。
+async fn record_parsed_state(
+    conn: &mut database::Conn,
+    artifact: &Artifact,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if artifact.file.id == NOT_IN_DB {
+        return Ok(());
+    }
+    DBfunc::update_sha256(conn, &artifact.file.path, &artifact.file.sha256).await?;
+    DBfunc::update_output_rel_path(conn, &artifact.file.path, &artifact.rel).await?;
+    DBfunc::update_uploaded_sha256(conn, &artifact.file.path, None).await?;
+    Ok(())
+}
+
 /// 第三步：把「这份产物已经在知识库里」记进库，必须在上传成功之后写。
 async fn record_artifact(
     conn: &mut database::Conn,
@@ -649,7 +731,8 @@ async fn record_artifact(
     if artifact.file.id != NOT_IN_DB {
         DBfunc::update_rag_id(conn, &artifact.file.path, Some(rag_id)).await?;
         DBfunc::update_output_rel_path(conn, &artifact.file.path, &artifact.rel).await?;
-        DBfunc::update_uploaded_sha256(conn, &artifact.file.path, &artifact.content_sha256).await?;
+        DBfunc::update_uploaded_sha256(conn, &artifact.file.path, Some(&artifact.content_sha256))
+            .await?;
         DBfunc::update_file_run_id(conn, &artifact.file.path, config.run_id).await?;
         DBfunc::update_sha256(conn, &artifact.file.path, &artifact.file.sha256).await?;
     } else {

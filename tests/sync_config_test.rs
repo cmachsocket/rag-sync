@@ -317,6 +317,7 @@ fn folder_of_picks_the_most_specific_root() {
         lightrag_password: "p".into(),
         lightrag_url: "http://r".into(),
         lightrag_username: "u".into(),
+        joplin: None,
         mineru_concurrency: 1,
         lightrag_concurrency: 1,
     };
@@ -393,4 +394,65 @@ async fn configured_run_id_is_ignored() {
         .await
         .unwrap();
     assert_eq!(c.run_id, 8);
+}
+
+// Joplin 段
+
+/// joplin 段是可选的：没有它就只做目录同步。
+#[tokio::test]
+async fn joplin_section_is_optional() {
+    let c = load(&(folders_yaml(&[("work", "/a")]) + MINIMAL_TAIL))
+        .await
+        .unwrap();
+    assert!(c.joplin.is_none(), "没配 joplin 段就不该有 Joplin 配置");
+}
+
+#[tokio::test]
+async fn joplin_section_is_loaded_with_defaults() {
+    let body = folders_yaml(&[("work", "/a")])
+        + MINIMAL_TAIL
+        + "joplin:\n  url: \"https://joplin.example.com\"\n  email: \"a@b.c\"\n  password: \"p\"\n";
+    let c = load(&body).await.unwrap();
+    let j = c.joplin.expect("配了 joplin 段就该有配置");
+    assert_eq!(j.url, "https://joplin.example.com");
+    assert_eq!(j.email, "a@b.c");
+    assert_eq!(j.password, "p");
+    assert_eq!(j.alias, "joplin", "别名有默认值");
+    assert_eq!(j.limit, 100, "每页条数有默认值");
+}
+
+/// 地址末尾的斜杠会和接口路径拼成 `//api/...`。
+#[tokio::test]
+async fn joplin_url_trailing_slash_is_trimmed() {
+    let body = folders_yaml(&[("work", "/a")])
+        + MINIMAL_TAIL
+        + "joplin:\n  url: \"https://joplin.example.com/\"\n  email: \"a@b.c\"\n  password: \"p\"\n";
+    let c = load(&body).await.unwrap();
+    assert_eq!(c.joplin.unwrap().url, "https://joplin.example.com");
+}
+
+#[tokio::test]
+async fn joplin_missing_field_names_it() {
+    for (缺, 段) in [
+        ("url", "joplin:\n  email: \"a@b.c\"\n  password: \"p\"\n"),
+        ("email", "joplin:\n  url: \"http://j\"\n  password: \"p\"\n"),
+        (
+            "password",
+            "joplin:\n  url: \"http://j\"\n  email: \"a@b.c\"\n",
+        ),
+    ] {
+        let body = folders_yaml(&[("work", "/a")]) + MINIMAL_TAIL + 段;
+        let err = load(&body).await.unwrap_err();
+        assert!(err.contains(缺), "报错要说清缺哪个字段: {err}");
+    }
+}
+
+/// 别名会变成上传文件名的前缀，非法字符要在这里拦下。
+#[tokio::test]
+async fn joplin_alias_with_double_underscore_is_rejected() {
+    let body = folders_yaml(&[("work", "/a")])
+        + MINIMAL_TAIL
+        + "joplin:\n  url: \"http://j\"\n  email: \"a@b.c\"\n  password: \"p\"\n  alias: \"a__b\"\n";
+    let err = load(&body).await.unwrap_err();
+    assert!(err.contains("__"), "{err}");
 }

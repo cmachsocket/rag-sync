@@ -17,7 +17,9 @@
 | `mineru_test.rs` | MinerU 上传 / 解析 / 取产物，对 mock 服务端跑 |
 | `lightrag_model_test.rs` | LightRAG 响应体反序列化与状态判定（纯函数） |
 | `lightrag_requests_test.rs` | LightRAG 上传、409 自愈、删除、分页 |
+| `joplin_model_test.rs` | Joplin item 的解析：切开正文与末尾的元信息块 |
 | `sync_flow_test.rs` | 端到端：扫描 → 转换 → 写产物 → 上传 → 落库；两步流水线的并行、同名冲突 |
+| `joplin_sync_test.rs` | Joplin 同步流：取变更流、取正文、不落盘上传、删除与软删除、游标失效 |
 | `regression_test.rs` | 回归防护：每个曾丢用户数据的缺陷一条 |
 | `live_lightrag_test.rs` | 打真实服务的端到端测试，默认 `#[ignore]` |
 

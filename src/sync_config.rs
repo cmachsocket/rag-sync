@@ -30,6 +30,9 @@ pub struct SyncConfig {
     pub lightrag_url: String,
     #[serde(default = "String::new")]
     pub lightrag_username: String,
+    /// Joplin 同步的配置。config.yml 里没有这一段就不做 Joplin 同步。
+    #[serde(default)]
+    pub joplin: Option<JoplinConfig>,
     /// 同时解析几个文件（MinerU），默认 1。逐页 OCR 是重活，一份一份来；
     /// 且「重试耗尽后本轮不再开始后面的文件」这个保证依赖它。
     #[serde(default = "default_mineru_concurrency")]
@@ -42,6 +45,31 @@ pub struct SyncConfig {
 
 fn zero() -> i32 {
     0
+}
+
+/// Joplin Server 同步的配置。笔记正文不落盘，取到就直接传进知识库。
+#[derive(Debug, Clone, Deserialize)]
+pub struct JoplinConfig {
+    /// Joplin Server 地址，例如 `https://joplin.example.com`。
+    pub url: String,
+    /// 登录用的邮箱。
+    pub email: String,
+    /// 登录用的密码。
+    pub password: String,
+    /// 上传给 LightRAG 的文件名前缀，默认 `joplin`。
+    #[serde(default = "default_joplin_alias")]
+    pub alias: String,
+    /// delta 每页取几条变更事件。
+    #[serde(default = "default_delta_limit")]
+    pub limit: usize,
+}
+
+fn default_joplin_alias() -> String {
+    "joplin".to_string()
+}
+
+fn default_delta_limit() -> usize {
+    100
 }
 
 fn default_mineru_concurrency() -> usize {
@@ -185,6 +213,22 @@ impl SyncConfig {
         }
         config.output_dir = expand_home_dir(&config.output_dir);
         validate_folders(&config.sync_folders)?;
+        if let Some(joplin) = &mut config.joplin {
+            for (键, 值) in [
+                ("url", &joplin.url),
+                ("email", &joplin.email),
+                ("password", &joplin.password),
+            ] {
+                if 值.trim().is_empty() {
+                    return Err(format!("配置文件中 joplin.{键} 不能为空").into());
+                }
+            }
+            // 末尾的斜杠会和接口路径拼成 `//api/...`
+            joplin.url = joplin.url.trim_end_matches('/').to_string();
+            // 别名会变成上传文件名的前缀，非法字符必须在这里拦下
+            validate_alias(&joplin.alias)
+                .map_err(|e| format!("joplin.alias {:?} {e}", joplin.alias))?;
+        }
         let old_counter: crate::db_model::RunCounter =
             match database::DBfunc::get_run_counter(conn).await? {
                 Some(r) => r,

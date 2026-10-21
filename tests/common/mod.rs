@@ -17,6 +17,7 @@ pub const MIGRATIONS_UP: &[&str] = &[
     include_str!("../../migrations/2026-10-16-181726-0000_init/up.sql"),
     include_str!("../../migrations/2026-10-17-000000-0001_add_output_rel_path/up.sql"),
     include_str!("../../migrations/2026-10-20-000000-0002_add_uploaded_sha256/up.sql"),
+    include_str!("../../migrations/2026-10-21-000000-0003_add_joplin_state/up.sql"),
 ];
 
 pub struct TestDb {
@@ -176,6 +177,7 @@ impl Env {
             lightrag_password: "pass".into(),
             lightrag_url: self.lightrag_url.clone(),
             lightrag_username: "user".into(),
+            joplin: None,
             mineru_concurrency: self.mineru_concurrency,
             lightrag_concurrency: self.lightrag_concurrency,
         }

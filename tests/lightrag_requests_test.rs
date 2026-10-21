@@ -291,7 +291,43 @@ async fn background_failure_surfaces_error_msg() {
 }
 
 // 终态但 documents 为空数组的情况在这里没法测：is_finished() 对空数组恒为 false，
-// _track 会轮询到 TRACK_TIMEOUT（900 s）才报错。判定逻辑见 tests/lightrag_model_test.rs。
+// _track 会轮询到 TRACK_TIMEOUT（4 小时）才报错。判定逻辑见 tests/lightrag_model_test.rs。
+
+// 上传后等待后台处理的上限
+
+/// 上传后等后台处理的上限至少 4 小时：大文件的抽取要跑很久，
+/// 提前判超时会把整轮同步拖失败。虚拟时间：5 秒的轮询间隔直接跳过。
+#[tokio::test(start_paused = true)]
+async fn track_wait_is_at_least_four_hours() {
+    let client = MockServer::client();
+    let (server, d) = setup(vec![
+        Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
+        Route::post("/documents/upload").and(upload_ok("t1")),
+        // 一直处理中，永远到不了终态
+        Route::get("/documents/track_status/t1").and(R::json(
+            200,
+            r#"{"track_id":"t1","total_count":1,"status_summary":{"processing":1},
+                "documents":[{"id":"d","status":"processing","chunks_count":6,
+                "file_path":"a.md"}]}"#,
+        )),
+    ])
+    .await;
+
+    let start = tokio::time::Instant::now();
+    let err = logged_in(&server, &client)
+        .await
+        .upload_file(&upload_path(&d))
+        .await
+        .unwrap_err()
+        .to_string();
+    let waited = start.elapsed();
+
+    assert!(err.contains("超时"), "{err}");
+    assert!(
+        waited >= std::time::Duration::from_secs(4 * 60 * 60),
+        "只等了 {waited:?}，不够 4 小时"
+    );
+}
 
 // 409 自愈
 
@@ -633,4 +669,74 @@ async fn pagination_non_2xx_surfaces_body() {
         .to_string();
     assert!(err.contains("503"), "{err}");
     assert!(err.contains("维护中"), "{err}");
+}
+
+// 删除
+
+/// pipeline 被占着时删除会回 busy —— 那是暂时状态，等一等再删就行。
+/// 虚拟时间：重试的等待直接跳过。
+#[tokio::test(start_paused = true)]
+async fn delete_retries_while_the_pipeline_is_busy() {
+    let client = MockServer::client();
+    let (server, _d) = setup(vec![
+        Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
+        Route::delete("/documents/delete_document")
+            .and(R::json(
+                200,
+                r#"{"status":"busy","message":"Pipeline is busy with another operation.","doc_id":"doc-1"}"#,
+            ))
+            .and(R::json(
+                200,
+                r#"{"status":"busy","message":"Pipeline is busy with another operation.","doc_id":"doc-1"}"#,
+            ))
+            .and(R::json(
+                200,
+                r#"{"status":"deletion_started","message":"","doc_id":"doc-1"}"#,
+            )),
+        // 删完之后文档列表里就没有它了
+        Route::post("/documents/paginated")
+            .and(R::json(
+                200,
+                r#"{"documents":[{"id":"doc-1","status":"processed","file_path":"a.md"}],
+                    "pagination":{"page":1,"total_pages":1,"total_count":1,"has_next":false}}"#,
+            ))
+            .and(R::json(
+                200,
+                r#"{"documents":[],"pagination":{"page":1,"total_pages":1,"total_count":0,"has_next":false}}"#,
+            )),
+    ])
+    .await;
+
+    logged_in(&server, &client)
+        .await
+        .delete_document_when_free("doc-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        server.count_to("DELETE", "/documents/delete_document"),
+        3,
+        "被占着的时候要重试"
+    );
+}
+
+/// 一直 busy 就不该无限重试：报错里要说清是被占着。
+#[tokio::test(start_paused = true)]
+async fn delete_gives_up_when_the_pipeline_stays_busy() {
+    let client = MockServer::client();
+    let (server, _d) = setup(vec![
+        Route::post("/login").and(R::json(200, r#"{"access_token":"t"}"#)),
+        Route::delete("/documents/delete_document").and(R::json(
+            200,
+            r#"{"status":"busy","message":"Pipeline is busy with another operation.","doc_id":"doc-1"}"#,
+        )),
+    ])
+    .await;
+
+    let err = logged_in(&server, &client)
+        .await
+        .delete_document_when_free("doc-1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("busy") || err.contains("占用"), "{err}");
 }

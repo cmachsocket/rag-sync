@@ -2,6 +2,7 @@
 //! cargo test --test e2e_config_test mineru_job -- --ignored --nocapture # 只打真 MinerU（任务接口）
 //! cargo test --test e2e_config_test probe -- --ignored --nocapture     # 单文件往返，结束自动删
 //! cargo test --test e2e_config_test full_sync -- --ignored --nocapture # 全量入库，见下
+//! cargo test --test e2e_config_test joplin_ -- --ignored --nocapture  # Joplin 同步流，只读 + 单篇往返
 
 mod common;
 
@@ -10,6 +11,8 @@ use std::path::PathBuf;
 use rag_sync::database::{self, DBfunc};
 use rag_sync::db_model;
 use rag_sync::http_util;
+use rag_sync::joplin_model;
+use rag_sync::joplin_requests::{JoplinClient, JoplinError};
 use rag_sync::lightrag_requests::RAGRequest;
 use rag_sync::sync_config::{SyncConfig, SyncFolder};
 use rag_sync::sync_folder::{create_output_files, delete_old_files, get_files, is_supported_file};
@@ -404,6 +407,7 @@ async fn probe_round_trip_against_real_services() {
         lightrag_username: real.lightrag_username.clone(),
         lightrag_password: real.lightrag_password.clone(),
         run_id: 1,
+        joplin: None,
         mineru_concurrency: 1,
         lightrag_concurrency: 1,
     };
@@ -529,4 +533,131 @@ async fn full_sync_against_real_config() {
     } else {
         println!("未设 E2E_ALLOW_DELETE，跳过 delete_old_files");
     }
+}
+
+// Joplin
+
+/// 对着真的 Joplin Server 走一遍「取变更流 -> 取正文 -> 切开正文与元信息块」。
+/// 只读，不往知识库里传东西：正文切错了，传进去的就是错的。
+#[tokio::test]
+#[ignore = "需要真实 Joplin Server 可达"]
+async fn joplin_delta_and_content_parse() {
+    let mut conn = database::establish_db_connection()
+        .await
+        .expect("连不上 rag-sync.db");
+    let config = SyncConfig::from_file(&mut conn, CONFIG_PATH)
+        .await
+        .expect("读取 config.yml 失败");
+    let joplin = config.joplin.expect("config.yml 里要有 joplin 段");
+
+    let client = http_util::client().expect("构造 HTTP 客户端失败");
+    let jop = JoplinClient::new(&client, &joplin.url, &joplin.email, &joplin.password)
+        .await
+        .expect("Joplin 登录失败：检查 config.yml 里的 joplin 段");
+
+    let page = jop.delta(None, 20).await.expect("取变更流失败");
+    assert!(!page.items.is_empty(), "变更流不该是空的");
+    println!("第一页 {} 条事件，游标 {:?}", page.items.len(), page.cursor);
+
+    let mut notes = 0;
+    for item in &page.items {
+        let content = match jop.content(&item.item_name).await {
+            Ok(c) => c,
+            Err(JoplinError::NotFound) => continue,
+            Err(e) => panic!("取 {} 的内容失败: {e}", item.item_name),
+        };
+        let parsed = joplin_model::parse_item(&content);
+        if !parsed.is_note() {
+            println!("{} 不是笔记，跳过", item.item_name);
+            continue;
+        }
+        notes += 1;
+        assert!(
+            !parsed.body.trim().is_empty(),
+            "{} 的正文切空了",
+            item.item_name
+        );
+        assert_eq!(
+            parsed.item_type(),
+            Some(joplin_model::item_type::NOTE),
+            "{} 的 type_ 不该被切进正文",
+            item.item_name
+        );
+        println!(
+            "{}: 标题 {:?}，正文 {} 字，parent_id {:?}",
+            item.item_name,
+            parsed.title(),
+            parsed.body.chars().count(),
+            parsed.parent_id()
+        );
+    }
+    assert!(notes > 0, "这一页里应该有笔记");
+}
+
+/// 拿真的 Joplin 笔记走一遍真的 LightRAG：正文在内存里直接传，传完就删掉。
+/// 验的是「不落盘也能传进去」，跑完不留东西在知识库里。
+#[tokio::test]
+#[ignore = "需要真实 Joplin Server 与 LightRAG 可达"]
+async fn joplin_note_uploaded_from_memory() {
+    let mut conn = database::establish_db_connection()
+        .await
+        .expect("连不上 rag-sync.db");
+    let config = SyncConfig::from_file(&mut conn, CONFIG_PATH)
+        .await
+        .expect("读取 config.yml 失败");
+    let joplin = config.joplin.expect("config.yml 里要有 joplin 段");
+
+    let client = http_util::client().expect("构造 HTTP 客户端失败");
+    let jop = JoplinClient::new(&client, &joplin.url, &joplin.email, &joplin.password)
+        .await
+        .expect("Joplin 登录失败");
+    let page = jop.delta(None, 5).await.expect("取变更流失败");
+
+    // 找一篇最短的笔记：抽取要调模型，短的跑得快
+    let mut picked: Option<(String, String)> = None;
+    for item in &page.items {
+        let Ok(content) = jop.content(&item.item_name).await else {
+            continue;
+        };
+        let parsed = joplin_model::parse_item(&content);
+        if !parsed.is_note() || parsed.body.trim().is_empty() {
+            continue;
+        }
+        match &picked {
+            Some((_, body)) if body.chars().count() <= parsed.body.chars().count() => {}
+            _ => picked = Some((item.item_name.clone(), parsed.body.clone())),
+        }
+    }
+    let (item_name, body) = picked.expect("这一页里应该有笔记");
+    println!("拿来做探针的笔记: {item_name}，{} 字", body.chars().count());
+
+    let rag = RAGRequest::new(
+        &client,
+        &config.lightrag_url,
+        &config.lightrag_username,
+        &config.lightrag_password,
+    )
+    .await
+    .expect("LightRAG 登录失败");
+
+    let upload_name = format!("{}__{item_name}", joplin.alias);
+    let doc_id = rag
+        .upload_content_as(&upload_name, body.as_bytes(), None)
+        .await
+        .expect("上传失败");
+    println!("入库成功: {upload_name} -> {doc_id}");
+    assert!(
+        rag.document_exists(&doc_id).await.unwrap(),
+        "传完就该能在文档列表里看到"
+    );
+
+    // 探针不留在知识库里
+    rag.delete_document_when_free(&doc_id)
+        .await
+        .expect("删除探针文档失败");
+    assert!(
+        !rag.document_exists(&doc_id).await.unwrap(),
+        "删完就该从文档列表里消失"
+    );
+    println!("探针已清理干净");
 }

@@ -9,11 +9,24 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// 轮询间隔。后台流水线是批处理的，太密只是白打服务端。
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// track_status 轮询上限：实测 8.6 KB Markdown 需 728 s，留够 15 分钟。
-const TRACK_TIMEOUT: Duration = Duration::from_secs(900);
+/// track_status 轮询上限：实测 8.6 KB Markdown 需 728 s，大文件的后台抽取要跑更久，
+/// 至少给 4 小时，别把还在跑的处理判成超时。
+pub const TRACK_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// 删除完成等待上限：pipeline 忙时 delete 会直接返回 busy。
 const DELETE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// pipeline 被占着时的重试次数与间隔。实测占用能持续几分钟。
+const BUSY_RETRIES: u32 = 10;
+const BUSY_DELAY: Duration = Duration::from_secs(15);
+
+/// 删文档的结果。三个状态全是 HTTP 200，状态码分不出来。
+enum DeleteOutcome {
+    /// 删掉了，文档已从列表里消失。
+    Deleted,
+    /// pipeline 被别的写者占着，什么都没删。
+    Busy(String),
+}
 
 /// 翻页上限：只防服务端一直回 `has_next: true`。
 const MAX_PAGES: u32 = 1000;
@@ -87,6 +100,14 @@ pub struct ConflictHint<'a> {
     pub content_sha256: Option<&'a str>,
 }
 
+/// 上传内容从哪来：磁盘上的文件，还是内存里的字节。
+/// Joplin 的笔记不落盘，走 [`UploadSource::Bytes`]。
+#[derive(Clone, Copy)]
+enum UploadSource<'a> {
+    File(&'a str),
+    Bytes(&'a [u8]),
+}
+
 pub struct RAGRequest<'a> {
     client: &'a reqwest::Client,
     url: &'a str,
@@ -146,15 +167,26 @@ impl<'a> RAGRequest<'a> {
         }
         Ok(login_response.access_token)
     }
-    async fn _upload(&self, file_path: &str, upload_name: &str) -> Result<String, UploadError> {
+    async fn _upload(
+        &self,
+        source: UploadSource<'_>,
+        upload_name: &str,
+    ) -> Result<String, UploadError> {
         let upload_url = format!("{}/documents/upload", self.url);
-        let file = tokio::fs::File::open(file_path)
-            .await
-            .map_err(|e| UploadError::fatal(format!("打开文件失败: {e}")))?;
-        let stream = FramedRead::new(file, tokio_util::codec::BytesCodec::new());
-        let body = reqwest::Body::wrap_stream(stream);
+        let part = match source {
+            UploadSource::File(file_path) => {
+                let file = tokio::fs::File::open(file_path)
+                    .await
+                    .map_err(|e| UploadError::fatal(format!("打开文件失败: {e}")))?;
+                let stream = FramedRead::new(file, tokio_util::codec::BytesCodec::new());
+                reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(stream))
+                    .file_name(upload_name.to_string())
+            }
+            UploadSource::Bytes(bytes) => {
+                reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(upload_name.to_string())
+            }
+        };
         // file_name 只给文件名部分：这就是服务端判同名的键。
-        let part = reqwest::multipart::Part::stream(body).file_name(upload_name.to_string());
         let form = reqwest::multipart::Form::new().part("file", part);
         let resp = self
             .client
@@ -233,6 +265,45 @@ impl<'a> RAGRequest<'a> {
     }
 
     pub async fn delete_document(&self, file_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        match self.delete_document_inner(file_id).await? {
+            DeleteOutcome::Deleted => Ok(()),
+            DeleteOutcome::Busy(message) => Err(format!(
+                "删除被拒（pipeline 被其他写者占用，未删除任何内容）: {message}"
+            )
+            .into()),
+        }
+    }
+
+    /// 与 [`RAGRequest::delete_document`] 相同，但 pipeline 被占着时会等一会儿再试。
+    /// LightRAG 的写入走单流水线，别人正在写的时候删除只会回 busy —— 那是暂时状态。
+    pub async fn delete_document_when_free(
+        &self,
+        file_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut attempt = 1;
+        loop {
+            match self.delete_document_inner(file_id).await? {
+                DeleteOutcome::Deleted => return Ok(()),
+                DeleteOutcome::Busy(message) if attempt >= BUSY_RETRIES => {
+                    return Err(format!(
+                        "删除被拒（pipeline 被其他写者占用，未删除任何内容）: {message}"
+                    )
+                    .into());
+                }
+                DeleteOutcome::Busy(message) => {
+                    println!("[删除] pipeline 被占着，{BUSY_DELAY:?} 后重试: {message}");
+                    tokio::time::sleep(BUSY_DELAY).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// 真正去删，返回「删掉了」还是「被占着」。
+    async fn delete_document_inner(
+        &self,
+        file_id: &str,
+    ) -> Result<DeleteOutcome, Box<dyn std::error::Error>> {
         let delete_url = format!("{}/documents/delete_document", self.url);
         let delete_request = lightrag_model::DeleteDocRequest {
             doc_ids: vec![file_id.to_string()],
@@ -260,11 +331,7 @@ impl<'a> RAGRequest<'a> {
         match result.status.as_str() {
             "deletion_started" => {}
             "busy" => {
-                return Err(format!(
-                    "删除被拒（pipeline 被其他写者占用，未删除任何内容）: {}",
-                    result.message
-                )
-                .into());
+                return Ok(DeleteOutcome::Busy(result.message));
             }
             other => {
                 return Err(format!("删除未调度，status={other}: {}", result.message).into());
@@ -274,7 +341,7 @@ impl<'a> RAGRequest<'a> {
         // deletion_started 只代表已调度：完成判定看 doc_id 是否从文档列表消失，
         // 不用 pipeline_status（全局共享标志会误判）。
         self.wait_document_gone(file_id).await?;
-        Ok(())
+        Ok(DeleteOutcome::Deleted)
     }
 
     /// 轮询文档列表直到 doc_id 消失。
@@ -397,8 +464,31 @@ impl<'a> RAGRequest<'a> {
         upload_name: &str,
         hint: Option<&ConflictHint<'_>>,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        self.upload_source_as(UploadSource::File(file_path), upload_name, hint)
+            .await
+    }
+
+    /// 与 [`RAGRequest::upload_file_as`] 相同，但内容来自内存 —— 不落盘。
+    /// Joplin 的笔记就是这么传的：正文只在内存里待一下，直接进知识库。
+    pub async fn upload_content_as(
+        &self,
+        upload_name: &str,
+        content: &[u8],
+        hint: Option<&ConflictHint<'_>>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        self.upload_source_as(UploadSource::Bytes(content), upload_name, hint)
+            .await
+    }
+
+    /// 上传并处理 409 同名冲突，返回 doc_id。
+    async fn upload_source_as(
+        &self,
+        source: UploadSource<'_>,
+        upload_name: &str,
+        hint: Option<&ConflictHint<'_>>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let name = upload_name.to_string();
-        let track_id = match self._upload(file_path, upload_name).await {
+        let track_id = match self._upload(source, upload_name).await {
             Ok(track_id) => track_id,
             // 只重试一次：再 409 说明有别的成因，循环只是白打请求。
             Err(UploadError::Conflict(detail)) => {
@@ -409,16 +499,16 @@ impl<'a> RAGRequest<'a> {
                     return Ok(doc_id);
                 }
                 self.remove_conflicting(&name, &detail, &found).await?;
-                self._upload(file_path, upload_name)
+                self._upload(source, upload_name)
                     .await
-                    .map_err(|e| e.into_err(&format!("清理同名冲突后重传 {file_path} 仍失败")))?
+                    .map_err(|e| e.into_err(&format!("清理同名冲突后重传 {name} 仍失败")))?
             }
-            Err(e) => return Err(e.into_err(&format!("上传 {file_path} 失败"))),
+            Err(e) => return Err(e.into_err(&format!("上传 {name} 失败"))),
         };
 
         let track = self._track(&track_id).await?;
         if let Some(err) = track.first_error() {
-            return Err(format!("{file_path} 后台处理失败: {err}").into());
+            return Err(format!("{name} 后台处理失败: {err}").into());
         }
         track
             .first_doc_id()

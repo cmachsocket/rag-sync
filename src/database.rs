@@ -60,15 +60,44 @@ pub trait DBfunc {
         new_output_rel_path: &str,
     ) -> Result<(), Box<dyn std::error::Error>>;
     /// 记下 rag_id 那份文档的内容指纹，跟着 rag_id 一起写，对不上会跳过本该做的重传。
+    /// 传 None 是作废：解析出新内容后旧指纹不再代表知识库里的那一份。
     async fn update_uploaded_sha256(
         &mut self,
         file_path: &str,
-        new_uploaded_sha256: &str,
+        new_uploaded_sha256: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>>;
     async fn found_file_less_than_run_id(
         &mut self,
         file_run_id: i32,
     ) -> Result<Vec<crate::db_model::File>, Box<dyn std::error::Error>>;
+    /// delta 游标：没有记录就是「还没同步过，从头开始」。
+    async fn get_joplin_cursor(&mut self) -> Result<Option<String>, Box<dyn std::error::Error>>;
+    async fn set_joplin_cursor(&mut self, cursor: &str) -> Result<(), Box<dyn std::error::Error>>;
+    /// 按服务端文件名取笔记记录（文件名是取内容与认领笔记的依据）。
+    async fn get_joplin_note(
+        &mut self,
+        item_name: &str,
+    ) -> Result<Option<crate::db_model::JoplinNote>, Box<dyn std::error::Error>>;
+    /// 全部笔记记录，用于全量重放后清掉已经不存在的笔记。
+    async fn list_joplin_notes(
+        &mut self,
+    ) -> Result<Vec<crate::db_model::JoplinNote>, Box<dyn std::error::Error>>;
+    /// 记下「这篇笔记已经进了知识库」。按 item_name 覆盖写。
+    async fn upsert_joplin_note(
+        &mut self,
+        item_id: &str,
+        item_name: &str,
+        upload_name: &str,
+        sha256: &str,
+        rag_id: Option<&str>,
+        updated_time: i64,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    async fn delete_joplin_note(
+        &mut self,
+        item_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    /// 清空笔记记录：游标失效要从头全量同步时用。
+    async fn clear_joplin_notes(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 pub async fn establish_db_connection() -> Result<Conn, Box<dyn std::error::Error>> {
@@ -244,7 +273,7 @@ impl DBfunc for Conn {
     async fn update_uploaded_sha256(
         &mut self,
         file_path: &str,
-        new_uploaded_sha256: &str,
+        new_uploaded_sha256: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::schema::files::dsl::*;
         diesel::update(files.filter(path.eq(file_path)))
@@ -265,5 +294,112 @@ impl DBfunc for Conn {
             .load::<File>(self)
             .await?;
         Ok(results)
+    }
+
+    async fn get_joplin_cursor(&mut self) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        use crate::schema::joplin_state::dsl::{cursor, joplin_state};
+        let result = joplin_state
+            .select(cursor)
+            .first::<String>(self)
+            .await
+            .optional()?;
+        Ok(result)
+    }
+
+    async fn set_joplin_cursor(
+        &mut self,
+        cursor_value: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::schema::joplin_state::dsl::{cursor, joplin_state};
+        // 单行表：没有就建一行，有就改它
+        let updated = diesel::update(joplin_state)
+            .set(cursor.eq(cursor_value))
+            .execute(self)
+            .await?;
+        if updated == 0 {
+            diesel::insert_into(joplin_state)
+                .values(cursor.eq(cursor_value))
+                .execute(self)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn get_joplin_note(
+        &mut self,
+        item_name_value: &str,
+    ) -> Result<Option<crate::db_model::JoplinNote>, Box<dyn std::error::Error>> {
+        use crate::db_model::JoplinNote;
+        use crate::schema::joplin_notes::dsl::*;
+        let result = joplin_notes
+            .filter(item_name.eq(item_name_value))
+            .select(JoplinNote::as_select())
+            .first::<JoplinNote>(self)
+            .await
+            .optional()?;
+        Ok(result)
+    }
+
+    async fn list_joplin_notes(
+        &mut self,
+    ) -> Result<Vec<crate::db_model::JoplinNote>, Box<dyn std::error::Error>> {
+        use crate::db_model::JoplinNote;
+        use crate::schema::joplin_notes::dsl::*;
+        let results = joplin_notes
+            .select(JoplinNote::as_select())
+            .load::<JoplinNote>(self)
+            .await?;
+        Ok(results)
+    }
+
+    async fn upsert_joplin_note(
+        &mut self,
+        item_id_value: &str,
+        item_name_value: &str,
+        upload_name_value: &str,
+        sha256_value: &str,
+        rag_id_value: Option<&str>,
+        updated_time_value: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::schema::joplin_notes::dsl::*;
+        use diesel::upsert::excluded;
+        diesel::insert_into(joplin_notes)
+            .values((
+                item_id.eq(item_id_value),
+                item_name.eq(item_name_value),
+                upload_name.eq(upload_name_value),
+                sha256.eq(sha256_value),
+                rag_id.eq(rag_id_value),
+                updated_time.eq(updated_time_value),
+            ))
+            .on_conflict(item_name)
+            .do_update()
+            .set((
+                item_id.eq(excluded(item_id)),
+                upload_name.eq(excluded(upload_name)),
+                sha256.eq(excluded(sha256)),
+                rag_id.eq(excluded(rag_id)),
+                updated_time.eq(excluded(updated_time)),
+            ))
+            .execute(self)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_joplin_note(
+        &mut self,
+        item_name_value: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::schema::joplin_notes::dsl::*;
+        diesel::delete(joplin_notes.filter(item_name.eq(item_name_value)))
+            .execute(self)
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_joplin_notes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::schema::joplin_notes::dsl::*;
+        diesel::delete(joplin_notes).execute(self).await?;
+        Ok(())
     }
 }

@@ -486,7 +486,7 @@ recovery_required, scanning, scanning_exclusive, update_status
 | `lightrag_requests.rs` `_upload` | `resp_json.status == "sucess"` 拼写错误，**每次成功上传都走进 else 分支返回 Err** | 改为 `"success"` |
 | `lightrag_requests.rs` `_upload` | `.file_name(file_path)` 传完整路径，服务端拿 filename 判同名，整条路径会污染判重和落盘目录 | 改为取 `Path::file_name()` 的 basename |
 | `lightrag_requests.rs` `_track` | URL 是 `/documents/track/{id}`，实际端点是 `/documents/track_status/{id}` → 404 | 已改正 |
-| `lightrag_requests.rs` `_track` | 轮询一次就返回，而上传 31 ms 返回、后台要 64 s~728 s，一次查询必然拿不到终态 | 改为按 `POLL_INTERVAL` 轮询到终态，`TRACK_TIMEOUT` 900 s |
+| `lightrag_requests.rs` `_track` | 轮询一次就返回，而上传 31 ms 返回、后台要 64 s~728 s，一次查询必然拿不到终态 | 改为按 `POLL_INTERVAL` 轮询到终态，`TRACK_TIMEOUT` 14400 s（4 小时） |
 | `lightrag_requests.rs` `delete_document` | 任何 2xx 都 `Ok(())`，把 `busy`（**什么都没删**）当成功 | 判 `status`：`busy` / `not_allowed` 返回 Err |
 | `lightrag_requests.rs` `delete_document` | 删除是异步的，返回即走，没等后台删完 | 轮询 `paginated` 到 doc_id 从列表消失才返回 Ok |
 

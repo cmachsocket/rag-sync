@@ -39,6 +39,7 @@ async fn setup(
         lightrag_username: "u".into(),
         lightrag_password: "p".into(),
         run_id: 1,
+        joplin: None,
         mineru_concurrency: 1,
         lightrag_concurrency: 1,
     };

@@ -232,3 +232,108 @@ async fn found_older_than_spares_current_run() {
         1
     );
 }
+
+// Joplin 的游标与笔记记录
+
+#[tokio::test]
+async fn joplin_cursor_starts_empty_and_round_trips() {
+    let mut db = test_db().await;
+    assert_eq!(DBfunc::get_joplin_cursor(&mut db.conn).await.unwrap(), None);
+    DBfunc::set_joplin_cursor(&mut db.conn, "c1").await.unwrap();
+    assert_eq!(
+        DBfunc::get_joplin_cursor(&mut db.conn)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("c1")
+    );
+    // 再写一次是覆盖，不是追加一行
+    DBfunc::set_joplin_cursor(&mut db.conn, "c2").await.unwrap();
+    assert_eq!(
+        DBfunc::get_joplin_cursor(&mut db.conn)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("c2")
+    );
+}
+
+#[tokio::test]
+async fn joplin_note_round_trips() {
+    let mut db = test_db().await;
+    DBfunc::upsert_joplin_note(
+        &mut db.conn,
+        "item-1",
+        "aa.md",
+        "joplin__aa.md",
+        "sha-1",
+        Some("doc-1"),
+        1_700_000_000_000,
+    )
+    .await
+    .unwrap();
+
+    let note = DBfunc::get_joplin_note(&mut db.conn, "aa.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(note.item_id, "item-1");
+    assert_eq!(note.upload_name, "joplin__aa.md");
+    assert_eq!(note.sha256, "sha-1");
+    assert_eq!(note.rag_id.as_deref(), Some("doc-1"));
+    assert_eq!(note.updated_time, 1_700_000_000_000);
+}
+
+/// 同一篇笔记再同步一次是覆盖，不能多出一行。
+#[tokio::test]
+async fn joplin_note_upsert_overwrites() {
+    let mut db = test_db().await;
+    for (sha, rag_id) in [("sha-1", Some("doc-1")), ("sha-2", Some("doc-2"))] {
+        DBfunc::upsert_joplin_note(
+            &mut db.conn,
+            "item-1",
+            "aa.md",
+            "joplin__aa.md",
+            sha,
+            rag_id,
+            1,
+        )
+        .await
+        .unwrap();
+    }
+    let notes = DBfunc::list_joplin_notes(&mut db.conn).await.unwrap();
+    assert_eq!(notes.len(), 1, "同一篇笔记只能有一行");
+    assert_eq!(notes[0].sha256, "sha-2");
+    assert_eq!(notes[0].rag_id.as_deref(), Some("doc-2"));
+}
+
+#[tokio::test]
+async fn joplin_note_delete_and_clear() {
+    let mut db = test_db().await;
+    for name in ["aa.md", "bb.md"] {
+        DBfunc::upsert_joplin_note(&mut db.conn, "item", name, name, "sha", None, 1)
+            .await
+            .unwrap();
+    }
+    DBfunc::delete_joplin_note(&mut db.conn, "aa.md")
+        .await
+        .unwrap();
+    assert!(
+        DBfunc::get_joplin_note(&mut db.conn, "aa.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        DBfunc::list_joplin_notes(&mut db.conn).await.unwrap().len(),
+        1
+    );
+
+    DBfunc::clear_joplin_notes(&mut db.conn).await.unwrap();
+    assert!(
+        DBfunc::list_joplin_notes(&mut db.conn)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
